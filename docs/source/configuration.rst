@@ -1,86 +1,111 @@
-配置
-====
+Configuration
+=============
 
-配置来源
---------
+Configuration file
+------------------
 
-项目从仓库根目录 ``.env`` 读取配置。变量模板位于 ``.env.example``；模板只包含变量名、
-空占位符和安全默认值。不要把真实 ``.env``、token、OpenID 或 secret 提交到 Git。
+wechat-news reads configuration from ``.env`` in the repository root. Create it from the public
+template and restrict its permissions:
 
-QQ
---
+.. code-block:: bash
 
-.. list-table::
-   :header-rows: 1
-   :widths: 28 18 54
+   cp .env.example .env
+   chmod 600 .env
 
-   * - 变量
-     - 必需性
-     - 作用
-   * - ``QQ_APP_ID``
-     - 必需
-     - QQ Bot App ID
-   * - ``QQ_CLIENT_SECRET``
-     - 必需
-     - QQ Bot Client Secret
-   * - ``QQ_TARGET_OPENID``
-     - 可选
-     - 定时候选推送目标；为空时，Bot 会尝试绑定首个私聊用户
+Safe complete example
+---------------------
 
-文本模型
---------
+Replace every placeholder with credentials from your own accounts. If you do not use an
+optional integration, clear its value instead of leaving a placeholder that looks configured.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 28 18 54
+.. code-block:: ini
 
-   * - 变量
-     - 必需性
-     - 作用
-   * - ``MODEL_BASE_URL``
-     - 可选
-     - OpenAI-compatible API 基础 URL
-   * - ``MODEL_API_KEY``
-     - 可选
-     - 文本模型 API key
-   * - ``MODEL_NAME``
-     - 可选
-     - 模型名称
+   QQ_APP_ID=YOUR_QQ_APP_ID
+   QQ_CLIENT_SECRET=YOUR_QQ_APP_SECRET
+   QQ_TARGET_OPENID=
 
-三项同时配置后，模型功能才会启用。模型用于候选标题/筛选、图片搜索关键词、中文图注和
-文章生成；未配置时，相关步骤会拒绝执行或使用代码中的确定性回退。
+   OPENALEX_API_KEY=YOUR_OPENALEX_API_KEY
 
-OpenAlex
---------
+   MODEL_BASE_URL=https://api.example.com/v1
+   MODEL_API_KEY=YOUR_MODEL_API_KEY
+   MODEL_NAME=YOUR_MODEL_NAME
+
+   WECHAT_APP_ID=YOUR_WECHAT_APP_ID
+   WECHAT_APP_SECRET=YOUR_WECHAT_APP_SECRET
+   WECHAT_AUTHOR=YOUR_AUTHOR_NAME
+
+   DAILY_PUSH_TIME=07:00
+   DAILY_TIMEZONE=Asia/Shanghai
+
+QQ settings
+-----------
+
+``QQ_APP_ID``
+   AppID for your own QQ Bot application. Required.
+
+``QQ_CLIENT_SECRET``
+   AppSecret or ClientSecret for your own QQ Bot application. Required.
+
+``QQ_TARGET_OPENID``
+   Recipient for scheduled candidate delivery. When empty, the first user who sends the Bot a
+   private message is atomically bound and written to the local ``.env``. An existing non-empty
+   value is never overwritten automatically.
+
+Model settings
+--------------
+
+``MODEL_BASE_URL``
+   Base URL of your OpenAI-compatible API endpoint.
+
+``MODEL_API_KEY``
+   API key for that endpoint.
+
+``MODEL_NAME``
+   Model identifier accepted by that endpoint.
+
+All three values must be set for model features to be enabled.
+
+OpenAlex setting
+----------------
 
 ``OPENALEX_API_KEY``
-   OpenAlex API key。PAPER 候选的正式发表验证和 DOI metadata 补充依赖该配置。
+   Optional for NEWS-only use, but required for the current PAPER discovery and formal-publication
+   verification workflow. It is recommended for a full deployment.
 
-微信公众号
-----------
+WeChat settings
+---------------
 
 ``WECHAT_APP_ID``
-   微信公众号 App ID。
+   AppID from your own WeChat Official Account.
 
 ``WECHAT_APP_SECRET``
-   微信公众号 App Secret。
+   AppSecret from your own WeChat Official Account.
 
 ``WECHAT_AUTHOR``
-   草稿作者字段与 qihai 页眉作者标签。
+   Author name passed to WeChat draft creation and displayed by the included formatting setup.
 
-未同时配置微信 App ID 与 App Secret 时，``publish`` 只执行本地排版 dry-run，不会创建草稿。
+Both AppID and AppSecret must be set for WeChat integration to be considered configured. Without
+them, ``publish`` performs a local formatting dry-run instead of creating a draft.
 
-Scheduler
----------
+Scheduler settings
+------------------
 
 ``DAILY_PUSH_TIME``
-   周一、周三、周五候选推送时间，格式为 ``HH:MM``；默认 ``07:00``。
+   Candidate delivery time in ``HH:MM`` format. Default: ``07:00``.
 
 ``DAILY_TIMEZONE``
-   调度时区；默认 ``Asia/Shanghai``。
+   IANA timezone used by the scheduler. Default: ``Asia/Shanghai``.
 
-本地状态
---------
+Local data
+----------
 
-SQLite 数据库固定写入 ``data/news.db``。生成稿件、图片、PDF、Figure、日志和临时文件分别
-位于 ``articles/``、``data/``、``logs/``、``tmp/`` 等运行时目录，均不进入公开仓库。
+The SQLite database is stored at ``data/news.db``. Generated articles, downloaded images, PDFs,
+figures, logs, and temporary files are written under ignored runtime directories such as
+``articles/``, ``data/``, ``logs/``, and ``tmp/``.
+
+Credential safety
+-----------------
+
+Never commit ``.env`` or the runtime-generated ``vendor/xiaohu-wechat-format/config.json``.
+Do not paste AppSecrets, API keys, tokens, or OpenIDs into GitHub Issues, screenshots, or public
+logs. Rotate a credential immediately through its provider if it is exposed.

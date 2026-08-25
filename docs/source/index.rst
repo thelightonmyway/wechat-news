@@ -1,40 +1,52 @@
 .. meta::
-   :description: 气海无涯科研资讯微信公众号自动化工具文档。
+   :description: Documentation for controlling a WeChat Official Account content workflow from QQ.
 
-气海无涯 WeChat News
-=====================
+wechat-news
+===========
 
-**wechat-news** 是“气海无涯”科研资讯微信公众号自动化工具。它通过 QQ Bot
-提供科研新闻与正式论文候选，完成内容处理、图片与版权检查、qihai 排版，并将
-文章创建到微信公众号草稿箱。
+**wechat-news** is a self-hosted automation tool for controlling a WeChat Official Account
+content workflow from QQ. It runs on one continuously available computer or server and uses
+a QQ Bot as the remote interface for discovery, selection, AI-assisted writing, image handling,
+formatting, scheduling, and draft creation.
 
 .. important::
 
-   本项目只自动创建微信公众号草稿，不会自动正式发布文章。
+   wechat-news creates drafts in your own WeChat Official Account. It does not automatically
+   publish final posts.
 
-文档目录
---------
+The current default deployment focuses on scientific content. Some bundled sources, topic
+filters, and the included ``qihai`` theme still reflect the author's deployment, while the
+repository and account configuration are designed for other users to install with their own
+QQ Bot, model service, and WeChat Official Account.
+
+Documentation
+-------------
 
 .. toctree::
    :maxdepth: 2
-   :caption: 入门
+   :caption: Getting Started
 
    introduction
    installation
+   qq-bot-setup
+   wechat-official-account-setup
+   model-configuration
    configuration
+   first-run
 
 .. toctree::
    :maxdepth: 2
-   :caption: 使用
+   :caption: Using wechat-news
 
    commands
    workflows
    images-and-copyright
    publishing
    scheduler
+   updating
 
 .. toctree::
    :maxdepth: 1
-   :caption: 故障排查
+   :caption: Help
 
    troubleshooting

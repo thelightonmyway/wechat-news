@@ -1,16 +1,24 @@
-安装与运行
-==========
+Installation
+============
 
-环境要求
---------
+Prerequisites
+-------------
 
-* Python 3.10 或更高版本
-* ``pip``
-* Git
-* 可访问 QQ Bot、RSS、OpenAlex、模型和微信接口的网络环境（按实际启用功能）
+Before installing the application, prepare:
 
-安装
-----
+* Python 3.10 or newer and ``pip``;
+* Git;
+* a machine or server that can remain running when you want the QQ Bot and scheduler available;
+* your own QQ Bot credentials;
+* your own WeChat Official Account credentials and API IP whitelist;
+* an OpenAI-compatible model endpoint for article generation;
+* an OpenAlex API key if you plan to use the PAPER workflow.
+
+The machine must be able to reach the QQ Bot gateway, configured RSS sources, OpenAlex, your
+model endpoint, image sources, and the WeChat Official Account API for the integrations you use.
+
+Clone and install
+-----------------
 
 .. code-block:: bash
 
@@ -21,18 +29,19 @@
    cp .env.example .env
    chmod 600 .env
 
-编辑 ``.env`` 后再启动。真实凭据只能保存在本地 ``.env`` 中。
+Open ``.env`` in a local editor and replace the placeholders with credentials from your own
+accounts. Never commit this file.
 
-运行
-----
+Process management
+------------------
 
-前台运行：
+Run in the foreground:
 
 .. code-block:: bash
 
    ./run.sh
 
-后台进程管理：
+Run in the background and manage the process:
 
 .. code-block:: bash
 
@@ -41,6 +50,12 @@
    ./run.sh restart
    ./run.sh stop
 
-``run.sh`` 优先使用项目内 ``.venv/bin/python``。后台模式使用 supervisor
-循环，在 Bot 子进程异常退出后按退避间隔重新启动。日志和 PID 文件写入 ``logs/``，
-该目录不进入 Git。
+``run.sh`` prefers ``.venv/bin/python``. In background mode it supervises the Bot process and
+restarts it with backoff after an unexpected exit. Runtime logs and PID files are written under
+``logs/`` and are excluded from Git.
+
+Next steps
+----------
+
+Complete :doc:`qq-bot-setup`, :doc:`wechat-official-account-setup`, and
+:doc:`model-configuration`, then follow :doc:`first-run`.

@@ -1,46 +1,68 @@
-内容工作流
-==========
+Workflows
+=========
 
-News workflow
+NEWS workflow
 -------------
 
 .. code-block:: text
 
-   配置的 RSS / 科研新闻来源
-   → 48 小时抓取（候选不足时扩展到 168 小时）
-   → 研究主题筛选与去重
-   → NEWS 候选
-   → 选择候选并 generate
-   → 公共图片 metadata 搜索与版权过滤
-   → 下载合规图片并生成中文图注
-   → qihai 排版
-   → 微信公众号草稿
+   configured content sources
+   → collection and topic filtering
+   → deduplicated candidates
+   → title translation and article generation
+   → public-image discovery and image checks
+   → WeChat formatting
+   → draft creation
 
-NEWS 候选按 DOI、canonical URL、规范化标题和相似标题去重。候选会先经过确定性评分，
-文本模型配置可用时再完成候选标题处理和选择；模型不可用时保留确定性回退。
+The current implementation collects configured RSS sources, normally using a 48-hour window and
+expanding to 168 hours when too few topic-matched items are available. It deduplicates by DOI,
+canonical URL, normalized title, and similar titles before ranking candidates.
 
-Paper workflow
+When the model integration is available, it can translate candidate titles and assist selection.
+Explicit ``generate`` commands use the model to write the selected article. NEWS image discovery
+uses text metadata from public sources and applies the current license policy before download and
+selection.
+
+PAPER workflow
 --------------
 
 .. code-block:: text
 
-   PAPER 候选
-   → DOI / OpenAlex 正式发表验证与 metadata
-   → 出版商 HTML 正文与 Figure
-   → 访问失败时尝试 OA HTML mirror
-   → 没有可合法使用的 HTML 图片时尝试 PDF + PyMuPDF4LLM Figure
-   → PDF 可用时渲染论文第一页
-   → generate 论文解读
-   → qihai 排版
-   → 微信公众号草稿
+   paper discovery
+   → DOI and OpenAlex metadata verification
+   → publisher or open-access article content
+   → paper images, PDF figures, and first page when available
+   → interpretation article generation
+   → WeChat formatting
+   → draft creation
 
-PAPER 模式要求 OpenAlex 返回 DOI、期刊、正式发表日期和受支持的论文类型。生成时优先使用
-论文 metadata、abstract 和论文正文；新闻正文仅作为补充。PDF Figure fallback 只在没有
-可合法使用的 HTML 图片时触发，并过滤补充材料、同行评审文件等非正文 PDF。
+The PAPER workflow requires an OpenAlex key in the current implementation. A candidate must have
+a DOI and pass OpenAlex formal-publication checks, including publication date, journal metadata,
+and a supported work type.
 
-候选与手动命令
+For content and images, the workflow tries the resolved publisher page first. When access fails,
+it can try an open-access HTML location from existing metadata, preferring PubMed Central when
+available. If no legally usable HTML image is available, generation can look for a formal or
+reference PDF and use PyMuPDF4LLM to extract numbered figures. A downloaded PDF can also provide
+the rendered first page and WeChat cover crop.
+
+Manual control
 --------------
 
-Scheduler 负责按时间向 QQ 推送候选列表。用户仍需通过 ``/news``、``/papers``、
-``/news N ...`` 或 ``/paper N ...`` 选择、生成和创建草稿。自动候选推送不会自动生成文章，
-也不会自动创建或正式发布微信文章。
+Scheduled jobs deliver candidate lists. Users still choose a candidate and explicitly run
+``generate`` and ``publish``. The scheduler does not generate articles, create drafts, or publish
+final posts automatically.
+
+Current limitations
+-------------------
+
+wechat-news is positioned as a reusable QQ-controlled WeChat workflow tool, but the present code
+is not fully domain-neutral:
+
+* the bundled RSS configuration focuses on science and climate-related sources;
+* topic relevance and exclusion terms are currently hard-coded for the author's scientific use;
+* generated writing is currently Chinese science communication and paper interpretation;
+* the included ``qihai`` theme and header reflect the author's custom deployment.
+
+These limitations are documented rather than hidden. Changing them requires a separate business-
+logic task and is outside the public documentation rewrite.

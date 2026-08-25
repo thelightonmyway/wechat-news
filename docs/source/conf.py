@@ -10,7 +10,7 @@ except FileNotFoundError:
     version = "0.0.0"
 release = version
 
-project = "气海无涯 WeChat News"
+project = "wechat-news"
 author = "xuyang"
 copyright = "2026, xuyang"
 
@@ -19,6 +19,6 @@ extensions = [
 ]
 
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "generated"]
-language = "zh_CN"
+language = "en"
 
 html_theme = "sphinx_rtd_theme"

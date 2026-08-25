@@ -1,43 +1,46 @@
-图片与版权
-==========
+Images and Copyright
+====================
 
-总原则
-------
+Separation of discovery and permission
+--------------------------------------
 
-图片发现与图片可发布判定是两个独立步骤。HTML、newspaper4k、Wikimedia Commons、NASA、
-OpenAlex 或 PDF 提取只负责提供候选与 metadata；最终是否可用由 ``images/policy.py`` 的
-保守规则决定。
+Image discovery does not automatically make an image publishable. HTML extraction, newspaper4k,
+Wikimedia Commons, NASA, OpenAlex metadata, and PDF extraction only produce candidate records.
+``images/policy.py`` performs a separate conservative license and third-party-risk assessment.
 
-News 图片
----------
+NEWS image sources
+------------------
 
-NEWS 生成流程可根据文章标题相关文本生成英文搜索短语，并依次查询：
+The current NEWS generation workflow can create English search phrases from title-related text
+and query:
 
-* Wikimedia Commons
-* Wikimedia Commons 中的 NOAA / NASA 相关结果
-* NASA Image and Video Library
+* Wikimedia Commons;
+* NOAA- and NASA-related results indexed through Wikimedia Commons;
+* NASA Image and Video Library.
 
-候选图片需要通过 metadata 相关性、许可证、尺寸、宽高比和非内容图片过滤。当前 NEWS
-正文最多选择 2 张非冗余合规图片，并从中选择封面候选；没有可用图片时继续使用默认封面。
+Candidates are filtered by metadata relevance, license, dimensions, aspect ratio, and non-content
+markers. Logos, icons, advertising, tracking pixels, banners, and sprites are rejected during the
+download stage. The current NEWS selector uses at most two non-redundant body images.
 
-Paper 图片
-----------
+PAPER image sources
+-------------------
 
-PAPER 图片来源按当前流程包括：
+The current PAPER workflow can use:
 
-1. 出版商 HTML 中的 ``figure`` 图片；
-2. 出版商 HTML 不可访问时，可访问的 OA HTML mirror（优先 PMC）；
-3. 没有可合法使用的 HTML 图片时，正式/参考 PDF + PyMuPDF4LLM Figure fallback；
-4. PDF 已下载时渲染论文第一页及微信封面裁剪图。
+1. figures discovered in publisher HTML;
+2. figures from an accessible open-access HTML location when the publisher page is unavailable;
+3. numbered figures extracted from a formal or reference PDF when no legally usable HTML image
+   is available;
+4. the rendered first page of a downloaded paper PDF.
 
-PDF Figure 只接受与 ``Fig. N`` 图注相邻且尺寸合理的图片区域。补充材料、同行评审文件和
-无法确认的图片区域不会作为正式 Figure 使用。当前 PAPER 正文最多选择 4 张非冗余合规图片。
-论文第一页可用时会放在正文开头，并优先使用其裁剪图作为微信封面。
+PDF figure extraction accepts a picture region only when it is large enough and adjacent to a
+matching ``Fig. N`` caption. Supplementary and peer-review PDFs are excluded from PDF source
+selection. The current PAPER selector uses at most four non-redundant body images.
 
-允许的许可证
---------------
+Accepted license labels
+-----------------------
 
-当前代码允许：
+The current policy accepts:
 
 * CC BY
 * CC BY-SA
@@ -46,24 +49,26 @@ PDF Figure 只接受与 ``Fig. N`` 图注相邻且尺寸合理的图片区域。
 * CC0
 * Public Domain
 
-拒绝规则
---------
+Rejected cases
+--------------
 
-当前代码拒绝：
+The current policy rejects:
 
-* 任意 ND / NoDerivatives 许可证，包括 CC BY-ND 和 CC BY-NC-ND
-* unknown 或无法确认可复用的许可证
-* all rights reserved、publisher copyright、copyrighted
-* 图注或署名中含第三方风险标记：reprinted、reproduced、with permission、third-party
-* Google Earth
-* Getty、Alamy、Shutterstock
+* NoDerivatives licenses, including CC BY-ND and CC BY-NC-ND;
+* unknown or otherwise unconfirmed reusable licenses;
+* ``all rights reserved``, publisher copyright, or copyrighted markers;
+* captions or credits containing third-party risk markers such as reprinted, reproduced,
+  with permission, third-party, or third party;
+* Google Earth;
+* Getty, Alamy, and Shutterstock.
 
-另外，logo、favicon、广告、tracking pixel、banner、sprite，以及尺寸或宽高比明显不适合
-正文的图片会在下载阶段被排除。
+Metadata and review
+-------------------
 
-Metadata 与正文
----------------
+The original caption, credit, license, provider, source URL, and policy reason are retained in the
+article's internal ``metadata.json`` and SQLite image records. The body uses short generated image
+captions rather than repeating long license or credit text.
 
-每张图片的原始 caption、credit、license、provider、来源 URL 和判定原因保存在文章内部
-``metadata.json`` 与 SQLite 图片记录中。正文仅显示脚本生成的简短中文图注，不显示冗长的
-license、credit、copyright 或图库说明；这些内部 metadata 应保留用于发布前人工复核。
+Retaining internal metadata does not replace human review. Before final publication, verify that
+the intended use is compatible with the image's actual license, required attribution, platform
+rules, and applicable law.

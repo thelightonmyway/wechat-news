@@ -1,53 +1,64 @@
-项目简介
-========
+Introduction
+============
 
-项目用途
---------
+What the project does
+---------------------
 
-“气海无涯” WeChat News 用于把科研资讯处理流程集中到一个本地运行的 QQ Bot：
+wechat-news turns one continuously running computer or server into a remotely controlled
+WeChat Official Account content workstation. You send commands to your own QQ Bot; the local
+service performs the requested work and returns candidate lists, status information, and
+results through QQ.
 
 .. code-block:: text
 
    QQ Bot
-   → 科研新闻 / 论文候选
-   → 内容处理
-   → 图片与版权检查
-   → qihai 微信排版
-   → 微信公众号草稿箱
+   → content discovery and selection
+   → AI-assisted translation and writing
+   → image handling
+   → WeChat formatting
+   → scheduling
+   → WeChat draft creation
 
-系统保留人工选择步骤。候选、生成和创建草稿均通过 QQ 命令触发；创建草稿后，
-仍需在微信公众号后台检查并决定是否正式发布。
+The project intentionally stops at draft creation. You remain responsible for reviewing,
+editing, and publishing the final post in the WeChat Official Account backend.
 
-两种内容模式
-------------
+Who can deploy it
+-----------------
+
+Any user who can provide the following can run their own deployment:
+
+* a QQ Bot application and its credentials;
+* a WeChat Official Account with the API permissions needed for access tokens, media uploads,
+  and draft management;
+* an OpenAI-compatible text model endpoint for generation features;
+* an OpenAlex API key when using the PAPER workflow;
+* a Linux, WSL, or server environment with Python 3.10 or newer.
+
+Content modes
+-------------
 
 NEWS
 ~~~~
 
-NEWS 面向科普与科学新闻。系统从 ``config/feeds.yaml`` 中配置的 RSS 和科研新闻
-来源获取条目，按研究主题筛选并区分候选，随后可生成中文科普推文。
+The NEWS workflow collects entries from configured RSS and content sources, applies the current
+topic filters, separates candidates, generates or translates an article, handles eligible
+images, formats the result, and creates a WeChat draft.
 
 PAPER
 ~~~~~
 
-PAPER 面向已经正式发表的论文。系统使用 DOI 和 OpenAlex 验证并补充 metadata，
-尝试从出版商 HTML 或可访问的开放 HTML 页面获取正文和 Figure；没有可合法使用的
-HTML 图片时，可回退到 PDF 与 PyMuPDF4LLM Figure 提取。PDF 可用时还可渲染论文
-第一页，并生成科研论文解读型推文。
+The PAPER workflow validates formally published papers with DOI and OpenAlex metadata, extracts
+article or paper content, handles publisher HTML figures and PDF fallbacks, generates an
+interpretation article, formats it, and creates a WeChat draft.
 
-核心能力
---------
+Current scope and example deployment
+------------------------------------
 
-* RSS feed collection
-* 研究主题相关性筛选
-* NEWS / PAPER 候选分离
-* DOI / OpenAlex metadata 补充与正式发表验证
-* HTML 图片与 Figure 提取
-* OA HTML fallback
-* PDF Figure 提取（PyMuPDF4LLM fallback）
-* 论文第一页渲染
-* 图片许可与第三方版权风险过滤
-* qihai 微信排版
-* 微信公众号草稿创建
-* 周一、周三、周五候选定时推送
-* QQ Bot 命令控制
+The current source list and topic relevance rules are oriented toward scientific and climate-
+related content because they reflect the author's active deployment. They are real application
+constraints, not a claim that the software is already domain-neutral. This documentation does
+not change those rules.
+
+The bundled ``qihai`` formatter theme and ``assets/qihai-header.png`` are an included custom
+example used by the author's deployment. They are not the public identity of wechat-news and
+are not credentials or user-specific account configuration.

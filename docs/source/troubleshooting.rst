@@ -1,56 +1,80 @@
-故障排查
-========
+Troubleshooting
+===============
 
-QQ Bot 没有响应
----------------
+The QQ Bot does not respond
+---------------------------
 
-* 运行 ``./run.sh status`` 检查 supervisor 与 Bot 子进程。
-* 检查 ``logs/bot.log`` 和 ``logs/supervisor.log``。
-* 确认 ``QQ_APP_ID``、``QQ_CLIENT_SECRET`` 正确，且网络可以访问 QQ Bot gateway。
-* ``/ping`` 应返回 ``pong``。
+* Run ``./run.sh status`` and confirm that both the supervisor and Bot process are running.
+* Inspect ``logs/bot.log`` and ``logs/supervisor.log``.
+* Confirm that ``QQ_APP_ID`` and ``QQ_CLIENT_SECRET`` belong to your own active Bot application.
+* Confirm that the machine can reach the QQ Bot gateway.
+* Send ``/ping``; a working Bot returns ``pong``.
 
-模型功能不可用
---------------
+The first user was bound incorrectly
+------------------------------------
 
-``generate`` 提示模型未配置时，检查 ``MODEL_BASE_URL``、``MODEL_API_KEY`` 和
-``MODEL_NAME`` 是否同时设置。候选标题处理失败时，系统可能回退到确定性候选，但文章生成
-不会在缺少模型配置时继续。
+``QQ_TARGET_OPENID`` binds the first private-message sender when it is empty. Stop the Bot, edit
+the local ``.env`` with the intended OpenID, and restart. The current application does not provide
+a command that displays or changes OpenIDs.
 
-OpenAlex timeout 或 PAPER 候选为空
----------------------------------------
+Model generation is unavailable
+-------------------------------
 
-* 检查 ``OPENALEX_API_KEY``。
-* OpenAlex 超时与 429/5xx 会进行有限次数重试；外部服务持续不可用时稍后再试。
-* PAPER 候选还必须有 DOI、期刊、有效发表日期、受支持的论文类型，并通过研究主题筛选。
+Check that ``MODEL_BASE_URL``, ``MODEL_API_KEY``, and ``MODEL_NAME`` are all set. ``/status`` reports
+the model as configured only when all three are non-empty. If generation still fails, confirm that
+the endpoint is reachable and supports the compatible chat-completions request used by the current
+OpenAI Python client.
 
-出版商 HTML 返回 403
----------------------
+PAPER candidates are empty
+--------------------------
 
-PAPER 流程会在出版商 HTML 访问失败时尝试 metadata 中的 OA HTML mirror。若仍不可访问，且能
-找到正式/参考 PDF，则生成阶段可尝试 PDF Figure fallback。外部站点临时失败时可稍后重试。
+* Confirm that ``OPENALEX_API_KEY`` is configured.
+* OpenAlex timeouts and 429/5xx responses receive a limited number of retries; try again later if
+  the service remains unavailable.
+* A PAPER candidate must have a DOI, journal metadata, a valid publication date, a supported work
+  type, and a match to the current scientific topic filters.
 
-论文图片不可用
---------------
+A publisher page returns 403
+----------------------------
 
-图片可能因许可证未知、ND、all rights reserved、第三方版权标记、下载失败或不符合尺寸要求而
-被拒绝。检查文章目录中的 ``metadata.json`` 和日志中的判定原因；不要手工绕过版权策略。
+The PAPER workflow can try an open-access HTML location from OpenAlex metadata when the publisher
+page is inaccessible. If no usable HTML image is available and a formal or reference PDF can be
+found, generation can attempt PDF figure extraction. External site availability can still prevent
+content or image retrieval.
 
-微信公众号草稿失败
--------------------
+No paper image is available
+---------------------------
 
-* 确认 ``WECHAT_APP_ID``、``WECHAT_APP_SECRET`` 和 ``WECHAT_AUTHOR`` 配置正确。
-* 微信错误 40164 通常表示当前公网 IP 未加入微信公众号后台 IP 白名单。
-* 先确认对应文章已经执行 ``generate``。
+An image may be rejected because its license is unknown, contains a NoDerivatives or third-party
+marker, is all-rights-reserved, cannot be downloaded, or does not meet content-image dimensions.
+Inspect the generated article's ``metadata.json`` and the application logs. Do not bypass the
+copyright policy merely to force an image into a draft.
 
-缺少 qihai 页眉或封面
----------------------
+WeChat status says configured but draft creation fails
+------------------------------------------------------
 
-* 品牌页眉应位于 ``assets/qihai-header.png``。
-* 默认封面应位于 ``assets/default-cover.jpg``。
-* PAPER 的论文第一页封面只有在 PDF 已成功下载并渲染时可用；否则回退到选中图片或默认封面。
+``/status`` only checks whether ``WECHAT_APP_ID`` and ``WECHAT_APP_SECRET`` are non-empty. It does
+not validate them against WeChat. Check:
 
-外部 API 临时失败
-------------------
+* that the AppID and AppSecret belong to your own Official Account;
+* that the account exposes the required media and draft API permissions;
+* that the machine's public outbound IP is in the API IP whitelist;
+* that the network can reach the WeChat API;
+* that the selected article was generated before ``publish``.
 
-RSS、图片站点、OpenAlex、模型、QQ 和微信均为外部服务。查看日志中的 HTTP 状态与错误类型，
-确认代理和网络设置后再重试；不要把日志、下载文件或临时调试输出提交到 Git。
+WeChat error ``40164`` commonly indicates an IP whitelist mismatch.
+
+The qihai header or cover is missing
+------------------------------------
+
+The included example header is ``assets/qihai-header.png`` and the default cover is
+``assets/default-cover.jpg``. A PAPER first-page cover is available only when a source PDF was
+successfully downloaded and rendered; otherwise the workflow falls back to an eligible selected
+image or the default cover.
+
+External APIs fail temporarily
+-------------------------------
+
+RSS publishers, image services, OpenAlex, the model endpoint, QQ, and WeChat are external systems.
+Review the HTTP status and error type in local logs, confirm network and proxy settings, and retry
+later. Never commit logs, downloaded files, debug output, or credentials to Git.

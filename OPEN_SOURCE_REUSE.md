@@ -1,23 +1,25 @@
 # Open Source Reuse
 
-本项目保留当前业务代码与 ``vendor/xiaohu-wechat-format`` 的集成方式。下表记录直接使用或随项目 vendor 的主要开源项目；具体许可证以所安装版本的包 metadata 和上游许可证文件为准。
+wechat-news keeps its current application structure and the existing `vendor/xiaohu-wechat-format` integration. This document lists the main directly used libraries, services, and vendored components. Exact terms are governed by the license and package metadata of the installed version.
 
-| 用途 | 项目/服务 | 集成方式 | 许可证或使用说明 |
+| Purpose | Project or service | Integration | License or usage note |
 |---|---|---|---|
-| RSS 解析 | feedparser | Python 依赖 | BSD-2-Clause |
-| 正文抽取 | trafilatura | Python 依赖 | Apache-2.0 |
-| 新闻 metadata / 图片发现 | newspaper4k | Python 依赖 | MIT |
-| HTML 解析 | Beautiful Soup | Python 依赖 | MIT |
-| HTTP 客户端 | aiohttp / HTTPX | Python 依赖 | Apache-2.0 / BSD-3-Clause |
-| 论文 metadata | PyAlex / OpenAlex | Python 依赖与 OpenAlex API | PyAlex 为 MIT；OpenAlex 数据遵循其服务条款 |
-| 定时任务 | APScheduler | Python 依赖 | MIT |
-| PDF 渲染与提取 | PyMuPDF / PyMuPDF4LLM | Python 依赖 | AGPL-3.0 或商业许可；部署与分发时应核对适用条款 |
-| 文本模型客户端 | OpenAI Python client | OpenAI-compatible API 客户端 | Apache-2.0 |
-| Markdown 处理 | Python-Markdown | Python 依赖 | BSD-3-Clause |
-| 微信排版与草稿 | xiaohu-wechat-format | 保存在 ``vendor/xiaohu-wechat-format``；包含本项目使用的 qihai theme 与适配 | 上游 README 声明 MIT；保留上游 README 与 attribution |
-| 公共图片发现 | Wikimedia Commons | 按单张图片 metadata 与许可证判定 | 每张图片许可证不同，必须逐项保留内部 license/credit metadata |
-| 公共图片发现 | NASA Image and Video Library | API / 图片 metadata | 依 NASA 媒体使用指南与单项 copyright metadata 判定，不自动视为公共领域 |
+| RSS parsing | feedparser | Python dependency | BSD-2-Clause |
+| Article extraction | trafilatura | Python dependency | Apache-2.0 |
+| News metadata and image discovery | newspaper4k | Python dependency | MIT |
+| HTML parsing | Beautiful Soup | Python dependency | MIT |
+| HTTP clients | aiohttp / HTTPX | Python dependencies | Apache-2.0 / BSD-3-Clause |
+| Paper metadata | PyAlex / OpenAlex | Python dependency and OpenAlex API | PyAlex is MIT; OpenAlex data is subject to its service terms |
+| Scheduling | APScheduler | Python dependency | MIT |
+| PDF rendering and extraction | PyMuPDF / PyMuPDF4LLM | Python dependencies | AGPL-3.0 or commercial licensing; review the applicable terms before redistribution or hosted deployment |
+| Model API client | OpenAI Python client | OpenAI-compatible API client | Apache-2.0 |
+| Markdown processing | Python-Markdown | Python dependency | BSD-3-Clause |
+| WeChat formatting and drafts | xiaohu-wechat-format | Vendored under `vendor/xiaohu-wechat-format` | The upstream README declares MIT; upstream README files and attribution are retained |
+| Public image discovery | Wikimedia Commons | Per-image metadata and license checks | Each image has its own license and attribution requirements |
+| Public image discovery | NASA Image and Video Library | API and media metadata | Media use depends on NASA guidance and each item's copyright metadata; content is not automatically treated as public domain |
 
-## Vendored component
+## Vendored formatting component
 
-``vendor/xiaohu-wechat-format`` 继续作为普通 vendored source 使用，不改为 Git submodule。项目不会提交该工具运行时生成的 ``config.json``；真实微信公众号凭据只保存在本地配置中。
+`vendor/xiaohu-wechat-format` remains ordinary vendored source rather than a Git submodule. The project includes local formatting adaptations and the `qihai` custom theme used by the author's deployment.
+
+The runtime-generated `vendor/xiaohu-wechat-format/config.json` is excluded from Git because it can contain WeChat credentials. Real AppIDs, AppSecrets, API keys, tokens, and OpenIDs must remain in local ignored configuration files.

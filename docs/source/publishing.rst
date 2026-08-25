@@ -1,49 +1,57 @@
-微信公众号草稿
+Draft Creation
 ==============
 
-发布流程
---------
+The publishing command is deliberately a draft-creation command.
 
 .. code-block:: text
 
    generate
-   → Markdown 稿件与 metadata
+   → Markdown article and metadata
    → qihai formatting
-   → 本地/远程图片处理与微信图片上传
-   → 微信公众号 draft/add
+   → image upload
+   → WeChat draft creation
+   → manual review in the WeChat backend
 
-项目固定调用 vendored ``xiaohu-wechat-format`` 的格式化与发布脚本，并使用 ``qihai`` theme。
-如果 ``assets/qihai-header.png`` 存在，排版前会把品牌页眉临时加入 Markdown，发布后还会检查
-该页眉是否进入微信草稿内容。
-
-标题与正文
+Formatting
 ----------
 
-NEWS
-~~~~
+wechat-news calls the vendored ``xiaohu-wechat-format`` formatter and uses the included ``qihai``
+theme. If ``assets/qihai-header.png`` exists, the current deployment prepends that custom header
+to the article during formatting.
 
-NEWS 草稿使用候选中文标题（没有中文标题时使用原始标题），并限制在微信标题长度范围内。
-正文包含模型生成的科普文章、最多 2 张选中的正文图片以及文章信息。
+The ``qihai`` theme and header are an included example from the author's deployment. This task
+does not change their styling or remove them.
 
-PAPER
-~~~~~
+NEWS drafts
+-----------
 
-PAPER 草稿标题优先组合“最新成果”、期刊名和文章标题，并遵守微信 64 字符限制。排版时会
-移除正文中的一级标题；论文第一页可用时放在正文开头。正文可包含最多 4 张选中的 Figure
-或其他合规图片，末尾附论文信息。
+A NEWS draft uses the candidate's translated title when available, includes the generated article,
+selected eligible images, and source information. The current image selector uses at most two body
+images for NEWS content.
 
-封面
-----
+PAPER drafts
+------------
 
-PAPER 优先使用论文第一页的微信比例裁剪图；否则使用选中的合规封面图片；仍不可用时回退到
-``assets/default-cover.jpg``。NEWS 使用选中的合规封面图片或默认封面。
+A PAPER draft can use journal metadata in the draft title, removes the first Markdown heading from
+the formatted body, and can include up to four selected paper images. When a source PDF was
+available and its first page was rendered, the first page is placed at the start of the article
+and its cropped version is preferred as the WeChat cover.
 
-Dry-run 与正式发布
-------------------
+Cover fallback
+--------------
 
-未配置 ``WECHAT_APP_ID`` 和 ``WECHAT_APP_SECRET`` 时，命令只完成本地 qihai 排版并返回
-HTML 路径。配置凭据后，``publish`` 只调用微信公众号草稿接口创建草稿。
+When a paper first-page cover is unavailable, the workflow uses a selected eligible cover image.
+If no selected cover is available, it falls back to ``assets/default-cover.jpg``.
 
-.. important::
+Dry-run behavior
+----------------
 
-   项目不会调用微信公众号正式发布接口。草稿必须在微信后台人工检查和发布。
+If ``WECHAT_APP_ID`` and ``WECHAT_APP_SECRET`` are not both configured, ``publish`` completes the
+local formatting step and returns the generated HTML path without creating a WeChat draft.
+
+Final publication
+-----------------
+
+A successful command creates a draft through the WeChat Official Account API. It does not publish
+the final post. Sign in to your own WeChat backend, review and edit the draft, and publish it
+manually when ready.
