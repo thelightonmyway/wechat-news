@@ -1,0 +1,42 @@
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+vendor/xiaohu-wechat-format/config.json
+vendor/xiaohu-wechat-format/.vendor-git/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime state and generated content
+data/
+logs/
+tmp/
+articles/
+downloads/
+figures/
+generated/
+cache/
+.cache/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+*.bak
+*.bak.*
+
+# Documentation build output
+docs/_build/
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

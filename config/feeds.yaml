@@ -1,0 +1,43 @@
+feeds:
+  - name: Guardian Science
+    url: https://www.theguardian.com/science/rss
+    domain: www.theguardian.com
+  - name: Nature News
+    url: https://www.nature.com/nature/articles?format=rss&type=news
+    domain: www.nature.com
+  - name: Science.org Latest News
+    url: https://www.science.org/rss/news_current.xml
+    domain: www.science.org
+  - name: NYT Science
+    url: https://rss.nytimes.com/services/xml/rss/nyt/Science.xml
+    domain: rss.nytimes.com
+  - name: ScienceDaily Top Science
+    url: https://www.sciencedaily.com/rss/top/science.xml
+    domain: www.sciencedaily.com
+  - name: Nature Atmospheric Science
+    url: https://www.nature.com/subjects/atmospheric-science.rss
+    domain: www.nature.com
+  - name: Nature Atmospheric Dynamics
+    url: https://www.nature.com/subjects/atmospheric-dynamics.rss
+    domain: www.nature.com
+  - name: Nature Climate Sciences
+    url: https://www.nature.com/subjects/climate-sciences.rss
+    domain: www.nature.com
+  - name: Nature Ocean Sciences
+    url: https://www.nature.com/subjects/ocean-sciences.rss
+    domain: www.nature.com
+  - name: Nature Physical Oceanography
+    url: https://www.nature.com/subjects/physical-oceanography.rss
+    domain: www.nature.com
+  - name: Nature Climate Change
+    url: https://www.nature.com/nclimate.rss
+    domain: www.nature.com
+  - name: Nature Geoscience
+    url: https://www.nature.com/ngeo.rss
+    domain: www.nature.com
+  - name: Eos / AGU
+    url: https://eos.org/feed
+    domain: eos.org
+  - name: Carbon Brief
+    url: https://www.carbonbrief.org/feed/
+    domain: www.carbonbrief.org
