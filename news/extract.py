@@ -20,7 +20,7 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message="nltk is not installed.*", category=UserWarning)
     from newspaper import Article
 
-from images.policy import apply_policy
+from images.policy import apply_policy, is_no_derivatives_license
 from news.feeds import extract_doi
 
 USER_AGENT = "Mozilla/5.0 (compatible; wechat-news/0.1; +local-research-bot)"
@@ -60,9 +60,10 @@ def discover_figure_images(html: str, base_url: str, page_license: str) -> list[
     soup = BeautifulSoup(html, "html.parser")
     images: list[dict[str, Any]] = []
     for figure in soup.find_all("figure"):
-        image = figure.find("img")
-        if not image:
+        figure_images = figure.find_all("img")
+        if not figure_images:
             continue
+        image = figure_images[0]
         src = str(image.get("src") or image.get("data-src") or image.get("data-original") or "")
         if not src:
             continue
@@ -81,6 +82,7 @@ def discover_figure_images(html: str, base_url: str, page_license: str) -> list[
                     "license": page_license,
                     "image_source": "html_figure",
                     "image_role": "figure",
+                    "figure_image_count": len(figure_images),
                     "metadata_title": caption or alt,
                 }
             )
@@ -250,7 +252,20 @@ def download_publishable_images(
                 if width < 600 or height < 350 or aspect_ratio > 4 or aspect_ratio < 0.25:
                     raise ValueError(f"non-content image dimensions: {width}x{height}")
                 digest = hashlib.sha256(str(record["url"]).encode("utf-8")).hexdigest()[:16]
-                if opened.format == "PNG":
+                if is_no_derivatives_license(str(record.get("license") or "")):
+                    extension = {
+                        "GIF": "gif",
+                        "JPEG": "jpg",
+                        "PNG": "png",
+                        "WEBP": "webp",
+                    }.get(str(opened.format or "").upper())
+                    if not extension:
+                        raise ValueError(
+                            f"ND image format cannot be preserved: {opened.format or 'unknown'}"
+                        )
+                    path = destination / f"{digest}.{extension}"
+                    path.write_bytes(content)
+                elif opened.format == "PNG":
                     path = destination / f"{digest}.png"
                     opened.save(path, format="PNG", optimize=True)
                 else:

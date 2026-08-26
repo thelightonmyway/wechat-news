@@ -14,12 +14,14 @@ from unittest.mock import MagicMock, patch
 from bot.bridge import QQNewsBot
 from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE
 from db import Database
-from images.policy import assess_image
+from images.policy import apply_policy, assess_image
 from news.feeds import canonicalize_url, normalize_title
 from news.pipeline import (
     PAPER_CONTENT,
     POPULAR_CONTENT,
     NewsPipeline,
+    _apply_article_license_to_html_figures,
+    _paper_wechat_cover,
     _prepare_paper_markdown,
     _select_article_images,
     content_type_for_date,
@@ -1411,10 +1413,73 @@ class V1Tests(unittest.TestCase):
         self.assertTrue(assess_image("Public Domain")[0])
         self.assertFalse(assess_image("CC BY-NC-ND 4.0")[0])
         self.assertFalse(assess_image("CC BY-ND 4.0")[0])
+        self.assertTrue(
+            assess_image("CC BY-NC-ND 4.0", allow_no_derivatives=True)[0]
+        )
+        self.assertTrue(assess_image("CC BY-ND 4.0", allow_no_derivatives=True)[0])
         self.assertFalse(assess_image("CC BY-NC", credit="Getty Images")[0])
         self.assertFalse(assess_image("CC BY-NC", credit="Reproduced with permission")[0])
         self.assertFalse(assess_image("CC BY-NC", credit="Based on Google Earth imagery")[0])
         self.assertFalse(assess_image("unknown")[0])
+
+    def test_paper_nd_figures_allow_body_but_not_cover(self):
+        nd = apply_policy(
+            {
+                "url": "https://example.test/nd.png",
+                "local_path": "/tmp/nd.png",
+                "license": "CC BY-NC-ND 4.0",
+                "caption": "Complete Figure 1",
+                "image_source": "html_figure",
+                "image_role": "figure",
+            },
+            allow_no_derivatives=True,
+        )
+        reusable = apply_policy(
+            {
+                "url": "https://example.test/by.png",
+                "local_path": "/tmp/by.png",
+                "license": "CC BY 4.0",
+                "caption": "Complete Figure 2",
+                "image_source": "html_figure",
+                "image_role": "figure",
+            }
+        )
+
+        self.assertTrue(nd["publishable"])
+        self.assertFalse(nd["derivatives_allowed"])
+        self.assertFalse(nd["cover_eligible"])
+        cover, body, _ = _select_article_images([nd, reusable], PAPER_CONTENT)
+        self.assertEqual(cover, reusable)
+        self.assertIn(nd, body)
+        nd_only_cover, nd_only_body, _ = _select_article_images([nd], PAPER_CONTENT)
+        self.assertIsNone(nd_only_cover)
+        self.assertEqual(nd_only_body, [nd])
+        self.assertEqual(
+            _paper_wechat_cover(
+                {
+                    "wechat_cover_path": "/tmp/cropped-cover.png",
+                    "source_pdf": "/tmp/paper.pdf",
+                    "license": "CC BY-NC-ND 4.0",
+                }
+            ),
+            {},
+        )
+
+    def test_paper_nd_figure_specific_restrictions_take_priority(self):
+        records = _apply_article_license_to_html_figures(
+            [
+                {
+                    "image_source": "html_figure",
+                    "figure_image_count": 1,
+                    "caption": "Figure 1",
+                    "credit": "Reproduced with permission",
+                    "license": "",
+                }
+            ],
+            "CC BY-NC-ND 4.0",
+        )
+        self.assertFalse(records[0]["publishable"])
+        self.assertIn("third-party marker", records[0]["reason"])
 
     def test_target_openid_binds_only_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

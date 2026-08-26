@@ -13,7 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from db import Database, utc_now
-from images.policy import apply_policy
+from images.policy import apply_policy, format_license_label, is_no_derivatives_license
 from images.search import search_public_images
 from news.extract import download_publishable_images, extract_article
 from news.feeds import fetch_all_feeds, normalize_title
@@ -447,7 +447,18 @@ def _apply_article_license_to_html_figures(
         record = dict(image)
         if record.get("image_source") == "html_figure":
             record["license"] = article_license or record.get("license") or ""
-            record = apply_policy(record)
+            record = apply_policy(record, allow_no_derivatives=True)
+            if (
+                record.get("publishable")
+                and is_no_derivatives_license(str(record.get("license") or ""))
+                and int(record.get("figure_image_count") or 1) != 1
+            ):
+                record["publishable"] = False
+                record["cover_eligible"] = False
+                record["reason"] = (
+                    "ND figure contains multiple image regions; complete unmodified figure "
+                    "cannot be guaranteed"
+                )
         updated.append(record)
     return updated
 
@@ -478,17 +489,22 @@ def _select_article_images(
         ),
         reverse=True,
     )
-    cover: dict[str, Any] | None = ranked[0] if ranked else None
-    if content_type == PAPER_CONTENT and ranked:
+    cover_ranked = [
+        image
+        for image in ranked
+        if not is_no_derivatives_license(str(image.get("license") or ""))
+    ]
+    cover: dict[str, Any] | None = cover_ranked[0] if cover_ranked else None
+    if content_type == PAPER_CONTENT and cover_ranked:
         preferred_html = [
             image
-            for image in ranked
+            for image in cover_ranked
             if image.get("image_source") != "pdf_figure"
             and str(image.get("image_role") or "").lower()
             in {"hero", "graphical_abstract", "article_cover", "cover"}
         ]
         pdf_figures = sorted(
-            [image for image in ranked if image.get("image_source") == "pdf_figure"],
+            [image for image in cover_ranked if image.get("image_source") == "pdf_figure"],
             key=lambda image: int(image.get("figure_number") or 0),
         )
         if preferred_html:
@@ -517,6 +533,55 @@ def _select_article_images(
         if len(body) == limit:
             break
     return cover, body, redundant_count
+
+
+def _paper_nd_attribution(image: dict[str, Any], dossier: dict[str, Any]) -> str:
+    if dossier.get("content_type") != PAPER_CONTENT or not is_no_derivatives_license(
+        str(image.get("license") or "")
+    ):
+        return ""
+
+    credit = " ".join(str(image.get("credit") or "").split())
+    openalex = dossier.get("openalex") or {}
+    authors = openalex.get("authors") or dossier.get("authors") or []
+    creator = credit
+    if not creator and authors:
+        creator = str(authors[0]).strip()
+        if creator and len(authors) > 1:
+            creator = f"{creator} et al."
+
+    year = ""
+    for value in (
+        openalex.get("publication_year"),
+        openalex.get("publication_date"),
+        dossier.get("published_at"),
+    ):
+        match = re.search(r"\b(?:19|20)\d{2}\b", str(value or ""))
+        if match:
+            year = match.group(0)
+            break
+    if creator and year and year not in creator:
+        creator = f"{creator} ({year})"
+
+    license_label = format_license_label(
+        str(image.get("license") or ""),
+        str(image.get("license_url") or ""),
+    )
+    parts = [part for part in (creator, license_label) if part]
+    return f"图源：{', '.join(parts)}" if parts else ""
+
+
+def _paper_wechat_cover(paper_first_page: dict[str, Any]) -> dict[str, Any]:
+    if not paper_first_page.get("wechat_cover_path") or is_no_derivatives_license(
+        str(paper_first_page.get("license") or "")
+    ):
+        return {}
+    return {
+        "image_source": "paper_first_page",
+        "local_path": paper_first_page.get("wechat_cover_path", ""),
+        "source_pdf": paper_first_page.get("source_pdf", ""),
+        "page": 1,
+    }
 
 
 def _prepare_paper_markdown(
@@ -1174,16 +1239,7 @@ class NewsPipeline:
                     self.logger.warning("Paper first-page rendering failed: %s", exc)
                     dossier["paper_first_page_error"] = f"{type(exc).__name__}: {exc}"[:1000]
             dossier["paper_first_page"] = paper_first_page
-            dossier["wechat_cover"] = (
-                {
-                    "image_source": "paper_first_page",
-                    "local_path": paper_first_page.get("wechat_cover_path", ""),
-                    "source_pdf": paper_first_page.get("source_pdf", ""),
-                    "page": 1,
-                }
-                if paper_first_page.get("wechat_cover_path")
-                else {}
-            )
+            dossier["wechat_cover"] = _paper_wechat_cover(paper_first_page)
             await asyncio.to_thread(
                 _prepare_paper_markdown,
                 markdown_path,
@@ -1253,6 +1309,9 @@ class NewsPipeline:
                 caption = body_image_captions[index - 1]
                 if caption:
                     image_section.append(f"*图{index}. {caption}*")
+                attribution = _paper_nd_attribution(image, dossier)
+                if attribution:
+                    image_section.append(f"*{attribution}*")
                 image_section.append("")
             terminal_sections.append("\n".join(image_section).rstrip())
         references = reference_markdown(dossier)

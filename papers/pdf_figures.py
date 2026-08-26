@@ -13,7 +13,7 @@ import httpx
 import pymupdf4llm
 from bs4 import BeautifulSoup
 
-from images.policy import apply_policy
+from images.policy import apply_policy, is_no_derivatives_license
 
 USER_AGENT = "Mozilla/5.0 (compatible; wechat-news/0.1; +local-research-bot)"
 FIGURE_NUMBER = re.compile(r"^\s*(?:fig(?:ure)?\.?)\s*(\d+)\s*(?:[|:.-]\s*)?", re.IGNORECASE)
@@ -271,6 +271,26 @@ def extract_pdf_figures(
                 nearby,
                 key=lambda value: sum(_axis_gap(picture_bbox, value[2])),
             )
+            if is_no_derivatives_license(article_license):
+                adjacent_pictures = [
+                    index
+                    for index, candidate in enumerate(boxes)
+                    if candidate.get("boxclass") == "picture"
+                    and _adjacent(_bbox(candidate), anchor_bbox)
+                ]
+                if len(adjacent_pictures) != 1:
+                    rejected.append(
+                        {
+                            "page": page.get("page_number"),
+                            "picture_box_index": picture_index,
+                            "picture_bbox": picture_bbox,
+                            "reason": (
+                                "ND figure has multiple picture regions; complete unmodified "
+                                "figure cannot be guaranteed"
+                            ),
+                        }
+                    )
+                    continue
             caption_indices = _caption_continuations(boxes, anchor_index, picture_index)
             caption = " ".join(_box_text(boxes[index]) for index in caption_indices).strip()
             if not FIGURE_NUMBER.match(caption):
@@ -319,7 +339,8 @@ def extract_pdf_figures(
                     "picture_bbox": picture_bbox,
                     "caption_bboxes": [_bbox(boxes[index]) for index in caption_indices],
                     "caption_boxclasses": [boxes[index].get("boxclass") for index in caption_indices],
-                }
+                },
+                allow_no_derivatives=True,
             )
             matched.append(record)
             used_numbers.add(number)

@@ -25,9 +25,6 @@ THIRD_PARTY_MARKERS = (
     "third party",
 )
 REJECTED_MARKERS = (
-    "cc by-nd",
-    "by-nd",
-    "-nd",
     "all rights reserved",
     "publisher copyright",
     "copyrighted",
@@ -64,10 +61,46 @@ def normalize_license(value: str | None) -> str:
     return text
 
 
+def is_no_derivatives_license(value: str | None) -> bool:
+    return re.search(r"\bcc\s*by(?:-[a-z]+)*-nd\b", normalize_license(value)) is not None
+
+
+def format_license_label(value: str | None, license_url: str | None = None) -> str:
+    license_text = normalize_license(value)
+    if re.search(r"\bcc\s*by-nc-nd\b", license_text):
+        label = "CC BY-NC-ND"
+    elif re.search(r"\bcc\s*by-nd\b", license_text):
+        label = "CC BY-ND"
+    elif re.search(r"\bcc\s*by-nc-sa\b", license_text):
+        label = "CC BY-NC-SA"
+    elif re.search(r"\bcc\s*by-sa\b", license_text):
+        label = "CC BY-SA"
+    elif re.search(r"\bcc\s*by-nc\b", license_text):
+        label = "CC BY-NC"
+    elif re.search(r"\bcc\s*by\b", license_text):
+        label = "CC BY"
+    elif "cc0" in license_text:
+        label = "CC0"
+    elif "public domain" in license_text:
+        label = "Public Domain"
+    else:
+        return ""
+
+    version = ""
+    for source in (value or "", license_url or ""):
+        match = re.search(r"(?<!\d)(\d+\.\d+)(?!\d)", source)
+        if match:
+            version = match.group(1)
+            break
+    return f"{label} {version}" if version else label
+
+
 def assess_image(
     license_value: str | None,
     caption: str | None = None,
     credit: str | None = None,
+    *,
+    allow_no_derivatives: bool = False,
 ) -> tuple[bool, str]:
     license_text = normalize_license(license_value)
     context = " ".join((caption or "", credit or "")).lower()
@@ -80,7 +113,10 @@ def assess_image(
     if rejected:
         return False, f"license rejected: {rejected}"
 
-    if re.search(r"\bcc\s*by(?:-[a-z]+)*-nd\b", license_text):
+    if is_no_derivatives_license(license_value):
+        if allow_no_derivatives:
+            label = format_license_label(license_value) or "NoDerivatives"
+            return True, f"{label}; unmodified complete figure only"
         return False, "no-derivatives license"
 
     if "cc0" in license_text:
@@ -98,13 +134,22 @@ def assess_image(
     return False, "unknown or non-reusable license"
 
 
-def apply_policy(image: dict[str, Any]) -> dict[str, Any]:
+def apply_policy(
+    image: dict[str, Any],
+    *,
+    allow_no_derivatives: bool = False,
+) -> dict[str, Any]:
+    license_value = str(image.get("license") or "")
     publishable, reason = assess_image(
-        str(image.get("license") or ""),
+        license_value,
         str(image.get("caption") or ""),
         str(image.get("credit") or ""),
+        allow_no_derivatives=allow_no_derivatives,
     )
+    no_derivatives = is_no_derivatives_license(license_value)
     result = dict(image)
     result["publishable"] = publishable
     result["reason"] = reason
+    result["derivatives_allowed"] = not no_derivatives
+    result["cover_eligible"] = publishable and not no_derivatives
     return result
