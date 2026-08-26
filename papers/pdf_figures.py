@@ -123,8 +123,8 @@ def discover_pdf_source(
 
 def _box_text(box: dict[str, Any]) -> str:
     return " ".join(
-        " ".join(str(span.get("text") or "") for span in line.get("spans", []))
-        for line in box.get("textlines", [])
+        " ".join(str(span.get("text") or "") for span in (line.get("spans") or []))
+        for line in (box.get("textlines") or [])
     ).strip()
 
 
