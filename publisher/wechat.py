@@ -36,15 +36,15 @@ def _article_metadata(markdown_path: Path) -> dict[str, Any]:
 def _paper_draft_title(metadata: dict[str, Any], fallback_title: str) -> str:
     article_title = str(metadata.get("title_cn") or fallback_title or "科研解读").strip()
     journal = str(metadata.get("journal") or "").strip()
-    if journal:
-        preferred = f"最新成果丨{journal}：{article_title}"
-        if len(preferred) <= 64:
-            return preferred
-        journal_title = f"{journal}：{article_title}"
-        if len(journal_title) <= 64:
-            return journal_title
-    fallback = f"最新成果丨{article_title}"
-    return fallback if len(fallback) <= 64 else article_title
+    if not journal:
+        return article_title[:64]
+    preferred = f"{journal}：{article_title}"
+    if len(preferred) <= 64:
+        return preferred
+    available = 64 - len(journal) - 1
+    if available > 0:
+        return f"{journal}：{article_title[:available]}"
+    return journal[:64]
 
 
 def ensure_tool_config(settings: Settings) -> None:

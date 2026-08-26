@@ -60,8 +60,10 @@ def select_top_ten(
                     "role": "system",
                     "content": (
                         "你是科研新闻标题翻译编辑。"
-                        "如果候选不超过10篇，必须保留全部候选并按原index逐篇生成中文标题，不得遗漏；"
-                        "只有候选超过10篇时才选择其中10篇。"
+                        "逐篇判断候选是否真正涉及近地面风、风能、大气环流、边界层、陆气相互作用、"
+                        "海气相互作用、检测归因、相关观测、极端天气气候机制、水汽降水机制或极地臭氧过程。"
+                        "泛泛的气候模型评估、CMIP基准测试、干旱生态、海冰生态或生产力研究不得仅因宽泛关键词入选。"
+                        "最多返回10篇，可以少于10篇；即使候选不足10篇也必须剔除不相关项，禁止凑数。"
                         "生成中文标题时，以英文原标题为唯一依据，只做忠实翻译和轻微中文润色。"
                         "可以调整语序，使中文自然、简洁，新闻标题不必逐字直译；学术专业术语必须准确。"
                         "禁止根据摘要或其他元数据补充原标题没有的信息、原因、机制、对象或结论，"
@@ -95,18 +97,10 @@ def select_top_ten(
             title_by_index[index] = title_cn
             used.add(index)
 
-        if len(candidates) <= 10:
-            if len(title_by_index) != len(candidates):
-                raise ValueError("model returned an incomplete title batch")
-            for index, candidate in enumerate(candidates, start=1):
-                selected.append(dict(candidate, title_cn=title_by_index[index]))
-        else:
-            for index, title_cn in title_by_index.items():
-                selected.append(dict(candidates[index - 1], title_cn=title_cn))
-                if len(selected) == 10:
-                    break
-            if len(selected) != 10:
-                raise ValueError("model returned an incomplete selection")
+        for index in sorted(title_by_index):
+            selected.append(dict(candidates[index - 1], title_cn=title_by_index[index]))
+            if len(selected) == 10:
+                break
         return selected, True, ""
     except Exception as exc:
         return fallback, False, f"{type(exc).__name__}: {exc}"

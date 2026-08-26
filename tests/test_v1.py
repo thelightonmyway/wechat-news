@@ -21,6 +21,7 @@ from news.pipeline import (
     POPULAR_CONTENT,
     NewsPipeline,
     _apply_article_license_to_html_figures,
+    _paper_publication_within_window,
     _paper_wechat_cover,
     _prepare_paper_markdown,
     _select_article_images,
@@ -93,6 +94,51 @@ class V1Tests(unittest.TestCase):
             }
         )
         self.assertGreater(score, 30)
+
+    def test_shared_topic_relevance_requires_specific_process(self):
+        self.assertFalse(
+            is_relevant_topic(
+                {
+                    "content_type": POPULAR_CONTENT,
+                    "title": "Generic climate model benchmarking",
+                    "summary": "CMIP6 model evaluation",
+                }
+            )
+        )
+        self.assertFalse(
+            is_relevant_topic(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Generic climate model benchmarking",
+                    "summary": "CMIP6 model evaluation",
+                }
+            )
+        )
+        self.assertTrue(
+            is_relevant_topic(
+                {
+                    "title": "Climate model projections of surface wind",
+                    "summary": "Near-surface wind speed changes",
+                }
+            )
+        )
+        for title in (
+            "Heatwaves and temperature extremes",
+            "Mechanisms of extreme precipitation",
+            "Temperature-soil moisture feedback",
+            "Tropical cyclone dynamics",
+            "Wildfire risk during heat and drought",
+        ):
+            self.assertTrue(is_relevant_topic({"title": title, "summary": ""}), title)
+        self.assertFalse(is_relevant_topic({"title": "Wildfire impacts", "summary": ""}))
+        self.assertFalse(
+            is_relevant_topic(
+                {
+                    "title": "Post-fire vegetation recovery during heat",
+                    "summary": "Ecological succession after wildfire",
+                }
+            )
+        )
 
     def test_weekly_content_types(self):
         self.assertEqual(content_type_for_date("2026-08-24"), POPULAR_CONTENT)  # Monday
@@ -282,7 +328,7 @@ class V1Tests(unittest.TestCase):
             [9, 8, 7, 6, 5, 4, 3],
         )
 
-    def test_48h_expands_to_7d_without_filling_irrelevant_items(self):
+    def test_news_expands_48h_to_7d_and_30d_without_filling(self):
         def item(index, title, summary):
             return {
                 "source": "test",
@@ -339,7 +385,7 @@ class V1Tests(unittest.TestCase):
                 pipeline._extract_shortlist = fake_extract
                 with patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch):
                     candidates = await pipeline.refresh("2026-08-24", POPULAR_CONTENT)
-                self.assertEqual(calls, [48, 168])
+                self.assertEqual(calls, [48, 168, 720])
                 self.assertEqual(len(candidates), 5)
                 self.assertTrue(all(is_relevant_topic(value) for value in candidates))
                 self.assertFalse(any("Batter" in value["title"] for value in candidates))
@@ -347,6 +393,82 @@ class V1Tests(unittest.TestCase):
                 self.assertFalse(any("Solar" in value["title"] for value in candidates))
 
         asyncio.run(check())
+
+    def test_paper_expands_48h_to_7d_and_30d(self):
+        titles = {
+            1: "Near-surface wind speed recovery",
+            2: "Polar vortex circulation dynamics",
+            3: "Air-sea interaction and ocean energy input",
+        }
+
+        def item(index):
+            return {
+                "source": "test",
+                "url": f"https://example.test/paper-{index}",
+                "canonical_url": f"https://example.test/paper-{index}",
+                "title": titles[index],
+                "normalized_title": normalize_title(titles[index]),
+                "summary": titles[index],
+                "published_at": "2026-08-26T00:00:00+00:00",
+                "doi": f"10.1000/paper-{index}",
+                "journal": "Journal of Climate",
+                "word_count": 800,
+                "status": "discovered",
+                "discovered_at": "2026-08-26T00:00:00+00:00",
+            }
+
+        windows = {
+            48: [item(1)],
+            168: [item(1), item(2)],
+            720: [item(1), item(2), item(3)],
+        }
+        calls = []
+
+        def fake_fetch(_path, hours):
+            calls.append(hours)
+            values = windows[hours]
+            return copy.deepcopy(values), [], {"test": len(values)}
+
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "paper-window.db",
+                    model_base_url="",
+                    model_api_key="",
+                    model_name="",
+                )
+                pipeline = NewsPipeline(settings)
+
+                async def fake_extract(values):
+                    return copy.deepcopy(values)
+
+                async def fake_published(values, _run_date):
+                    return copy.deepcopy(values)
+
+                pipeline._extract_shortlist = fake_extract
+                pipeline._published_papers = fake_published
+                with patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch):
+                    candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual(calls, [48, 168, 720])
+                self.assertEqual(len(candidates), 3)
+
+        asyncio.run(check())
+
+    def test_paper_publication_date_must_be_within_30_days(self):
+        self.assertTrue(
+            _paper_publication_within_window(
+                {"publication_date": "2026-07-27"},
+                "2026-08-26",
+            )
+        )
+        self.assertFalse(
+            _paper_publication_within_window(
+                {"publication_date": "2026-07-26"},
+                "2026-08-26",
+            )
+        )
 
     def test_refresh_excludes_drafted_url_and_doi_but_keeps_failed(self):
         def item(index, title, *, doi="", canonical_url=None):
@@ -1210,14 +1332,16 @@ class V1Tests(unittest.TestCase):
             self.assertTrue(markdown_text.startswith("![论文第一页](images/paper-first-page.png)"))
             self.assertNotIn(f"# {title_cn}", markdown_text)
             self.assertEqual(_selected_cover_path(markdown), wechat_cover)
+            draft_title = _paper_draft_title(metadata, title_cn)
             self.assertEqual(
-                _paper_draft_title(metadata, title_cn),
+                draft_title,
                 "Communications Earth & Environment："
                 "夏季风变率驱动中国北方毛乌素沙地绿化和新石器时代社会变迁",
             )
+            self.assertNotIn("最新成果", draft_title)
             self.assertEqual(
                 _paper_draft_title({"content_type": PAPER_CONTENT}, title_cn),
-                f"最新成果丨{title_cn}",
+                title_cn,
             )
 
     def test_paper_formatter_removes_duplicate_h1_after_brand_header(self):
@@ -1511,7 +1635,7 @@ class V1Tests(unittest.TestCase):
 
         asyncio.run(check())
 
-    def test_batch_chinese_titles_use_one_model_call_and_keep_order(self):
+    def test_model_can_select_fewer_than_ten_and_keep_order(self):
         settings = replace(
             load_settings(),
             model_base_url="https://model.example/v1",
@@ -1520,7 +1644,7 @@ class V1Tests(unittest.TestCase):
         )
         candidates = [
             {"title": f"English title {index}", "source": "Nature News", "score": 20 - index}
-            for index in range(1, 11)
+            for index in range(1, 8)
         ]
         response = SimpleNamespace(
             choices=[
@@ -1529,8 +1653,8 @@ class V1Tests(unittest.TestCase):
                         content=json.dumps(
                             {
                                 "items": [
-                                    {"index": index, "title_cn": f"中文标题{index}"}
-                                    for index in range(10, 0, -1)
+                                    {"index": 5, "title_cn": "中文标题5"},
+                                    {"index": 2, "title_cn": "中文标题2"},
                                 ]
                             },
                             ensure_ascii=False,
@@ -1553,13 +1677,15 @@ class V1Tests(unittest.TestCase):
         self.assertIn("禁止根据摘要或其他元数据补充", system_prompt)
         self.assertIn("禁止为了吸引眼球扩大、强化或改写原文含义", system_prompt)
         self.assertIn("删除原标题末尾", system_prompt)
+        self.assertIn("最多返回10篇，可以少于10篇", system_prompt)
+        self.assertIn("禁止凑数", system_prompt)
         self.assertEqual(
             [item["title_cn"] for item in selected],
-            [f"中文标题{index}" for index in range(1, 11)],
+            ["中文标题2", "中文标题5"],
         )
         self.assertEqual(
             [item["title"] for item in selected],
-            [f"English title {index}" for index in range(1, 11)],
+            ["English title 2", "English title 5"],
         )
 
     def test_news_restores_chinese_title_and_keeps_english_title(self):

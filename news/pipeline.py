@@ -7,7 +7,7 @@ import difflib
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date as date_type, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -124,14 +124,21 @@ CORE_TOPIC_GROUPS = {
         "observational coverage",
         "climate observations",
     ),
-    "extremes": (
-        "extreme precipitation",
+    "temperature_extremes": (
+        "temperature",
+        "air temperature",
+        "surface air temperature",
+        "temperature extreme",
+        "temperature extremes",
         "extreme temperature",
         "heatwave",
+        "heatwaves",
         "heat wave",
-        "drought",
+        "heat waves",
         "extreme wind",
         "compound extremes",
+        "compound climate extremes",
+        "drought",
     ),
     "ocean_air_sea": (
         "southern ocean",
@@ -159,18 +166,106 @@ CORE_TOPIC_GROUPS = {
         "southern hemisphere westerlies",
     ),
     "moisture_precipitation": (
+        "precipitation",
+        "heavy precipitation",
+        "extreme precipitation",
+        "precipitation extreme",
+        "precipitation extremes",
+        "atmospheric moisture",
+        "water vapor",
+        "water vapour",
+        "humidity",
         "moisture transport",
         "moisture convergence",
+        "soil moisture",
+        "evapotranspiration",
         "vertical motion",
         "precipitation mechanism",
         "precipitation variability",
         "precipitation change",
         "asian monsoon",
     ),
+    "cloud_radiation": (
+        "cloud",
+        "clouds",
+        "cloud radiative effect",
+        "cloud radiative effects",
+        "radiation",
+        "radiative forcing",
+    ),
+    "snow": (
+        "snow",
+        "snow cover",
+    ),
+    "storms": (
+        "tropical cyclone",
+        "tropical cyclones",
+        "cyclone",
+        "cyclones",
+        "typhoon",
+        "typhoons",
+        "hurricane",
+        "hurricanes",
+        "storm",
+        "storms",
+        "storm dynamics",
+        "fire weather",
+    ),
 }
 TOPIC_TERMS = tuple(
     term for terms in CORE_TOPIC_GROUPS.values() for term in terms
 )
+WILDFIRE_TERMS = ("wildfire", "wildfires")
+WILDFIRE_WEATHER_TERMS = (
+    "temperature",
+    "heat",
+    "drought",
+    "humidity",
+    "wind",
+    "precipitation",
+    "fire weather",
+    "climate variability",
+    "climate change",
+)
+WILDFIRE_EXCLUDED_CONTEXTS = (
+    "post-fire vegetation",
+    "post fire vegetation",
+    "vegetation recovery",
+    "forest management",
+    "fire management",
+    "ecological succession",
+    "social impact",
+    "social impacts",
+    "economic impact",
+    "economic impacts",
+)
+BROAD_CONTEXT_TERMS = {
+    "climate change",
+    "cmip5",
+    "cmip6",
+    "large ensemble",
+    "climate model",
+    "model evaluation",
+    "era5",
+    "reanalysis",
+    "station observations",
+    "satellite observations",
+    "observational coverage",
+    "climate observations",
+    "drought",
+    "monsoon",
+    "asian monsoon",
+    "sea ice",
+    "antarctic sea ice",
+    "arctic sea ice",
+    "southern ocean",
+    "land cover",
+    "vegetation cover",
+    "vegetation feedback",
+    "forest cover",
+    "precipitation variability",
+    "precipitation change",
+}
 EXCLUDED_TERMS = (
     "battery",
     "batteries",
@@ -233,6 +328,7 @@ EXCLUDED_TERMS = (
 )
 POPULAR_CONTENT = "popular"
 PAPER_CONTENT = "paper"
+LOOKBACK_HOURS = (48, 168, 720)
 
 
 def content_type_for_date(date_value: str) -> str:
@@ -262,11 +358,20 @@ def matched_topic_groups(item: dict[str, Any]) -> set[str]:
     text = _topic_text(item)
     if any(_contains_term(text, term) for term in EXCLUDED_TERMS):
         return set()
-    return {
+    wildfire = any(_contains_term(text, term) for term in WILDFIRE_TERMS)
+    if wildfire and any(context in text for context in WILDFIRE_EXCLUDED_CONTEXTS):
+        return set()
+    groups = {
         group
         for group, terms in CORE_TOPIC_GROUPS.items()
-        if any(_contains_term(text, term) for term in terms)
+        if any(
+            term not in BROAD_CONTEXT_TERMS and _contains_term(text, term)
+            for term in terms
+        )
     }
+    if wildfire and any(_contains_term(text, term) for term in WILDFIRE_WEATHER_TERMS):
+        groups.add("wildfire_weather")
+    return groups
 
 
 def is_relevant_topic(item: dict[str, Any]) -> bool:
@@ -648,6 +753,19 @@ def local_date(settings: Settings, now: datetime | None = None) -> str:
     return current.astimezone(ZoneInfo(settings.daily_timezone)).date().isoformat()
 
 
+def _paper_publication_within_window(
+    metadata: dict[str, Any],
+    run_date: str,
+    days: int = 30,
+) -> bool:
+    try:
+        published = date_type.fromisoformat(str(metadata.get("publication_date") or ""))
+        current = date_type.fromisoformat(run_date)
+    except ValueError:
+        return False
+    return current - timedelta(days=days) <= published <= current
+
+
 def _parse_datetime(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -747,7 +865,11 @@ class NewsPipeline:
                 by_url[key] = result
         return list(by_url.values())
 
-    async def _published_papers(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def _published_papers(
+        self,
+        items: list[dict[str, Any]],
+        run_date: str,
+    ) -> list[dict[str, Any]]:
         if not self.openalex.configured:
             self.logger.warning("Wednesday paper selection skipped: OPENALEX_API_KEY not configured")
             return []
@@ -764,8 +886,14 @@ class NewsPipeline:
                     return None
             merged = dict(item)
             merged["openalex"] = metadata
-            if not self.openalex.is_formally_published(metadata) or not is_relevant_topic(merged):
+            run_day = date_type.fromisoformat(run_date)
+            if not self.openalex.is_formally_published(
+                metadata,
+                today=run_day,
+            ) or not _paper_publication_within_window(metadata, run_date):
                 return None
+            merged["source_published_at"] = merged.get("published_at") or ""
+            merged["paper_publication_date"] = metadata.get("publication_date") or ""
             merged["title"] = metadata.get("title") or merged.get("title") or ""
             merged["normalized_title"] = normalize_title(str(merged["title"]))
             merged["summary"] = metadata.get("abstract") or merged.get("summary") or ""
@@ -773,6 +901,8 @@ class NewsPipeline:
             merged["source"] = metadata.get("journal") or merged.get("source") or "OpenAlex"
             if metadata.get("publication_date"):
                 merged["published_at"] = f"{metadata['publication_date']}T00:00:00+00:00"
+            if not is_relevant_topic(merged):
+                return None
             merged["status"] = "published_paper"
             return merged
 
@@ -797,40 +927,37 @@ class NewsPipeline:
             )
             try:
                 published = self.db.published_article_identifiers()
-                items, feed_errors, source_counts = await asyncio.to_thread(
-                    fetch_all_feeds,
-                    self.feed_config,
-                    48,
-                )
-                topic_items = [
-                    item
-                    for item in items
-                    if is_relevant_topic(item)
-                    and not _is_published_article(item, published)
-                ]
-                lookback_hours = 48
-                if len(topic_items) < 10:
-                    expanded_items, expanded_errors, expanded_counts = await asyncio.to_thread(
+                feed_errors: list[str] = []
+                source_counts: dict[str, int] = {}
+                topic_items: list[dict[str, Any]] = []
+                enriched: list[dict[str, Any]] = []
+                lookback_hours = LOOKBACK_HOURS[0]
+                for window_hours in LOOKBACK_HOURS:
+                    items, window_errors, window_counts = await asyncio.to_thread(
                         fetch_all_feeds,
                         self.feed_config,
-                        168,
+                        window_hours,
                     )
+                    feed_errors = list(dict.fromkeys([*feed_errors, *window_errors]))
+                    source_counts = window_counts
+                    lookback_hours = window_hours
                     topic_items = [
                         item
-                        for item in expanded_items
+                        for item in items
                         if is_relevant_topic(item)
                         and not _is_published_article(item, published)
                     ]
-                    feed_errors = list(dict.fromkeys([*feed_errors, *expanded_errors]))
-                    source_counts = expanded_counts
-                    lookback_hours = 168
+                    normalized = deduplicate(topic_items)
+                    enriched = await self._extract_shortlist(normalized)
+                    enriched = [
+                        item for item in deduplicate(enriched) if is_relevant_topic(item)
+                    ]
+                    if run_type == PAPER_CONTENT:
+                        enriched = await self._published_papers(enriched, run_date)
+                        enriched = deduplicate(enriched)
+                    if len(enriched) >= 10:
+                        break
                 self.last_source_counts = source_counts
-                normalized = deduplicate(topic_items)
-                enriched = await self._extract_shortlist(normalized)
-                enriched = deduplicate(enriched)
-                if run_type == PAPER_CONTENT:
-                    enriched = await self._published_papers(enriched)
-                    enriched = deduplicate(enriched)
 
                 eligible: list[dict[str, Any]] = []
                 for item in enriched:
