@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import datetime, time, timezone
+from datetime import date as date_type, datetime, time, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,6 +29,8 @@ from news.pipeline import (
     deduplicate,
     deterministic_score,
     is_relevant_topic,
+    merge_paper_candidate_pool,
+    paper_relevance_score,
     prioritize_candidates,
 )
 from papers.doi import resolve_doi_landing_page
@@ -42,6 +44,7 @@ from writer.llm import (
     _normalize_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
+    select_paper_top_ten,
     select_top_ten,
 )
 
@@ -138,6 +141,67 @@ class V1Tests(unittest.TestCase):
                     "summary": "Ecological succession after wildfire",
                 }
             )
+        )
+
+    def test_paper_relevance_regressions_and_types(self):
+        self.assertEqual(
+            paper_relevance_score(
+                {
+                    "title": (
+                        "Drought-induced soil moisture declines in Andean catchments "
+                        "inferred from satellite-derived ground displacement"
+                    ),
+                    "summary": "A hydrology and geodetic analysis of catchment storage.",
+                    "work_type": "article",
+                }
+            ),
+            0,
+        )
+        self.assertEqual(
+            paper_relevance_score(
+                {
+                    "title": (
+                        "Central Pacific El Niño-driven Pacific–Atlantic teleconnections "
+                        "are an important source of North Atlantic Oscillation predictability"
+                    ),
+                    "summary": "ENSO teleconnections control NAO climate predictability.",
+                    "work_type": "article",
+                }
+            ),
+            3,
+        )
+        self.assertGreaterEqual(
+            paper_relevance_score(
+                {
+                    "title": (
+                        "Role of natural halogen chemistry on the evolution of global "
+                        "stratospheric ozone depletion"
+                    ),
+                    "summary": "Ozone-climate interactions in the stratosphere.",
+                    "work_type": "article",
+                }
+            ),
+            2,
+        )
+        self.assertEqual(
+            paper_relevance_score(
+                {
+                    "title": "Reply to comments on atmospheric circulation",
+                    "summary": "A reply to the original article.",
+                    "work_type": "reply",
+                }
+            ),
+            0,
+        )
+        self.assertEqual(
+            paper_relevance_score(
+                {
+                    "title": "Correction to a study of surface wind",
+                    "summary": "Publisher correction.",
+                    "work_type": "correction",
+                }
+            ),
+            0,
         )
 
     def test_weekly_content_types(self):
@@ -437,14 +501,38 @@ class V1Tests(unittest.TestCase):
                     model_base_url="",
                     model_api_key="",
                     model_name="",
+                    openalex_api_key="test-key",
                 )
                 pipeline = NewsPipeline(settings)
+                pipeline.openalex.discover_recent_papers = MagicMock(
+                    return_value=[
+                        {
+                            "title": titles[1],
+                            "abstract": titles[1],
+                            "publication_date": "2026-08-25",
+                            "journal": "Journal of Climate",
+                            "doi": "10.1000/paper-1",
+                            "type": "article",
+                        },
+                        {
+                            "title": "Stratospheric ozone depletion evolution",
+                            "abstract": "Ozone-climate interactions in the stratosphere",
+                            "publication_date": "2026-08-24",
+                            "journal": "Atmospheric Chemistry and Physics",
+                            "doi": "10.1000/openalex-ozone",
+                            "type": "article",
+                        },
+                    ]
+                )
 
                 async def fake_extract(values):
                     return copy.deepcopy(values)
 
                 async def fake_published(values, _run_date):
-                    return copy.deepcopy(values)
+                    return [
+                        {**value, "paper_local_score": 2, "work_type": "article"}
+                        for value in copy.deepcopy(values)
+                    ]
 
                 pipeline._extract_shortlist = fake_extract
                 pipeline._published_papers = fake_published
@@ -452,7 +540,13 @@ class V1Tests(unittest.TestCase):
                     candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
 
                 self.assertEqual(calls, [48, 168, 720])
-                self.assertEqual(len(candidates), 3)
+                self.assertEqual(len(candidates), 4)
+                pipeline.openalex.discover_recent_papers.assert_called_once_with(
+                    date_type(2026, 7, 27),
+                    date_type(2026, 8, 26),
+                )
+                self.assertEqual(pipeline.last_paper_discovery_stats["rss_candidates"], 3)
+                self.assertEqual(pipeline.last_paper_discovery_stats["openalex_added"], 1)
 
         asyncio.run(check())
 
@@ -468,6 +562,43 @@ class V1Tests(unittest.TestCase):
                 {"publication_date": "2026-07-26"},
                 "2026-08-26",
             )
+        )
+
+    def test_openalex_papers_merge_with_rss_and_deduplicate_doi(self):
+        rss = [
+            {
+                "title": "Surface wind variability",
+                "summary": "Near-surface wind mechanism",
+                "doi": "10.1000/shared",
+                "canonical_url": "https://publisher.test/shared",
+                "published_at": "2026-08-25T00:00:00+00:00",
+                "discovery_origin": "rss",
+            }
+        ]
+        openalex = [
+            {
+                "title": "Surface wind variability",
+                "summary": "Near-surface wind mechanism",
+                "doi": "10.1000/shared",
+                "canonical_url": "https://doi.org/10.1000/shared",
+                "published_at": "2026-08-24T00:00:00+00:00",
+                "discovery_origin": "openalex",
+            },
+            {
+                "title": "Stratospheric ozone depletion evolution",
+                "summary": "Ozone-climate interactions",
+                "doi": "10.1000/ozone",
+                "canonical_url": "https://doi.org/10.1000/ozone",
+                "published_at": "2026-08-23T00:00:00+00:00",
+                "discovery_origin": "openalex",
+            },
+        ]
+        merged = merge_paper_candidate_pool(rss, openalex)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual({item["doi"] for item in merged}, {"10.1000/shared", "10.1000/ozone"})
+        self.assertEqual(
+            sum(item.get("discovery_origin") == "openalex" for item in merged),
+            1,
         )
 
     def test_refresh_excludes_drafted_url_and_doi_but_keeps_failed(self):
@@ -1686,6 +1817,56 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(
             [item["title"] for item in selected],
             ["English title 2", "English title 5"],
+        )
+
+    def test_paper_llm_keeps_only_scores_two_and_three_without_filling(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        candidates = [
+            {
+                "title": f"Paper {index}",
+                "summary": "Physical climate mechanism",
+                "paper_local_score": 2,
+            }
+            for index in range(1, 13)
+        ]
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "items": [
+                                    {"index": 1, "score": 3, "title_cn": "核心论文"},
+                                    {"index": 2, "score": 2, "title_cn": "相关论文"},
+                                    {"index": 3, "score": 1, "title_cn": "外围论文"},
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+        with patch("writer.llm.OpenAI", return_value=client):
+            selected, used_model, error = select_paper_top_ten(candidates, settings)
+
+        self.assertTrue(used_model)
+        self.assertEqual(error, "")
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(
+            [item["paper_relevance_score"] for item in selected],
+            [3, 2],
+        )
+        self.assertEqual(
+            [item["title_cn"] for item in selected],
+            ["核心论文", "相关论文"],
         )
 
     def test_news_restores_chinese_title_and_keeps_english_title(self):

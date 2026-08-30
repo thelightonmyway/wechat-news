@@ -28,6 +28,7 @@ from writer.llm import (
     generate_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
+    select_paper_top_ten,
     select_top_ten,
 )
 
@@ -376,6 +377,218 @@ def matched_topic_groups(item: dict[str, Any]) -> set[str]:
 
 def is_relevant_topic(item: dict[str, Any]) -> bool:
     return bool(matched_topic_groups(item))
+
+
+PAPER_DISALLOWED_TYPES = {
+    "reply",
+    "correction",
+    "editorial",
+    "comment",
+    "correspondence",
+}
+PAPER_DISALLOWED_TITLE_PREFIXES = (
+    "reply to ",
+    "correction to ",
+    "author correction",
+    "publisher correction",
+    "editorial:",
+    "comment on ",
+    "correspondence:",
+)
+PAPER_RELEVANCE_GROUPS = {
+    "wind": (
+        "surface wind",
+        "near-surface wind",
+        "near surface wind",
+        "wind energy",
+        "wind power",
+        "terrestrial stilling",
+    ),
+    "circulation_teleconnection": (
+        "atmospheric circulation",
+        "jet stream",
+        "teleconnection",
+        "teleconnections",
+        "el niño",
+        "el nino",
+        "enso",
+        "north atlantic oscillation",
+        "nao",
+        "southern annular mode",
+        "sam",
+        "walker circulation",
+        "hadley circulation",
+        "polar vortex",
+    ),
+    "stratosphere_ozone": (
+        "stratosphere-troposphere",
+        "stratosphere troposphere",
+        "stratospheric ozone",
+        "ozone depletion",
+        "ozone recovery",
+        "ozone-climate",
+        "ozone climate",
+    ),
+    "temperature": (
+        "surface air temperature",
+        "air temperature",
+        "temperature extreme",
+        "temperature extremes",
+        "heatwave",
+        "heatwaves",
+        "heat wave",
+        "heat waves",
+    ),
+    "precipitation_moisture": (
+        "precipitation",
+        "water vapor",
+        "water vapour",
+        "atmospheric moisture",
+        "moisture transport",
+        "moisture convergence",
+    ),
+    "extremes_storms": (
+        "extreme weather",
+        "climate extreme",
+        "climate extremes",
+        "compound extreme",
+        "compound extremes",
+        "tropical cyclone",
+        "tropical cyclones",
+        "hurricane",
+        "typhoon",
+        "storm dynamics",
+    ),
+    "boundary_land": (
+        "boundary layer",
+        "land-atmosphere interaction",
+        "land atmosphere interaction",
+        "surface roughness",
+    ),
+    "air_sea": (
+        "air-sea interaction",
+        "air sea interaction",
+        "ocean-atmosphere interaction",
+        "ocean atmosphere interaction",
+        "ocean-atmosphere coupling",
+        "ocean atmosphere coupling",
+        "ocean circulation",
+        "wind work",
+    ),
+    "polar_climate": (
+        "polar climate",
+        "arctic climate",
+        "antarctic climate",
+        "sea ice dynamics",
+        "sea-ice dynamics",
+        "sea ice variability",
+    ),
+    "variability_predictability": (
+        "climate variability",
+        "climate predictability",
+        "predictability",
+        "internal variability",
+    ),
+    "attribution": (
+        "detection and attribution",
+        "climate attribution",
+        "anthropogenic forcing",
+        "greenhouse gas forcing",
+    ),
+}
+PAPER_CONDITIONAL_GROUPS = {
+    "land_surface_hydrology": (
+        "drought",
+        "soil moisture",
+        "evapotranspiration",
+        "catchment",
+        "hydrology",
+    ),
+    "model_evaluation": (
+        "climate model",
+        "model evaluation",
+        "model benchmarking",
+        "cmip5",
+        "cmip6",
+    ),
+    "observations": (
+        "reanalysis",
+        "era5",
+        "station observations",
+        "satellite observations",
+    ),
+    "sea_ice": ("sea ice", "sea-ice"),
+}
+PAPER_DOMAIN_EXCLUSIONS = (
+    "ground displacement",
+    "geodesy",
+    "geodetic",
+    "ecological succession",
+    "vegetation biology",
+    "species richness",
+    "biodiversity",
+    "biogeochemistry",
+    "ocean chemistry",
+    "software benchmark",
+    "software benchmarking",
+)
+PAPER_MECHANISM_MARKERS = (
+    "mechanism",
+    "dynamics",
+    "feedback",
+    "interaction",
+    "coupling",
+    "circulation",
+    "variability",
+    "predictability",
+    "attribution",
+    "forcing",
+)
+
+
+def paper_relevance_score(item: dict[str, Any]) -> int:
+    title = str(item.get("title") or "").strip().lower()
+    text = _topic_text(item)
+    work_type = str(
+        item.get("work_type")
+        or item.get("type")
+        or (item.get("openalex") or {}).get("work_type")
+        or ""
+    ).lower()
+    if work_type in PAPER_DISALLOWED_TYPES or any(
+        title.startswith(prefix) for prefix in PAPER_DISALLOWED_TITLE_PREFIXES
+    ):
+        return 0
+
+    physical_groups = {
+        group
+        for group, terms in PAPER_RELEVANCE_GROUPS.items()
+        if any(_contains_term(text, term) for term in terms)
+    }
+    conditional_groups = {
+        group
+        for group, terms in PAPER_CONDITIONAL_GROUPS.items()
+        if any(_contains_term(text, term) for term in terms)
+    }
+    if not physical_groups:
+        return 0
+    if any(marker in text for marker in PAPER_DOMAIN_EXCLUSIONS) and not any(
+        marker in text for marker in PAPER_MECHANISM_MARKERS
+    ):
+        return 0
+
+    if len(physical_groups) >= 2:
+        return 3
+    if physical_groups & {
+        "circulation_teleconnection",
+        "stratosphere_ozone",
+        "variability_predictability",
+        "attribution",
+    }:
+        return 3
+    if conditional_groups and not any(marker in text for marker in PAPER_MECHANISM_MARKERS):
+        return 1
+    return 2
 
 
 def prioritize_candidates(
@@ -833,6 +1046,47 @@ def deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
+def _openalex_discovery_item(record: dict[str, Any], run_date: str) -> dict[str, Any]:
+    doi = str(record.get("doi") or "").strip().lower()
+    url = f"https://doi.org/{doi}" if doi else ""
+    publication_date = str(record.get("publication_date") or "")
+    journal = str(record.get("journal") or "")
+    work_type = str(record.get("type") or "")
+    return {
+        "source": journal or "OpenAlex",
+        "url": url,
+        "canonical_url": url,
+        "title": str(record.get("title") or ""),
+        "normalized_title": normalize_title(str(record.get("title") or "")),
+        "summary": str(record.get("abstract") or ""),
+        "published_at": f"{publication_date}T00:00:00+00:00" if publication_date else "",
+        "doi": doi,
+        "journal": journal,
+        "word_count": 0,
+        "work_type": work_type,
+        "discovery_origin": "openalex",
+        "status": "openalex_discovered",
+        "discovered_at": f"{run_date}T00:00:00+00:00",
+        "openalex": {
+            "configured": True,
+            "found": True,
+            "doi": doi,
+            "title": str(record.get("title") or ""),
+            "abstract": str(record.get("abstract") or ""),
+            "journal": journal,
+            "publication_date": publication_date,
+            "work_type": work_type,
+        },
+    }
+
+
+def merge_paper_candidate_pool(
+    rss_candidates: list[dict[str, Any]],
+    openalex_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return deduplicate([*rss_candidates, *openalex_candidates])
+
+
 class NewsPipeline:
     def __init__(self, settings: Settings, logger: logging.Logger | None = None) -> None:
         self.settings = settings
@@ -842,6 +1096,7 @@ class NewsPipeline:
         self.feed_config = PROJECT_ROOT / "config" / "feeds.yaml"
         self.refresh_lock = asyncio.Lock()
         self.last_source_counts: dict[str, int] = {}
+        self.last_paper_discovery_stats: dict[str, int] = {}
 
     async def _extract_shortlist(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         preliminary = sorted(items, key=deterministic_score, reverse=True)[:40]
@@ -876,14 +1131,19 @@ class NewsPipeline:
         semaphore = asyncio.Semaphore(5)
 
         async def verify(item: dict[str, Any]) -> dict[str, Any] | None:
-            if not item.get("doi") or not is_relevant_topic(item):
+            if not item.get("doi") or paper_relevance_score(item) == 0:
                 return None
-            async with semaphore:
-                try:
-                    metadata = await asyncio.to_thread(self.openalex.lookup_doi, item.get("doi"))
-                except Exception as exc:
-                    self.logger.warning("OpenAlex DOI lookup failed: %s", exc)
-                    return None
+            metadata = item.get("openalex") or {}
+            if not metadata.get("found"):
+                async with semaphore:
+                    try:
+                        metadata = await asyncio.to_thread(
+                            self.openalex.lookup_doi,
+                            item.get("doi"),
+                        )
+                    except Exception as exc:
+                        self.logger.warning("OpenAlex DOI lookup failed: %s", exc)
+                        return None
             merged = dict(item)
             merged["openalex"] = metadata
             run_day = date_type.fromisoformat(run_date)
@@ -899,10 +1159,14 @@ class NewsPipeline:
             merged["summary"] = metadata.get("abstract") or merged.get("summary") or ""
             merged["journal"] = metadata.get("journal") or ""
             merged["source"] = metadata.get("journal") or merged.get("source") or "OpenAlex"
+            merged["work_type"] = metadata.get("work_type") or merged.get("work_type") or ""
             if metadata.get("publication_date"):
                 merged["published_at"] = f"{metadata['publication_date']}T00:00:00+00:00"
-            if not is_relevant_topic(merged):
+            local_score = paper_relevance_score(merged)
+            if local_score == 0:
                 return None
+            merged["paper_local_score"] = local_score
+            merged["discovery_origin"] = merged.get("discovery_origin") or "rss"
             merged["status"] = "published_paper"
             return merged
 
@@ -932,6 +1196,24 @@ class NewsPipeline:
                 topic_items: list[dict[str, Any]] = []
                 enriched: list[dict[str, Any]] = []
                 lookback_hours = LOOKBACK_HOURS[0]
+                openalex_papers: list[dict[str, Any]] = []
+                if run_type == PAPER_CONTENT and self.openalex.configured:
+                    run_day = date_type.fromisoformat(run_date)
+                    discovered = await asyncio.to_thread(
+                        self.openalex.discover_recent_papers,
+                        run_day - timedelta(days=30),
+                        run_day,
+                    )
+                    openalex_papers = await self._published_papers(
+                        [
+                            _openalex_discovery_item(record, run_date)
+                            for record in discovered
+                        ],
+                        run_date,
+                    )
+
+                rss_paper_count = 0
+                openalex_added_count = 0
                 for window_hours in LOOKBACK_HOURS:
                     items, window_errors, window_counts = await asyncio.to_thread(
                         fetch_all_feeds,
@@ -941,23 +1223,62 @@ class NewsPipeline:
                     feed_errors = list(dict.fromkeys([*feed_errors, *window_errors]))
                     source_counts = window_counts
                     lookback_hours = window_hours
-                    topic_items = [
-                        item
-                        for item in items
-                        if is_relevant_topic(item)
-                        and not _is_published_article(item, published)
-                    ]
-                    normalized = deduplicate(topic_items)
-                    enriched = await self._extract_shortlist(normalized)
-                    enriched = [
-                        item for item in deduplicate(enriched) if is_relevant_topic(item)
-                    ]
                     if run_type == PAPER_CONTENT:
-                        enriched = await self._published_papers(enriched, run_date)
-                        enriched = deduplicate(enriched)
+                        topic_items = [
+                            item
+                            for item in items
+                            if item.get("doi")
+                            and paper_relevance_score(item) > 0
+                            and not _is_published_article(item, published)
+                        ]
+                        normalized = deduplicate(topic_items)
+                        rss_enriched = await self._extract_shortlist(normalized)
+                        rss_enriched = [
+                            item
+                            for item in deduplicate(rss_enriched)
+                            if paper_relevance_score(item) > 0
+                        ]
+                        rss_papers = deduplicate(
+                            await self._published_papers(rss_enriched, run_date)
+                        )
+                        rss_paper_count = len(rss_papers)
+                        merged_papers = merge_paper_candidate_pool(
+                            rss_papers,
+                            openalex_papers,
+                        )
+                        openalex_added_count = sum(
+                            item.get("discovery_origin") == "openalex"
+                            for item in merged_papers
+                        )
+                        enriched = sorted(
+                            merged_papers,
+                            key=lambda item: (
+                                int(item.get("paper_local_score") or 0),
+                                deterministic_score(item),
+                            ),
+                            reverse=True,
+                        )[:30]
+                    else:
+                        topic_items = [
+                            item
+                            for item in items
+                            if is_relevant_topic(item)
+                            and not _is_published_article(item, published)
+                        ]
+                        normalized = deduplicate(topic_items)
+                        enriched = await self._extract_shortlist(normalized)
+                        enriched = [
+                            item for item in deduplicate(enriched) if is_relevant_topic(item)
+                        ]
                     if len(enriched) >= 10:
                         break
                 self.last_source_counts = source_counts
+                if run_type == PAPER_CONTENT:
+                    self.last_paper_discovery_stats = {
+                        "rss_candidates": rss_paper_count,
+                        "openalex_added": openalex_added_count,
+                        "coarse_filtered": len(enriched),
+                    }
 
                 eligible: list[dict[str, Any]] = []
                 for item in enriched:
@@ -973,13 +1294,34 @@ class NewsPipeline:
                     eligible.append(item)
                 enriched = eligible
 
-                prioritized = prioritize_candidates(enriched)
-                selected, used_model, llm_error = await asyncio.to_thread(
-                    select_top_ten,
-                    prioritized,
-                    self.settings,
-                )
-                selected = prioritize_candidates(selected)
+                if run_type == PAPER_CONTENT:
+                    selected, used_model, llm_error = await asyncio.to_thread(
+                        select_paper_top_ten,
+                        enriched[:30],
+                        self.settings,
+                    )
+                    selected = sorted(
+                        selected,
+                        key=lambda item: (
+                            int(item.get("paper_relevance_score") or 0),
+                            float(item.get("score") or deterministic_score(item)),
+                        ),
+                        reverse=True,
+                    )[:10]
+                    self.last_paper_discovery_stats.update(
+                        {
+                            "llm_selected": len(selected),
+                            "top10": len(selected),
+                        }
+                    )
+                else:
+                    prioritized = prioritize_candidates(enriched)
+                    selected, used_model, llm_error = await asyncio.to_thread(
+                        select_top_ten,
+                        prioritized,
+                        self.settings,
+                    )
+                    selected = prioritize_candidates(selected)
                 self.db.replace_candidates(run_date, selected, run_type)
                 errors = list(feed_errors)
                 if self.settings.model_configured and llm_error:
@@ -1033,10 +1375,24 @@ class NewsPipeline:
                     not str(item.get("title_cn") or "").strip() for item in existing
                 ):
                     title_candidates = [
-                        dict(item, article_id=int(item["id"])) for item in existing
+                        dict(
+                            item,
+                            article_id=int(item["id"]),
+                            paper_local_score=(
+                                paper_relevance_score(item)
+                                if run_type == PAPER_CONTENT
+                                else item.get("paper_local_score", 0)
+                            ),
+                        )
+                        for item in existing
                     ]
+                    selector = (
+                        select_paper_top_ten
+                        if run_type == PAPER_CONTENT
+                        else select_top_ten
+                    )
                     titled, used_model, title_error = await asyncio.to_thread(
-                        select_top_ten,
+                        selector,
                         title_candidates,
                         self.settings,
                     )

@@ -13,6 +13,25 @@ from pyalex import Works, config, invert_abstract
 LOGGER = logging.getLogger("wechat_news.openalex")
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 2
+DISCOVERY_QUERIES = (
+    "surface wind wind energy",
+    "atmospheric circulation jet stream teleconnection",
+    "ENSO NAO SAM climate predictability",
+    "polar vortex stratosphere troposphere coupling",
+    "ozone climate stratosphere",
+    "temperature heatwave climate extremes",
+    "precipitation water vapor moisture transport",
+    "drought atmospheric climate mechanism",
+    "tropical cyclone extreme weather",
+    "boundary layer land atmosphere interaction",
+    "air sea interaction ocean atmosphere",
+    "polar climate sea ice dynamics",
+    "climate variability predictability detection attribution",
+    "physical climate model evaluation reanalysis observations",
+)
+DISCOVERY_SELECT = (
+    "title,doi,publication_date,type,primary_location,abstract_inverted_index"
+)
 
 
 def normalize_doi(value: str | None) -> str:
@@ -55,6 +74,73 @@ class OpenAlexAdapter:
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
+
+    def discover_recent_papers(
+        self,
+        from_date: date,
+        to_date: date,
+        *,
+        per_query: int = 15,
+    ) -> list[dict[str, Any]]:
+        if not self.configured:
+            return []
+
+        discovered: list[dict[str, Any]] = []
+        seen_dois: set[str] = set()
+        for query in DISCOVERY_QUERIES:
+            works = None
+            for attempt in range(MAX_RETRIES + 1):
+                try:
+                    works = (
+                        Works()
+                        .search(query)
+                        .filter(
+                            from_publication_date=from_date.isoformat(),
+                            to_publication_date=to_date.isoformat(),
+                        )
+                        .select(DISCOVERY_SELECT)
+                        .get(per_page=per_query)
+                    )
+                    break
+                except Exception as exc:
+                    if _retryable_error(exc) and attempt < MAX_RETRIES:
+                        time.sleep(0.5 * (2**attempt))
+                        continue
+                    LOGGER.warning(
+                        "OpenAlex discovery unavailable query=%r attempts=%s error=%s",
+                        query,
+                        attempt + 1,
+                        exc,
+                    )
+                    works = []
+                    break
+
+            for work in works or []:
+                doi = normalize_doi(work.get("doi"))
+                if not doi or doi in seen_dois:
+                    continue
+                publication_date = str(work.get("publication_date") or "")
+                try:
+                    published = date.fromisoformat(publication_date)
+                except ValueError:
+                    continue
+                if published < from_date or published > to_date:
+                    continue
+                primary_location = work.get("primary_location") or {}
+                source = primary_location.get("source") or {}
+                abstract_index = work.get("abstract_inverted_index")
+                discovered.append(
+                    {
+                        "title": work.get("title") or "",
+                        "abstract": invert_abstract(abstract_index) if abstract_index else "",
+                        "publication_date": publication_date,
+                        "journal": source.get("display_name") or "",
+                        "doi": doi,
+                        "type": work.get("type") or "",
+                    }
+                )
+                seen_dois.add(doi)
+        return discovered
 
     def lookup_doi(self, doi_value: str | None) -> dict[str, Any]:
         doi = normalize_doi(doi_value)

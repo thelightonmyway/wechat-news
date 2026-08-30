@@ -106,6 +106,92 @@ def select_top_ten(
         return fallback, False, f"{type(exc).__name__}: {exc}"
 
 
+def select_paper_top_ten(
+    candidates: list[dict[str, Any]],
+    settings: Settings,
+) -> tuple[list[dict[str, Any]], bool, str]:
+    fallback = [
+        dict(item, title_cn=str(item.get("title_cn") or ""))
+        for item in candidates
+        if int(item.get("paper_local_score") or 0) >= 2
+    ][:10]
+    if not candidates:
+        return [], False, "no candidates"
+    if not settings.model_configured:
+        return fallback, False, "model not configured"
+
+    payload = [
+        {
+            "index": index,
+            "title": item.get("title", ""),
+            "abstract": str(item.get("summary") or "")[:8000],
+            "publication_date": item.get("published_at", ""),
+            "journal": item.get("journal", ""),
+            "doi": item.get("doi", ""),
+            "type": item.get("work_type", ""),
+        }
+        for index, item in enumerate(candidates[:30], start=1)
+    ]
+    client = OpenAI(
+        api_key=settings.model_api_key,
+        base_url=settings.model_base_url,
+        timeout=90.0,
+        max_retries=2,
+    )
+    try:
+        response = client.chat.completions.create(
+            model=settings.model_name,
+            temperature=0.1,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是物理气候科学论文筛选编辑。根据每篇论文的title和abstract判断其主要科学问题，"
+                        "而不是按单个关键词命中。评分：3=核心相关，2=明确相关，1=外围相关，0=无关。"
+                        "优先保留风和风能、大气环流与遥相关、ENSO/NAO/SAM、极涡和层结耦合、臭氧气候、"
+                        "温度热浪、降水水汽、干旱气候机制、极端天气与热带气旋、边界层陆气、海气相互作用、"
+                        "极地海冰气候动力学、气候变率可预测性、检测归因、物理气候模式评估，以及与气候机制"
+                        "直接相关的再分析或观测。排除没有气候机制的水文/大地测量、生态植被、生物地球化学或"
+                        "海洋化学、泛环境变化、通用模型/软件benchmark，以及Reply、Correction、Editorial、"
+                        "Comment、Correspondence。只返回2或3分论文，3分优先；最多10篇，允许少于10篇，禁止凑数。"
+                        "title_cn必须忠实翻译英文标题，不得添加原题没有的信息。返回严格JSON："
+                        '{"items":[{"index":1,"score":3,"title_cn":"...","reason":"..."}]}。'
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+        )
+        parsed = _json_from_text(response.choices[0].message.content or "")
+        selected: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        scored: list[tuple[int, int, str]] = []
+        for choice in parsed.get("items", []):
+            index = int(choice.get("index", 0))
+            score = int(choice.get("score", 0))
+            title_cn = str(choice.get("title_cn") or "").strip()
+            if (
+                index < 1
+                or index > len(payload)
+                or index in seen
+                or score not in {2, 3}
+                or not title_cn
+            ):
+                continue
+            scored.append((score, index, title_cn))
+            seen.add(index)
+        for score, index, title_cn in sorted(scored, key=lambda value: (-value[0], value[1]))[:10]:
+            selected.append(
+                dict(
+                    candidates[index - 1],
+                    title_cn=title_cn,
+                    paper_relevance_score=score,
+                )
+            )
+        return selected, True, ""
+    except Exception as exc:
+        return fallback, False, f"{type(exc).__name__}: {exc}"
+
+
 def _title_related_image_context(title: str, summary: str) -> str:
     title_terms = {
         term
