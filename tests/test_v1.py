@@ -1560,6 +1560,135 @@ class V1Tests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_paper_pdf_fallback_runs_after_html_download_failure(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                settings = replace(
+                    load_settings(),
+                    database_path=root / "paper-fallback.db",
+                )
+                pipeline = NewsPipeline(settings)
+                article_id = pipeline.db.upsert_article(
+                    {
+                        "source": "Nature Communications",
+                        "url": "https://example.test/paper",
+                        "canonical_url": "https://example.test/paper",
+                        "title": "Atmospheric circulation paper",
+                        "summary": "Atmospheric circulation mechanism",
+                        "published_at": "2026-08-25T00:00:00+00:00",
+                        "doi": "10.1000/paper-fallback",
+                        "journal": "Nature Communications",
+                        "word_count": 800,
+                        "status": "published_paper",
+                        "discovered_at": "2026-08-25T00:00:00+00:00",
+                    }
+                )
+                dossier = {
+                    "id": article_id,
+                    "rank": 1,
+                    "date": "2026-08-25",
+                    "content_type": PAPER_CONTENT,
+                    "title": "Atmospheric circulation paper",
+                    "title_cn": "大气环流论文",
+                    "summary": "Atmospheric circulation mechanism",
+                    "text": "Paper text",
+                    "url": "https://example.test/paper",
+                    "doi": "10.1000/paper-fallback",
+                    "journal": "Nature Communications",
+                    "authors": ["Author One"],
+                    "openalex": {
+                        "journal": "Nature Communications",
+                        "license": "CC BY 4.0",
+                    },
+                    "images": [
+                        {
+                            "url": "https://example.test/html-figure.png",
+                            "local_path": "",
+                            "caption": "Complete Figure 1",
+                            "credit": "Author One",
+                            "license": "CC BY 4.0",
+                            "publishable": True,
+                            "image_source": "html_figure",
+                            "image_role": "figure",
+                        }
+                    ],
+                }
+
+                async def fake_details(_rank, _date, _content_type=None):
+                    return copy.deepcopy(dossier)
+
+                def fake_markdown(value, _settings, destination):
+                    destination.mkdir(parents=True, exist_ok=True)
+                    markdown = destination / "article.md"
+                    metadata = destination / "metadata.json"
+                    markdown.write_text("# 大气环流论文\n\nPaper body", encoding="utf-8")
+                    metadata.write_text("{}", encoding="utf-8")
+                    return markdown, metadata
+
+                def fake_download(records, _destination):
+                    return [
+                        {
+                            **record,
+                            "local_path": "",
+                            "publishable": False,
+                            "reason": "download failed",
+                        }
+                        for record in records
+                    ]
+
+                def fake_pdf_figures(_url, output_dir, **_kwargs):
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    path = output_dir / "figure-01.png"
+                    path.write_bytes(b"png")
+                    figure = {
+                        "url": "https://example.test/paper.pdf#figure=1",
+                        "local_path": str(path),
+                        "caption": "Fig. 1 | Atmospheric circulation.",
+                        "credit": "Author One",
+                        "license": "CC BY 4.0",
+                        "publishable": True,
+                        "image_source": "pdf_figure",
+                        "image_role": "figure",
+                        "figure_number": 1,
+                    }
+                    return [figure], {"matched_figures": 1, "figures": [figure]}
+
+                pipeline.paper_details = fake_details
+                with (
+                    patch("news.pipeline.article_output_dir", return_value=root / "article"),
+                    patch("news.pipeline.download_publishable_images", side_effect=fake_download),
+                    patch(
+                        "news.pipeline.discover_pdf_source",
+                        return_value={
+                            "pdf_url": "https://example.test/paper.pdf",
+                            "landing_url": "https://example.test/paper",
+                            "license": "CC BY 4.0",
+                            "license_url": "https://creativecommons.org/licenses/by/4.0/",
+                        },
+                    ),
+                    patch(
+                        "news.pipeline.extract_pdf_figures",
+                        side_effect=fake_pdf_figures,
+                    ) as extract_pdf,
+                    patch("news.pipeline.generate_article_markdown", side_effect=fake_markdown),
+                    patch("news.pipeline.generate_image_captions", return_value=["大气环流。"]),
+                ):
+                    generated = await pipeline.generate(
+                        1,
+                        "2026-08-25",
+                        PAPER_CONTENT,
+                    )
+
+                self.assertEqual(extract_pdf.call_count, 1)
+                self.assertTrue(generated["dossier"]["pdf_figure_fallback"]["attempted"])
+                self.assertEqual(
+                    generated["dossier"]["body_images"][0]["image_source"],
+                    "pdf_figure",
+                )
+
+        asyncio.run(check())
+
     def test_paper_title_first_page_and_cover_use_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

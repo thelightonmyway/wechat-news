@@ -849,6 +849,9 @@ def _has_publishable_html_image(images: list[dict[str, Any]]) -> bool:
     for image in images:
         if not image.get("publishable") or image.get("image_source") == "pdf_figure":
             continue
+        local_path = str(image.get("local_path") or "")
+        if not local_path or not Path(local_path).is_file():
+            continue
         descriptor = " ".join(
             str(image.get(key) or "")
             for key in ("url", "caption", "alt", "metadata_title", "image_role")
@@ -1693,14 +1696,36 @@ class NewsPipeline:
             str(dossier.get("content_type") or ""),
         )
         if dossier.get("content_type") == PAPER_CONTENT:
+            html_images = list(dossier.get("images") or [])
+            html_local_flags = [
+                bool(image.get("local_path") and Path(str(image["local_path"])).is_file())
+                for image in html_images
+            ]
+            html_remote_images = [
+                image
+                for image, is_local in zip(html_images, html_local_flags)
+                if not is_local
+            ]
+            downloaded_html_images = await asyncio.to_thread(
+                download_publishable_images,
+                html_remote_images,
+                str(output_dir / "images"),
+            )
+            html_remote_iterator = iter(downloaded_html_images)
+            dossier["images"] = [
+                dict(image) if is_local else next(html_remote_iterator)
+                for image, is_local in zip(html_images, html_local_flags)
+            ]
             dossier["pdf_figure_fallback"] = {
                 "attempted": False,
-                "reason": "legal HTML image available",
+                "reason": "usable legal HTML image downloaded",
             }
             if not _has_publishable_html_image(list(dossier.get("images") or [])):
                 dossier["pdf_figure_fallback"] = {
                     "attempted": True,
-                    "reason": "no legal HTML hero, graphical abstract, cover, or figure",
+                    "reason": (
+                        "no usable downloaded HTML hero, graphical abstract, cover, or figure"
+                    ),
                 }
                 try:
                     openalex = dossier.get("openalex") or {}
