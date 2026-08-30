@@ -2,6 +2,24 @@ feeds:
   - name: Guardian Science
     url: https://www.theguardian.com/science/rss
     domain: www.theguardian.com
+  - name: Guardian Climate Crisis
+    url: https://www.theguardian.com/environment/climate-crisis/rss
+    domain: www.theguardian.com
+  - name: NASA Earth Observatory
+    url: https://earthobservatory.nasa.gov/feeds/earth-observatory.rss
+    domain: earthobservatory.nasa.gov
+  - name: NOAA NOS News
+    url: https://oceanservice.noaa.gov/rss/nosnews.xml
+    domain: oceanservice.noaa.gov
+  - name: NOAA NOS Newsroom
+    url: https://oceanservice.noaa.gov/newsroom/nosmedia.xml
+    domain: oceanservice.noaa.gov
+  - name: Copernicus Climate
+    url: https://climate.copernicus.eu/rss.xml
+    domain: climate.copernicus.eu
+  - name: Inside Climate News
+    url: https://insideclimatenews.org/feed/
+    domain: insideclimatenews.org
   - name: Nature News
     url: https://www.nature.com/nature/articles?format=rss&type=news
     domain: www.nature.com

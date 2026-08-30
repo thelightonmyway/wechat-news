@@ -15,10 +15,13 @@ from bot.bridge import QQNewsBot
 from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE
 from db import Database
 from images.policy import apply_policy, assess_image
-from news.feeds import canonicalize_url, normalize_title
+from news.feeds import canonicalize_url, load_feeds, normalize_title
 from news.pipeline import (
     PAPER_CONTENT,
+    PAPER_ONLY_SOURCES,
     POPULAR_CONTENT,
+    PRIMARY_SOURCES,
+    SECONDARY_SOURCES,
     NewsPipeline,
     _apply_article_license_to_html_figures,
     _paper_publication_within_window,
@@ -32,6 +35,7 @@ from news.pipeline import (
     merge_paper_candidate_pool,
     paper_relevance_score,
     prioritize_candidates,
+    source_allowed_for_content,
 )
 from papers.doi import resolve_doi_landing_page
 from papers.oa_mirror import resolve_oa_html_mirror
@@ -249,6 +253,41 @@ class V1Tests(unittest.TestCase):
             2,
         )
 
+    def test_news_feed_configuration_and_paper_only_sources(self):
+        feeds = {
+            item["name"]: item["url"]
+            for item in load_feeds(
+                Path(__file__).resolve().parents[1] / "config" / "feeds.yaml"
+            )
+        }
+        expected = {
+            "Guardian Climate Crisis": (
+                "https://www.theguardian.com/environment/climate-crisis/rss"
+            ),
+            "NASA Earth Observatory": (
+                "https://earthobservatory.nasa.gov/feeds/earth-observatory.rss"
+            ),
+            "NOAA NOS News": "https://oceanservice.noaa.gov/rss/nosnews.xml",
+            "NOAA NOS Newsroom": (
+                "https://oceanservice.noaa.gov/newsroom/nosmedia.xml"
+            ),
+            "Copernicus Climate": "https://climate.copernicus.eu/rss.xml",
+            "Inside Climate News": "https://insideclimatenews.org/feed/",
+        }
+        for name, url in expected.items():
+            with self.subTest(source=name):
+                self.assertEqual(feeds.get(name), url)
+                self.assertIn(name, PRIMARY_SOURCES | SECONDARY_SOURCES)
+                self.assertTrue(source_allowed_for_content(name, POPULAR_CONTENT))
+
+        for name in PAPER_ONLY_SOURCES:
+            with self.subTest(source=name):
+                self.assertFalse(source_allowed_for_content(name, POPULAR_CONTENT))
+                self.assertTrue(source_allowed_for_content(name, PAPER_CONTENT))
+
+        for name in ("Nature News", "Eos / AGU", "Carbon Brief"):
+            self.assertTrue(source_allowed_for_content(name, POPULAR_CONTENT))
+
     def test_weekly_content_types(self):
         self.assertEqual(content_type_for_date("2026-08-24"), POPULAR_CONTENT)  # Monday
         self.assertEqual(content_type_for_date("2026-08-26"), PAPER_CONTENT)  # Wednesday
@@ -438,9 +477,9 @@ class V1Tests(unittest.TestCase):
         )
 
     def test_news_expands_48h_to_7d_and_30d_without_filling(self):
-        def item(index, title, summary):
+        def item(index, title, summary, source="test"):
             return {
-                "source": "test",
+                "source": source,
                 "url": f"https://example.test/{index}",
                 "canonical_url": f"https://example.test/{index}",
                 "title": title,
@@ -465,6 +504,12 @@ class V1Tests(unittest.TestCase):
             item(6, "Antarctic sea ice change", "Ozone recovery and Southern Hemisphere westerlies"),
             item(7, "Alzheimer treatment trial", "Medical neuroscience disease research"),
             item(8, "Solar investment outlook", "Generic renewable energy economics"),
+            item(
+                9,
+                "Surface wind changes in a climate model",
+                "Near-surface wind and atmospheric circulation",
+                "Nature Climate Change",
+            ),
         ]
         calls = []
 
@@ -500,6 +545,9 @@ class V1Tests(unittest.TestCase):
                 self.assertFalse(any("Batter" in value["title"] for value in candidates))
                 self.assertFalse(any("Alzheimer" in value["title"] for value in candidates))
                 self.assertFalse(any("Solar" in value["title"] for value in candidates))
+                self.assertFalse(
+                    any(value["source"] in PAPER_ONLY_SOURCES for value in candidates)
+                )
 
         asyncio.run(check())
 

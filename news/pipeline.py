@@ -35,18 +35,34 @@ from writer.llm import (
 SOURCE_WEIGHTS = {
     "Nature News": 13,
     "Science.org Latest News": 13,
+    "NASA Earth Observatory": 11,
+    "Copernicus Climate": 10,
+    "NOAA NOS News": 10,
+    "NOAA NOS Newsroom": 10,
     "Guardian Science": 9,
+    "Guardian Climate Crisis": 9,
     "NYT Science": 9,
+    "Inside Climate News": 8,
     "ScienceDaily Top Science": 7,
 }
 PRIMARY_SOURCES = {
     "Guardian Science",
+    "Guardian Climate Crisis",
     "Nature News",
     "Science.org Latest News",
     "NYT Science",
     "ScienceDaily Top Science",
 }
 SECONDARY_SOURCES = {
+    "NASA Earth Observatory",
+    "NOAA NOS News",
+    "NOAA NOS Newsroom",
+    "Copernicus Climate",
+    "Inside Climate News",
+    "Eos / AGU",
+    "Carbon Brief",
+}
+PAPER_ONLY_SOURCES = {
     "Nature Atmospheric Science",
     "Nature Atmospheric Dynamics",
     "Nature Climate Sciences",
@@ -54,8 +70,6 @@ SECONDARY_SOURCES = {
     "Nature Physical Oceanography",
     "Nature Climate Change",
     "Nature Geoscience",
-    "Eos / AGU",
-    "Carbon Brief",
 }
 RESEARCH_TERMS = (
     "study",
@@ -330,6 +344,10 @@ EXCLUDED_TERMS = (
 POPULAR_CONTENT = "popular"
 PAPER_CONTENT = "paper"
 LOOKBACK_HOURS = (48, 168, 720)
+
+
+def source_allowed_for_content(source: str, content_type: str) -> bool:
+    return content_type != POPULAR_CONTENT or source not in PAPER_ONLY_SOURCES
 
 
 def content_type_for_date(date_value: str) -> str:
@@ -1316,7 +1334,11 @@ class NewsPipeline:
                         topic_items = [
                             item
                             for item in items
-                            if is_relevant_topic(item)
+                            if source_allowed_for_content(
+                                str(item.get("source") or ""),
+                                run_type,
+                            )
+                            and is_relevant_topic(item)
                             and not _is_published_article(item, published)
                         ]
                         normalized = deduplicate(topic_items)
