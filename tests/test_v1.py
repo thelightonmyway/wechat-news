@@ -35,7 +35,7 @@ from news.pipeline import (
 )
 from papers.doi import resolve_doi_landing_page
 from papers.oa_mirror import resolve_oa_html_mirror
-from papers.openalex import OpenAlexAdapter
+from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
 from papers.pdf_figures import extract_pdf_figures
 from publisher.wechat import _paper_draft_title, _selected_cover_path, format_markdown
 from scheduler import should_run_startup_catchup
@@ -645,6 +645,44 @@ class V1Tests(unittest.TestCase):
             sum(item.get("discovery_origin") == "openalex" for item in merged),
             1,
         )
+
+    def test_paper_journal_whitelist(self):
+        allowed = [
+            ("Nature", ""),
+            ("Nature Climate Change", "Springer Nature"),
+            ("Communications Earth & Environment", "Springer Nature"),
+            ("npj Climate and Atmospheric Science", "Nature Portfolio"),
+            ("Science", "AAAS"),
+            ("Science Advances", "AAAS"),
+            (
+                "Science Translational Medicine",
+                "American Association for the Advancement of Science",
+            ),
+            ("Proceedings of the National Academy of Sciences", ""),
+            ("Geophysical Research Letters", "American Geophysical Union"),
+            ("Earth's Future", "American Geophysical Union"),
+            ("AGU Advances", "American Geophysical Union"),
+            ("The Innovation", ""),
+            ("Atmospheric Chemistry and Physics", "Copernicus Publications"),
+            ("Weather and Climate Dynamics", "Copernicus Publications"),
+            ("Earth System Dynamics", "Copernicus Publications"),
+            ("Climate Dynamics", "Springer Nature"),
+            ("Environmental Research Letters", "IOP Publishing"),
+        ]
+        for journal, publisher in allowed:
+            with self.subTest(journal=journal):
+                self.assertTrue(is_allowed_paper_journal(journal, publisher))
+
+        rejected = [
+            ("Britain International of Exact Sciences (BIoEx) Journal", ""),
+            ("SOLA", ""),
+            ("Agricultural Water Management", "Elsevier"),
+            ("Geoscientific Model Development", "Copernicus Publications"),
+            ("Theoretical and Applied Climatology", "Springer Nature"),
+        ]
+        for journal, publisher in rejected:
+            with self.subTest(journal=journal):
+                self.assertFalse(is_allowed_paper_journal(journal, publisher))
 
     def test_refresh_excludes_drafted_url_and_doi_but_keeps_failed(self):
         def item(index, title, *, doi="", canonical_url=None):

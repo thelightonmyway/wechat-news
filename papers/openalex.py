@@ -32,6 +32,32 @@ DISCOVERY_QUERIES = (
 DISCOVERY_SELECT = (
     "title,doi,publication_date,type,primary_location,abstract_inverted_index"
 )
+ALLOWED_JOURNALS = {
+    "nature",
+    "science",
+    "science advances",
+    "proceedings of the national academy of sciences",
+    "proceedings of the national academy of sciences of the united states of america",
+    "pnas",
+    "geophysical research letters",
+    "earths future",
+    "agu advances",
+    "the innovation",
+    "atmospheric chemistry and physics",
+    "weather and climate dynamics",
+    "earth system dynamics",
+    "climate dynamics",
+    "environmental research letters",
+}
+NATURE_PUBLISHER_MARKERS = (
+    "nature portfolio",
+    "nature publishing group",
+    "springer nature",
+)
+AAAS_PUBLISHER_MARKERS = (
+    "american association for the advancement of science",
+    "aaas",
+)
 
 
 def normalize_doi(value: str | None) -> str:
@@ -41,6 +67,41 @@ def normalize_doi(value: str | None) -> str:
             doi = doi[len(prefix):]
             break
     return doi.strip().lower()
+
+
+def normalize_journal_name(value: str | None) -> str:
+    text = (
+        (value or "")
+        .casefold()
+        .replace("&", " and ")
+        .replace("’", "'")
+        .replace("'", "")
+    )
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def is_allowed_paper_journal(
+    journal: str | None,
+    publisher: str | None = None,
+) -> bool:
+    journal_name = normalize_journal_name(journal)
+    publisher_name = normalize_journal_name(publisher)
+    if journal_name in ALLOWED_JOURNALS:
+        return True
+
+    nature_publisher = any(
+        marker in publisher_name for marker in NATURE_PUBLISHER_MARKERS
+    )
+    if nature_publisher and (
+        journal_name.startswith("nature ")
+        or journal_name.startswith("communications ")
+        or journal_name.startswith("npj ")
+    ):
+        return True
+
+    aaas_publisher = any(marker in publisher_name for marker in AAAS_PUBLISHER_MARKERS)
+    return aaas_publisher and journal_name.startswith("science ")
 
 
 def _status_code(exc: Exception) -> int | None:
@@ -128,13 +189,22 @@ class OpenAlexAdapter:
                     continue
                 primary_location = work.get("primary_location") or {}
                 source = primary_location.get("source") or {}
+                journal = source.get("display_name") or ""
+                publisher = (
+                    source.get("host_organization_name")
+                    or source.get("host_organization_display_name")
+                    or ""
+                )
+                if not is_allowed_paper_journal(journal, publisher):
+                    continue
                 abstract_index = work.get("abstract_inverted_index")
                 discovered.append(
                     {
                         "title": work.get("title") or "",
                         "abstract": invert_abstract(abstract_index) if abstract_index else "",
                         "publication_date": publication_date,
-                        "journal": source.get("display_name") or "",
+                        "journal": journal,
+                        "publisher": publisher,
                         "doi": doi,
                         "type": work.get("type") or "",
                     }
@@ -195,6 +265,11 @@ class OpenAlexAdapter:
         primary_location = work.get("primary_location") or {}
         best_oa = work.get("best_oa_location") or {}
         source = primary_location.get("source") or {}
+        publisher = (
+            source.get("host_organization_name")
+            or source.get("host_organization_display_name")
+            or ""
+        )
         open_access = work.get("open_access") or {}
         abstract_index = work.get("abstract_inverted_index")
         abstract = invert_abstract(abstract_index) if abstract_index else ""
@@ -238,6 +313,7 @@ class OpenAlexAdapter:
             "title": work.get("title") or "",
             "authors": authors,
             "journal": source.get("display_name") or "",
+            "publisher": publisher,
             "publication_date": work.get("publication_date") or "",
             "abstract": abstract or "",
             "oa_status": open_access.get("oa_status") or "unknown",

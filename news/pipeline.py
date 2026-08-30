@@ -20,7 +20,7 @@ from news.feeds import fetch_all_feeds, normalize_title
 from papers.doi import resolve_doi_landing_page
 from papers.first_page import render_paper_first_page
 from papers.oa_mirror import resolve_oa_html_mirror
-from papers.openalex import OpenAlexAdapter
+from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
 from papers.pdf_figures import discover_pdf_source, extract_pdf_figures
 from settings import PROJECT_ROOT, Settings
 from writer.llm import (
@@ -1096,6 +1096,7 @@ def _openalex_discovery_item(record: dict[str, Any], run_date: str) -> dict[str,
     url = f"https://doi.org/{doi}" if doi else ""
     publication_date = str(record.get("publication_date") or "")
     journal = str(record.get("journal") or "")
+    publisher = str(record.get("publisher") or "")
     work_type = str(record.get("type") or "")
     return {
         "source": journal or "OpenAlex",
@@ -1107,6 +1108,7 @@ def _openalex_discovery_item(record: dict[str, Any], run_date: str) -> dict[str,
         "published_at": f"{publication_date}T00:00:00+00:00" if publication_date else "",
         "doi": doi,
         "journal": journal,
+        "publisher": publisher,
         "word_count": 0,
         "work_type": work_type,
         "discovery_origin": "openalex",
@@ -1119,6 +1121,7 @@ def _openalex_discovery_item(record: dict[str, Any], run_date: str) -> dict[str,
             "title": str(record.get("title") or ""),
             "abstract": str(record.get("abstract") or ""),
             "journal": journal,
+            "publisher": publisher,
             "publication_date": publication_date,
             "work_type": work_type,
         },
@@ -1189,6 +1192,11 @@ class NewsPipeline:
                     except Exception as exc:
                         self.logger.warning("OpenAlex DOI lookup failed: %s", exc)
                         return None
+            if not is_allowed_paper_journal(
+                str(metadata.get("journal") or ""),
+                str(metadata.get("publisher") or ""),
+            ):
+                return None
             merged = dict(item)
             merged["openalex"] = metadata
             run_day = date_type.fromisoformat(run_date)
@@ -1203,6 +1211,7 @@ class NewsPipeline:
             merged["normalized_title"] = normalize_title(str(merged["title"]))
             merged["summary"] = metadata.get("abstract") or merged.get("summary") or ""
             merged["journal"] = metadata.get("journal") or ""
+            merged["publisher"] = metadata.get("publisher") or ""
             merged["source"] = metadata.get("journal") or merged.get("source") or "OpenAlex"
             merged["work_type"] = metadata.get("work_type") or merged.get("work_type") or ""
             if metadata.get("publication_date"):
