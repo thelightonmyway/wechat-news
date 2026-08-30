@@ -204,6 +204,51 @@ class V1Tests(unittest.TestCase):
             0,
         )
 
+    def test_paper_storms_require_climate_scale_connection(self):
+        self.assertEqual(
+            paper_relevance_score(
+                {
+                    "title": (
+                        "Convective butterflies lead to tropical cyclone rapid "
+                        "intensification"
+                    ),
+                    "summary": "Convective and storm-scale intensification dynamics.",
+                    "work_type": "article",
+                }
+            ),
+            0,
+        )
+        self.assertEqual(
+            paper_relevance_score(
+                {
+                    "title": "A storm-scale microphysics mechanism in an eyewall",
+                    "summary": "A single extreme weather event.",
+                    "work_type": "article",
+                }
+            ),
+            0,
+        )
+        self.assertGreaterEqual(
+            paper_relevance_score(
+                {
+                    "title": "ENSO controls interannual variability of tropical cyclone activity",
+                    "summary": "El Niño teleconnections regulate seasonal cyclone activity.",
+                    "work_type": "article",
+                }
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            paper_relevance_score(
+                {
+                    "title": "Climate change alters tropical cyclone frequency and intensity",
+                    "summary": "Long-term projections attribute changes in cyclone climatology.",
+                    "work_type": "article",
+                }
+            ),
+            2,
+        )
+
     def test_weekly_content_types(self):
         self.assertEqual(content_type_for_date("2026-08-24"), POPULAR_CONTENT)  # Monday
         self.assertEqual(content_type_for_date("2026-08-26"), PAPER_CONTENT)  # Wednesday
@@ -1859,6 +1904,9 @@ class V1Tests(unittest.TestCase):
 
         self.assertTrue(used_model)
         self.assertEqual(error, "")
+        system_prompt = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("纯对流动力学", system_prompt)
+        self.assertIn("次季节/季节可预报性", system_prompt)
         self.assertEqual(len(selected), 2)
         self.assertEqual(
             [item["paper_relevance_score"] for item in selected],

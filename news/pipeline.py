@@ -447,17 +447,11 @@ PAPER_RELEVANCE_GROUPS = {
         "moisture transport",
         "moisture convergence",
     ),
-    "extremes_storms": (
-        "extreme weather",
+    "climate_extremes": (
         "climate extreme",
         "climate extremes",
         "compound extreme",
         "compound extremes",
-        "tropical cyclone",
-        "tropical cyclones",
-        "hurricane",
-        "typhoon",
-        "storm dynamics",
     ),
     "boundary_land": (
         "boundary layer",
@@ -544,6 +538,48 @@ PAPER_MECHANISM_MARKERS = (
     "attribution",
     "forcing",
 )
+PAPER_STORM_TERMS = (
+    "tropical cyclone",
+    "tropical cyclones",
+    "hurricane",
+    "hurricanes",
+    "typhoon",
+    "typhoons",
+    "storm",
+    "storms",
+    "extreme weather",
+)
+PAPER_STORM_CLIMATE_SCALE_TERMS = (
+    "climate variability",
+    "climate change",
+    "interannual variability",
+    "decadal variability",
+    "long-term trend",
+    "long term trend",
+    "climate trend",
+    "attribution",
+    "projection",
+    "projections",
+    "predictability",
+    "subseasonal",
+    "sub-seasonal",
+    "seasonal prediction",
+    "seasonal predictability",
+    "enso",
+    "el niño",
+    "el nino",
+    "la niña",
+    "la nina",
+    "monsoon",
+    "teleconnection",
+    "teleconnections",
+    "large-scale circulation",
+    "large scale circulation",
+    "atmospheric circulation",
+    "walker circulation",
+    "hadley circulation",
+    "climatology",
+)
 
 
 def paper_relevance_score(item: dict[str, Any]) -> int:
@@ -560,11 +596,20 @@ def paper_relevance_score(item: dict[str, Any]) -> int:
     ):
         return 0
 
+    storm_scale = any(_contains_term(text, term) for term in PAPER_STORM_TERMS)
+    storm_climate_scale = any(
+        _contains_term(text, term) for term in PAPER_STORM_CLIMATE_SCALE_TERMS
+    )
+    if storm_scale and not storm_climate_scale:
+        return 0
+
     physical_groups = {
         group
         for group, terms in PAPER_RELEVANCE_GROUPS.items()
         if any(_contains_term(text, term) for term in terms)
     }
+    if storm_scale and storm_climate_scale:
+        physical_groups.add("storm_climate")
     conditional_groups = {
         group
         for group, terms in PAPER_CONDITIONAL_GROUPS.items()
