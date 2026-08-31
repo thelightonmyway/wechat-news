@@ -15,6 +15,7 @@ from bot.bridge import QQNewsBot
 from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE
 from db import Database
 from images.policy import apply_policy, assess_image
+from images.search import normalize_search_result, search_public_images
 from news.feeds import canonicalize_url, load_feeds, normalize_title
 from news.pipeline import (
     PAPER_CONTENT,
@@ -1918,6 +1919,55 @@ class V1Tests(unittest.TestCase):
         self.assertLessEqual(len(body), 4)
         tied_cover, _, _ = _select_article_images(images, PAPER_CONTENT, "")
         self.assertEqual(tied_cover["figure_number"], 1)
+
+    def test_news_public_search_preserves_metadata_and_rejects_unknown_license(self):
+        licensed = {
+            "original_url": "https://upload.wikimedia.org/marine-heat-wave.jpg",
+            "source_url": "https://commons.wikimedia.org/wiki/File:Marine_heat_wave.jpg",
+            "source": "Wikimedia Commons",
+            "license_short_name": "CC BY-SA 4.0",
+            "metadata_title": "Marine heat wave and ocean acidification",
+            "description": "Marine heat wave conditions in the ocean",
+            "credit": "Example Author",
+        }
+        unknown = {
+            "original_url": "https://example.test/unknown.jpg",
+            "source": "Unknown archive",
+            "metadata_title": "Marine heat wave and ocean acidification",
+            "description": "Unknown-license image",
+        }
+        mapped = normalize_search_result(licensed)
+        self.assertEqual(mapped["provider"], "Wikimedia Commons")
+        self.assertEqual(mapped["source"], "Wikimedia Commons")
+        self.assertEqual(mapped["image_source"], "public_search")
+        self.assertEqual(mapped["license"], "CC BY-SA 4.0")
+        self.assertEqual(mapped["url"], licensed["original_url"])
+        self.assertEqual(mapped["source_url"], licensed["source_url"])
+        self.assertEqual(mapped["credit"], "Example Author")
+        self.assertTrue(mapped["publishable"])
+        self.assertFalse(normalize_search_result(unknown)["publishable"])
+
+        with (
+            patch(
+                "images.search.search_wikimedia_commons",
+                return_value=[licensed, unknown],
+            ),
+            patch("images.search.search_nasa_images", return_value=[]),
+        ):
+            approved = search_public_images(
+                ["marine heat wave", "ocean acidification"],
+                max_images=5,
+            )
+
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0]["provider"], "Wikimedia Commons")
+        self.assertTrue(approved[0]["publishable"])
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "marine-heat-wave.jpg"
+            image_path.write_bytes(b"image")
+            approved[0]["local_path"] = str(image_path)
+            _, body_images, _ = _select_article_images(approved, POPULAR_CONTENT)
+            self.assertEqual(len(body_images), 1)
 
     def test_image_policy(self):
         self.assertTrue(assess_image("CC BY 4.0")[0])

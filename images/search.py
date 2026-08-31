@@ -28,6 +28,53 @@ def _plain(value: Any) -> str:
     return " ".join(BeautifulSoup(str(value or ""), "html.parser").get_text(" ", strip=True).split())
 
 
+def normalize_search_result(
+    image: dict[str, Any],
+    *,
+    default_provider: str = "",
+) -> dict[str, Any]:
+    record = dict(image)
+    provider = str(record.get("provider") or record.get("source") or default_provider)
+    url = str(record.get("url") or record.get("original_url") or "")
+    source_url = str(
+        record.get("source_url")
+        or record.get("description_url")
+        or record.get("original_url")
+        or url
+    )
+    title = str(record.get("title") or record.get("metadata_title") or "")
+    description = str(
+        record.get("description")
+        or record.get("caption")
+        or record.get("alt")
+        or ""
+    )
+    license_value = str(
+        record.get("license")
+        or record.get("license_short_name")
+        or record.get("usage_terms")
+        or ""
+    )
+    record.update(
+        {
+            "url": url,
+            "original_url": str(record.get("original_url") or url),
+            "source_url": source_url,
+            "provider": provider,
+            "source": str(record.get("source") or provider),
+            "image_source": str(record.get("image_source") or "public_search"),
+            "title": title,
+            "metadata_title": str(record.get("metadata_title") or title),
+            "description": description,
+            "caption": str(record.get("caption") or description or title),
+            "alt": str(record.get("alt") or description or title),
+            "credit": str(record.get("credit") or ""),
+            "license": license_value,
+        }
+    )
+    return apply_policy(record)
+
+
 def _wikimedia_json(params: dict[str, Any]) -> dict[str, Any]:
     with httpx.Client(timeout=30.0, follow_redirects=True, trust_env=True) as client:
         response = client.get(
@@ -79,15 +126,26 @@ def search_wikimedia_commons(query: str, limit: int = 12) -> list[dict[str, Any]
         description = _plain(metadata.get("ImageDescription") or metadata.get("ObjectName"))
         credit = _plain(metadata.get("Credit"))
         artist = _plain(metadata.get("Artist"))
-        record = apply_policy(
+        title = str(page.get("title") or "").removeprefix("File:")
+        record = normalize_search_result(
             {
                 "url": image_info.get("url") or "",
+                "original_url": image_info.get("url") or "",
+                "source_url": (
+                    image_info.get("descriptionurl")
+                    or image_info.get("descriptionshorturl")
+                    or ""
+                ),
                 "local_path": "",
-                "caption": description or str(page.get("title") or "").removeprefix("File:"),
-                "alt": description,
+                "title": title,
+                "description": description,
+                "caption": description or title,
+                "alt": description or title,
                 "credit": " · ".join(part for part in (artist, credit, "Wikimedia Commons") if part),
                 "license": license_value,
                 "provider": "Wikimedia Commons",
+                "source": "Wikimedia Commons",
+                "image_source": "public_search",
                 "metadata_title": str(page.get("title") or ""),
             }
         )
@@ -112,10 +170,14 @@ def search_nasa_images(query: str, limit: int = 12) -> list[dict[str, Any]]:
         links = item.get("links") or []
         image_url = next((link.get("href") for link in links if link.get("render") == "image"), "")
         license_value = data.get("license") or data.get("copyright") or ""
-        record = apply_policy(
+        record = normalize_search_result(
             {
                 "url": image_url,
+                "original_url": image_url,
+                "source_url": str(item.get("href") or image_url),
                 "local_path": "",
+                "title": str(data.get("title") or ""),
+                "description": str(data.get("description") or ""),
                 "caption": str(data.get("description") or data.get("title") or ""),
                 "alt": str(data.get("title") or ""),
                 "credit": " · ".join(
@@ -125,6 +187,8 @@ def search_nasa_images(query: str, limit: int = 12) -> list[dict[str, Any]]:
                 ),
                 "license": str(license_value),
                 "provider": "NASA Images",
+                "source": "NASA Images",
+                "image_source": "public_search",
                 "metadata_title": str(data.get("title") or ""),
             }
         )
@@ -191,7 +255,8 @@ def search_public_images(keywords: list[str], max_images: int = 5) -> list[dict[
 
     approved: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for record in found:
+    for raw_record in found:
+        record = normalize_search_result(raw_record)
         url = str(record.get("url") or "")
         path = urlsplit(url).path.lower()
         if (
