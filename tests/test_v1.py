@@ -52,6 +52,7 @@ from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
     _normalize_article_markdown,
+    generate_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
     select_paper_top_ten,
@@ -1357,6 +1358,72 @@ class V1Tests(unittest.TestCase):
         self.assertIn("## 科学意义", markdown)
         self.assertNotIn("简报中的其他科研进展", markdown)
         self.assertNotIn("Dolphin and slavery stories", markdown)
+
+    def test_paper_prompt_uses_short_natural_style_and_verbatim_quote_rules(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="# 测试标题\n\n简短正文。")
+                )
+            ]
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "writer.llm.OpenAI",
+            return_value=client,
+        ):
+            root = Path(tmp)
+            generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "The supplied paper states an exact scientific result.",
+                    "summary": "Paper abstract",
+                    "openalex": {"abstract": "Paper abstract"},
+                    "images": [],
+                },
+                settings,
+                root / "paper",
+            )
+            paper_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
+                "content"
+            ]
+            client.chat.completions.create.reset_mock()
+            generate_article_markdown(
+                {
+                    "content_type": POPULAR_CONTENT,
+                    "title": "Test news",
+                    "title_cn": "测试新闻",
+                    "text": "News article text",
+                    "summary": "News summary",
+                    "images": [],
+                },
+                settings,
+                root / "news",
+            )
+            news_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
+                "content"
+            ]
+
+        self.assertIn("约800到1200个中文字符", paper_prompt)
+        self.assertIn("最多3到4个小节", paper_prompt)
+        self.assertIn("禁止逐句翻译英文", paper_prompt)
+        self.assertIn("自然中文重新组织", paper_prompt)
+        self.assertIn("必须逐字复制", paper_prompt)
+        self.assertIn("每处最多约25个英文词", paper_prompt)
+        self.assertIn("没有合适原文时宁可不引用", paper_prompt)
+        self.assertIn("最重要的2到4个发现", paper_prompt)
+        self.assertIn("约1000到2000中文字", news_prompt)
+        self.assertNotIn("约800到1200个中文字符", news_prompt)
+        self.assertNotIn("英文原文短引", news_prompt)
 
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(
