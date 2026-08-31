@@ -21,7 +21,7 @@ from papers.doi import resolve_doi_landing_page
 from papers.first_page import render_paper_first_page
 from papers.oa_mirror import resolve_oa_html_mirror
 from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
-from papers.pdf_figures import discover_pdf_source, extract_pdf_figures
+from papers.pdf_figures import _download_pdf, discover_pdf_source, extract_pdf_figures
 from settings import PROJECT_ROOT, Settings
 from writer.llm import (
     article_output_dir,
@@ -861,8 +861,18 @@ def _images_redundant(
     first: dict[str, Any],
     second: dict[str, Any],
 ) -> bool:
-    if str(first.get("url") or "") == str(second.get("url") or ""):
+    first_url = str(first.get("url") or "")
+    second_url = str(second.get("url") or "")
+    if first_url and first_url == second_url:
         return True
+    if (
+        str(first.get("image_role") or "").lower() == "figure"
+        and str(second.get("image_role") or "").lower() == "figure"
+    ):
+        first_number = first.get("figure_number")
+        second_number = second.get("figure_number")
+        if first_number is not None and second_number is not None:
+            return str(first_number) == str(second_number)
     first_tokens = _image_information_tokens(first)
     second_tokens = _image_information_tokens(second)
     if not first_tokens or not second_tokens:
@@ -1041,6 +1051,114 @@ def _paper_wechat_cover(paper_first_page: dict[str, Any]) -> dict[str, Any]:
         "source_pdf": paper_first_page.get("source_pdf", ""),
         "page": 1,
     }
+
+
+def _paper_figure_caption(
+    image: dict[str, Any],
+    generated_caption: str,
+    display_index: int,
+) -> tuple[int, str]:
+    figure_number = int(image.get("figure_number") or display_index)
+    caption = generated_caption.strip() or str(
+        image.get("original_caption")
+        or image.get("caption")
+        or image.get("alt")
+        or image.get("metadata_title")
+        or image.get("figure_title")
+        or ""
+    ).strip()
+    caption = re.sub(
+        r"^\s*fig(?:ure)?\.?\s*\d+\s*(?:[|:.-]\s*)?",
+        "",
+        caption,
+        flags=re.IGNORECASE,
+    ).strip()
+    return figure_number, caption or str(image.get("figure_title") or f"Figure {figure_number}")
+
+
+def _insert_paper_figures(
+    markdown_path: Path,
+    images: list[dict[str, Any]],
+    generated_captions: list[str],
+    dossier: dict[str, Any],
+) -> list[str]:
+    if not images:
+        return []
+    lines = markdown_path.read_text(encoding="utf-8").splitlines()
+    heading_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^#{2,3}\s+", line.strip())
+    ]
+    sections: list[tuple[int, int, str]] = []
+    if heading_indexes:
+        for position, start in enumerate(heading_indexes):
+            end = (
+                heading_indexes[position + 1]
+                if position + 1 < len(heading_indexes)
+                else len(lines)
+            )
+            sections.append((start, end, "\n".join(lines[start:end])))
+    else:
+        index = 0
+        while index < len(lines):
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+            start = index
+            while index < len(lines) and lines[index].strip():
+                index += 1
+            end = index
+            text = "\n".join(lines[start:end]).strip()
+            if text and not all(
+                line.strip().startswith("![") for line in lines[start:end]
+            ):
+                sections.append((start, end, text))
+        if not sections:
+            sections.append((0, len(lines), "\n".join(lines)))
+
+    insertions: dict[int, list[str]] = {}
+    used_sections: set[int] = set()
+    effective_captions: list[str] = []
+    for index, image in enumerate(images, start=1):
+        generated = generated_captions[index - 1] if index <= len(generated_captions) else ""
+        figure_number, caption = _paper_figure_caption(image, generated, index)
+        effective_captions.append(caption)
+        ranked_sections = sorted(
+            range(len(sections)),
+            key=lambda section_index: (
+                section_index not in used_sections,
+                _text_relevance_score(image, sections[section_index][2]),
+                -section_index,
+            ),
+            reverse=True,
+        )
+        section_index = ranked_sections[0]
+        used_sections.add(section_index)
+        _, section_end, _ = sections[section_index]
+        insertion_index = section_end
+        while insertion_index > 0 and not lines[insertion_index - 1].strip():
+            insertion_index -= 1
+        local_name = Path(str(image["local_path"])).name
+        block = [
+            f"![Fig. {figure_number}](images/{local_name})",
+            f"*Fig. {figure_number} | {caption}*",
+        ]
+        attribution = _paper_nd_attribution(image, dossier)
+        if attribution:
+            block.append(f"*{attribution}*")
+        insertions.setdefault(insertion_index, []).append("\n".join(block))
+
+    output: list[str] = []
+    for index in range(len(lines) + 1):
+        for block in insertions.get(index, []):
+            if output and output[-1].strip():
+                output.append("")
+            output.extend(block.splitlines())
+            output.append("")
+        if index < len(lines):
+            output.append(lines[index])
+    markdown_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    return effective_captions
 
 
 def _prepare_paper_markdown(
@@ -1876,6 +1994,32 @@ class NewsPipeline:
         if dossier.get("content_type") == PAPER_CONTENT:
             paper_first_page: dict[str, Any] = {}
             source_pdf = output_dir / "source_reference.pdf"
+            paper_pdf_source = dict(dossier.get("pdf_figure_source") or {})
+            fallback_attempted = bool(
+                (dossier.get("pdf_figure_fallback") or {}).get("attempted")
+            )
+            if not source_pdf.is_file() and not fallback_attempted:
+                try:
+                    if not paper_pdf_source.get("pdf_url"):
+                        openalex = dossier.get("openalex") or {}
+                        paper_pdf_source = await asyncio.to_thread(
+                            discover_pdf_source,
+                            str(dossier.get("url") or ""),
+                            str(dossier.get("doi") or ""),
+                            str(openalex.get("license") or ""),
+                        )
+                    if paper_pdf_source.get("pdf_url"):
+                        await asyncio.to_thread(
+                            _download_pdf,
+                            str(paper_pdf_source["pdf_url"]),
+                            source_pdf,
+                        )
+                    else:
+                        dossier["paper_first_page_error"] = "no formal/reference PDF found"
+                except Exception as exc:
+                    self.logger.warning("Paper first-page PDF download failed: %s", exc)
+                    dossier["paper_first_page_error"] = f"{type(exc).__name__}: {exc}"[:1000]
+            dossier["paper_first_page_pdf_source"] = paper_pdf_source
             if source_pdf.is_file():
                 try:
                     paper_first_page = await asyncio.to_thread(
@@ -1888,12 +2032,10 @@ class NewsPipeline:
                         {
                             "doi": dossier.get("doi", ""),
                             "journal": openalex.get("journal") or dossier.get("journal") or "",
-                            "license": (dossier.get("pdf_figure_source") or {}).get("license")
+                            "license": paper_pdf_source.get("license")
                             or openalex.get("license")
                             or "",
-                            "license_url": (dossier.get("pdf_figure_source") or {}).get(
-                                "license_url", ""
-                            ),
+                            "license_url": paper_pdf_source.get("license_url", ""),
                         }
                     )
                 except Exception as exc:
@@ -1952,6 +2094,14 @@ class NewsPipeline:
         )
         dossier["cover_image"] = cover_image or {}
         dossier["body_images"] = body_images
+        dossier["generated_body_image_captions"] = body_image_captions
+        if dossier.get("content_type") == PAPER_CONTENT and body_images:
+            body_image_captions = _insert_paper_figures(
+                markdown_path,
+                body_images,
+                body_image_captions,
+                dossier,
+            )
         dossier["body_image_captions"] = body_image_captions
         dossier["redundant_images_removed"] = redundant_count
         self.logger.info(
@@ -1962,7 +2112,7 @@ class NewsPipeline:
             redundant_count,
         )
         terminal_sections: list[str] = []
-        if body_images:
+        if body_images and dossier.get("content_type") != PAPER_CONTENT:
             image_section: list[str] = []
             for index, image in enumerate(body_images, start=1):
                 local_name = Path(str(image["local_path"])).name
@@ -2001,9 +2151,15 @@ class NewsPipeline:
                     "image_search_keywords": dossier.get("image_search_keywords", []),
                     "paper_first_page": dossier.get("paper_first_page", {}),
                     "paper_first_page_error": dossier.get("paper_first_page_error", ""),
+                    "paper_first_page_pdf_source": dossier.get(
+                        "paper_first_page_pdf_source", {}
+                    ),
                     "wechat_cover": dossier.get("wechat_cover", {}),
                     "cover_image": dossier.get("cover_image", {}),
                     "body_images": dossier.get("body_images", []),
+                    "generated_body_image_captions": dossier.get(
+                        "generated_body_image_captions", []
+                    ),
                     "body_image_captions": dossier.get("body_image_captions", []),
                     "redundant_images_removed": dossier.get("redundant_images_removed", 0),
                     "pdf_figure_fallback": dossier.get("pdf_figure_fallback", {}),

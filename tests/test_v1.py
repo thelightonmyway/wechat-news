@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from bot.bridge import QQNewsBot
-from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE
+from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE, _paper_image_summary
 from db import Database
 from images.policy import apply_policy, assess_image
 from images.search import normalize_search_result, search_public_images
@@ -26,6 +26,8 @@ from news.pipeline import (
     SECONDARY_SOURCES,
     NewsPipeline,
     _apply_article_license_to_html_figures,
+    _images_redundant,
+    _insert_paper_figures,
     _paper_publication_within_window,
     _paper_wechat_cover,
     _prepare_paper_markdown,
@@ -1715,6 +1717,96 @@ class V1Tests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_paper_figures_are_inserted_with_original_numbers_and_caption_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images_dir = root / "images"
+            images_dir.mkdir()
+            first_page = images_dir / "paper-first-page.png"
+            first_page.write_bytes(b"png")
+            figure_five = images_dir / "figure-05.png"
+            figure_five.write_bytes(b"png")
+            figure_two = images_dir / "figure-02.png"
+            figure_two.write_bytes(b"png")
+            markdown = root / "article.md"
+            markdown.write_text(
+                "![论文第一页](images/paper-first-page.png)\n\n"
+                "## Atmospheric circulation\n\n"
+                "Surface wind responds to large-scale atmospheric circulation.\n\n"
+                "## Precipitation mechanisms\n\n"
+                "Moisture transport controls extreme precipitation.\n",
+                encoding="utf-8",
+            )
+            body_images = [
+                {
+                    "local_path": str(figure_five),
+                    "url": "https://example.test/figure-5.png",
+                    "image_role": "figure",
+                    "figure_number": 5,
+                    "caption": "Fig. 5 | Atmospheric circulation and surface wind.",
+                    "publishable": True,
+                },
+                {
+                    "local_path": str(figure_two),
+                    "url": "https://example.test/figure-2.png",
+                    "image_role": "figure",
+                    "figure_number": 2,
+                    "caption": "Fig. 2 | Moisture transport and precipitation.",
+                    "publishable": True,
+                },
+            ]
+            captions = _insert_paper_figures(
+                markdown,
+                body_images,
+                ["大尺度环流与近地面风。", ""],
+                {"content_type": PAPER_CONTENT},
+            )
+            text = markdown.read_text(encoding="utf-8")
+            self.assertEqual(
+                captions,
+                ["大尺度环流与近地面风。", "Moisture transport and precipitation."],
+            )
+            self.assertLess(text.index("论文第一页"), text.index("## Atmospheric circulation"))
+            self.assertLess(text.index("Fig. 5 | 大尺度环流与近地面风。"), text.index("## Precipitation mechanisms"))
+            self.assertGreater(text.index("Fig. 2 | Moisture transport and precipitation."), text.index("## Precipitation mechanisms"))
+            self.assertNotIn("图1.", text)
+
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "body_images": body_images,
+                        "paper_first_page": {"local_path": str(first_page)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary = _paper_image_summary(markdown, body_images)
+            self.assertEqual(
+                summary,
+                "可用图片：2\n正文使用：2\n论文首页：有",
+            )
+
+            plain_markdown = root / "plain-article.md"
+            plain_markdown.write_text(
+                "![论文第一页](images/paper-first-page.png)\n\n"
+                "Surface wind responds to atmospheric circulation.\n\n"
+                "The study compares several climate mechanisms.\n\n"
+                "Moisture transport controls extreme precipitation.\n",
+                encoding="utf-8",
+            )
+            _insert_paper_figures(
+                plain_markdown,
+                body_images,
+                ["大尺度环流与近地面风。", ""],
+                {"content_type": PAPER_CONTENT},
+            )
+            plain_lines = plain_markdown.read_text(encoding="utf-8").splitlines()
+            figure_lines = [
+                index for index, line in enumerate(plain_lines) if line.startswith("![Fig. ")
+            ]
+            self.assertEqual(len(figure_lines), 2)
+            self.assertGreater(figure_lines[1] - figure_lines[0], 3)
+
     def test_paper_title_first_page_and_cover_use_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1962,6 +2054,39 @@ class V1Tests(unittest.TestCase):
             self.assertTrue(figures[0]["publishable"])
             self.assertTrue(Path(figures[0]["local_path"]).is_file())
 
+    def test_paper_figure_numbers_prevent_false_deduplication(self):
+        figure_one = {
+            "url": "https://example.test/figure-1.png",
+            "image_role": "figure",
+            "figure_number": 1,
+            "caption": "Atmospheric circulation response under warming",
+        }
+        figure_two = {
+            "url": "https://example.test/figure-2.png",
+            "image_role": "figure",
+            "figure_number": 2,
+            "caption": "Atmospheric circulation response under warming",
+        }
+        self.assertFalse(_images_redundant(figure_one, figure_two))
+        self.assertTrue(
+            _images_redundant(
+                figure_one,
+                {**figure_two, "figure_number": 1},
+            )
+        )
+        self.assertTrue(
+            _images_redundant(
+                figure_one,
+                {**figure_two, "url": figure_one["url"]},
+            )
+        )
+        self.assertTrue(
+            _images_redundant(
+                {**figure_one, "image_role": "article_image", "figure_number": None},
+                {**figure_two, "image_role": "article_image", "figure_number": None},
+            )
+        )
+
     def test_paper_cover_fallback_compares_only_first_and_last_when_many(self):
         images = [
             {
@@ -1988,6 +2113,41 @@ class V1Tests(unittest.TestCase):
         self.assertLessEqual(len(body), 4)
         tied_cover, _, _ = _select_article_images(images, PAPER_CONTENT, "")
         self.assertEqual(tied_cover["figure_number"], 1)
+
+    def test_springer_html_figures_parse_full_caption_and_number(self):
+        html = """
+        <div class="c-article-section__figure" id="figure-1">
+          <p class="c-article-section__figure-caption">Fig. 1</p>
+          <div class="c-article-section__figure-description">
+            Full caption describing atmospheric circulation and surface wind.
+          </div>
+          <figure><img src="/article/figure-1.png" alt="Figure one"></figure>
+        </div>
+        <div class="c-article-section__figure" id="figure-2">
+          <p class="c-article-section__figure-caption">Fig. 2</p>
+          <div class="c-article-section__figure-description">
+            Full caption describing precipitation and temperature feedbacks.
+          </div>
+          <figure><img src="/article/figure-2.png" alt="Figure two"></figure>
+        </div>
+        """
+        figures = discover_figure_images(
+            html,
+            "https://link.springer.com/article/10.1007/example",
+            "CC BY 4.0",
+        )
+        self.assertEqual(len(figures), 2)
+        self.assertEqual([item["figure_number"] for item in figures], [1, 2])
+        self.assertEqual(
+            figures[0]["caption"],
+            "Full caption describing atmospheric circulation and surface wind.",
+        )
+        self.assertEqual(
+            figures[1]["caption"],
+            "Full caption describing precipitation and temperature feedbacks.",
+        )
+        self.assertTrue(all(item["publishable"] for item in figures))
+        self.assertTrue(all(item["image_role"] == "figure" for item in figures))
 
     def test_wiley_html_figures_parse_title_caption_and_large_image_url(self):
         html = """

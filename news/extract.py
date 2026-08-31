@@ -59,17 +59,44 @@ def _credit_for_figure(figure: Any) -> str:
 def discover_figure_images(html: str, base_url: str, page_license: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     images: list[dict[str, Any]] = []
+    figure_nodes = []
     for figure in soup.find_all("figure"):
+        springer_parent = figure.find_parent(class_="c-article-section__figure")
+        if springer_parent is not None and str(
+            springer_parent.get("id") or ""
+        ).startswith("figure-"):
+            continue
+        figure_nodes.append(figure)
+    for node in soup.select('.c-article-section__figure[id^="figure-"]'):
+        if node not in figure_nodes:
+            figure_nodes.append(node)
+    for figure in figure_nodes:
         figure_images = figure.find_all("img")
         if not figure_images:
             continue
         image = figure_images[0]
         wiley_figure = figure.find_parent(class_="article-section__full") is not None
+        springer_figure = (
+            "c-article-section__figure" in (figure.get("class") or [])
+            and str(figure.get("id") or "").startswith("figure-")
+        )
         if wiley_figure:
             src = str(image.get("data-lg-src") or image.get("src") or "")
             image_url_source = "data-lg-src" if image.get("data-lg-src") else "src"
             title_node = figure.select_one(".figure__title")
             caption_node = figure.select_one(".figure__caption-text")
+            figure_title = title_node.get_text(" ", strip=True) if title_node else ""
+            caption = caption_node.get_text(" ", strip=True) if caption_node else ""
+        elif springer_figure:
+            src = str(
+                image.get("src")
+                or image.get("data-src")
+                or image.get("data-original")
+                or ""
+            )
+            image_url_source = "src"
+            title_node = figure.select_one(".c-article-section__figure-caption")
+            caption_node = figure.select_one(".c-article-section__figure-description")
             figure_title = title_node.get_text(" ", strip=True) if title_node else ""
             caption = caption_node.get_text(" ", strip=True) if caption_node else ""
         else:

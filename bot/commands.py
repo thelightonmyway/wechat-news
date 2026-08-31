@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 
@@ -14,6 +15,32 @@ NEWS_COMMAND = re.compile(r"^/news\s+(\d+)(?:\s+(generate|publish))?$", re.IGNOR
 PAPER_COMMAND = re.compile(r"^/paper\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
 NEWS_USAGE = "用法：\n/news\n/news N\n/news N generate\n/news N publish"
 PAPER_USAGE = "用法：\n/papers\n/paper N\n/paper N generate\n/paper N publish"
+
+
+def _paper_image_summary(markdown_path: Path, images: list[dict]) -> str:
+    metadata_path = markdown_path.parent / "metadata.json"
+    metadata: dict = {}
+    if metadata_path.is_file():
+        try:
+            value = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                metadata = value
+        except (OSError, ValueError, TypeError):
+            pass
+    available = sum(
+        bool(image.get("publishable"))
+        and bool(image.get("local_path"))
+        and Path(str(image["local_path"])).is_file()
+        for image in images
+    )
+    body_count = len(metadata.get("body_images") or [])
+    first_page_path = str((metadata.get("paper_first_page") or {}).get("local_path") or "")
+    first_page = bool(first_page_path and Path(first_page_path).is_file())
+    return (
+        f"可用图片：{available}\n"
+        f"正文使用：{body_count}\n"
+        f"论文首页：{'有' if first_page else '无'}"
+    )
 
 
 class CommandHandler:
@@ -113,23 +140,34 @@ class CommandHandler:
                 result.get("draft_media_id", ""),
                 result.get("error", ""),
             )
-            image_count = len(
-                [
-                    image
-                    for image in self.pipeline.db.get_images(int(candidate["id"]))
-                    if image.get("publishable")
-                ]
+            images = self.pipeline.db.get_images(int(candidate["id"]))
+            image_count = len([image for image in images if image.get("publishable")])
+            markdown_path = Path(post["markdown_path"])
+            paper_image_summary = (
+                _paper_image_summary(markdown_path, images)
+                if content_type == PAPER_CONTENT
+                else ""
             )
-            word_count = len(Path(post["markdown_path"]).read_text(encoding="utf-8"))
+            word_count = len(markdown_path.read_text(encoding="utf-8"))
+            dry_run_image_summary = (
+                paper_image_summary
+                if content_type == PAPER_CONTENT
+                else f"合法图片：{image_count}"
+            )
+            drafted_image_summary = (
+                paper_image_summary
+                if content_type == PAPER_CONTENT
+                else f"图片：{image_count}"
+            )
             if result["status"] == "dry_run":
                 return (
                     f"微信排版 dry-run 完成\n标题：{candidate.get('title_cn') or candidate.get('title')}\n"
-                    f"字数：{word_count}\n合法图片：{image_count}\nHTML：{result['article_html']}\n"
+                    f"字数：{word_count}\n{dry_run_image_summary}\nHTML：{result['article_html']}\n"
                     "Blocker：未配置微信公众号凭据，未创建草稿。"
                 )
             return (
                 f"微信公众号草稿已创建\n标题：{candidate.get('title_cn') or candidate.get('title')}\n"
-                f"字数：{word_count}\n图片：{image_count}\n草稿 media_id：{result['draft_media_id']}"
+                f"字数：{word_count}\n{drafted_image_summary}\n草稿 media_id：{result['draft_media_id']}"
             )
         except Exception as exc:
             self.pipeline.db.save_publish_history(
