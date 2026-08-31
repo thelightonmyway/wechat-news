@@ -32,6 +32,8 @@ from news.pipeline import (
     content_type_for_date,
     deduplicate,
     deterministic_score,
+    is_relevant_news_after_extraction,
+    is_relevant_news_rss_prefilter,
     is_relevant_topic,
     merge_paper_candidate_pool,
     paper_relevance_score,
@@ -102,6 +104,28 @@ class V1Tests(unittest.TestCase):
             }
         )
         self.assertGreater(score, 30)
+
+    def test_news_rss_prefilter_defers_strict_relevance_until_after_extraction(self):
+        rss_item = {
+            "title": "Why the ocean is changing faster than expected",
+            "summary": "Scientists explain what happened.",
+        }
+        self.assertTrue(is_relevant_news_rss_prefilter(rss_item))
+        self.assertFalse(is_relevant_topic(rss_item))
+        extracted = {
+            **rss_item,
+            "text": (
+                "The full report identifies air-sea interaction and atmospheric "
+                "circulation as the mechanism driving the observed change."
+            ),
+        }
+        self.assertTrue(is_relevant_news_after_extraction(extracted))
+
+        medical = {
+            "title": "Heat treatment improves cancer outcomes",
+            "summary": "A clinical trial of a new medical therapy.",
+        }
+        self.assertFalse(is_relevant_news_rss_prefilter(medical))
 
     def test_shared_topic_relevance_requires_specific_process(self):
         self.assertFalse(

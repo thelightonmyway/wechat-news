@@ -397,6 +397,81 @@ def is_relevant_topic(item: dict[str, Any]) -> bool:
     return bool(matched_topic_groups(item))
 
 
+NEWS_RSS_PREFILTER_TERMS = (
+    "climate",
+    "weather",
+    "temperature",
+    "warming",
+    "heat",
+    "precipitation",
+    "rainfall",
+    "snow",
+    "drought",
+    "wind",
+    "storm",
+    "storms",
+    "ocean",
+    "sea",
+    "arctic",
+    "antarctic",
+    "ice",
+    "atmosphere",
+    "atmospheric",
+    "cloud",
+    "clouds",
+    "monsoon",
+    "enso",
+    "wildfire",
+    "wildfires",
+    "humidity",
+    "moisture",
+    "water vapor",
+    "water vapour",
+)
+NEWS_RSS_PREFILTER_EXCLUSIONS = (
+    "alzheimer",
+    "dementia",
+    "cancer",
+    "tumor",
+    "patient",
+    "clinical trial",
+    "medicine",
+    "medical",
+    "gene therapy",
+    "vaccine",
+    "artificial intelligence",
+    "battery",
+    "electric vehicle",
+    "black hole",
+    "galaxy",
+    "exoplanet",
+    "archaeology",
+    "smartphone",
+    "gaming",
+    "celebrity",
+)
+
+
+def is_relevant_news_rss_prefilter(item: dict[str, Any]) -> bool:
+    text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+    if any(_contains_term(text, term) for term in NEWS_RSS_PREFILTER_EXCLUSIONS):
+        return False
+    return is_relevant_topic(item) or any(
+        _contains_term(text, term) for term in NEWS_RSS_PREFILTER_TERMS
+    )
+
+
+def is_relevant_news_after_extraction(item: dict[str, Any]) -> bool:
+    probe = dict(item)
+    probe["summary"] = " ".join(
+        (
+            str(item.get("summary") or ""),
+            str(item.get("text") or "")[:50000],
+        )
+    )
+    return is_relevant_topic(probe)
+
+
 PAPER_DISALLOWED_TYPES = {
     "reply",
     "correction",
@@ -1341,13 +1416,15 @@ class NewsPipeline:
                                 str(item.get("source") or ""),
                                 run_type,
                             )
-                            and is_relevant_topic(item)
+                            and is_relevant_news_rss_prefilter(item)
                             and not _is_published_article(item, published)
                         ]
                         normalized = deduplicate(topic_items)
                         enriched = await self._extract_shortlist(normalized)
                         enriched = [
-                            item for item in deduplicate(enriched) if is_relevant_topic(item)
+                            item
+                            for item in deduplicate(enriched)
+                            if is_relevant_news_after_extraction(item)
                         ]
                     if len(enriched) >= 10:
                         break
