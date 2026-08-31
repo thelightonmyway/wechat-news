@@ -18,6 +18,7 @@ from images.policy import apply_policy, is_no_derivatives_license
 USER_AGENT = "Mozilla/5.0 (compatible; wechat-news/0.1; +local-research-bot)"
 FIGURE_NUMBER = re.compile(r"^\s*(?:fig(?:ure)?\.?)\s*(\d+)\s*(?:[|:.-]\s*)?", re.IGNORECASE)
 PDF_EXCLUSIONS = ("supplement", "moesm", "peer-review", "peer_review", "reviewer")
+WILEY_LIBRARY_HOST_SUFFIX = ".onlinelibrary.wiley.com"
 CREDIT_MARKERS = (
     "credit",
     "copyright",
@@ -51,6 +52,18 @@ def _page_license(soup: BeautifulSoup, fallback: str = "") -> tuple[str, str]:
     return _canonical_license(fallback), ""
 
 
+def _is_wiley_library_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host == "onlinelibrary.wiley.com" or host.endswith(WILEY_LIBRARY_HOST_SUFFIX)
+
+
+def _is_pdf_candidate_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(".pdf") or (
+        _is_wiley_library_url(url) and path.startswith("/doi/pdf/")
+    )
+
+
 def discover_pdf_source(
     article_url: str,
     doi: str = "",
@@ -67,6 +80,14 @@ def discover_pdf_source(
     candidates: list[tuple[int, str]] = []
     if direct_pdf:
         candidates.append((20, direct_pdf))
+    if doi and _is_wiley_library_url(article_url):
+        parsed_article = urlparse(article_url)
+        candidates.append(
+            (
+                20,
+                f"{parsed_article.scheme}://{parsed_article.netloc}/doi/pdf/{doi.strip()}",
+            )
+        )
     landing_url = ""
     resolved_license = _canonical_license(article_license)
     license_url = ""
@@ -100,10 +121,18 @@ def discover_pdf_source(
             for anchor in soup.find_all("a", href=True):
                 href = urljoin(landing_url, str(anchor.get("href") or "").strip())
                 path = urlparse(href).path.lower()
-                if not path.endswith(".pdf"):
+                if not _is_pdf_candidate_url(href):
                     continue
                 priority = 0 if path.endswith("_reference.pdf") else 10
                 candidates.append((priority, href))
+            if _is_wiley_library_url(landing_url) and doi:
+                parsed_landing = urlparse(landing_url)
+                candidates.append(
+                    (
+                        20,
+                        f"{parsed_landing.scheme}://{parsed_landing.netloc}/doi/pdf/{doi.strip()}",
+                    )
+                )
             break
 
     usable: list[tuple[int, str]] = []

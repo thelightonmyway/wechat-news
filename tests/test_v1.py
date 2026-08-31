@@ -43,7 +43,7 @@ from news.pipeline import (
 from papers.doi import resolve_doi_landing_page
 from papers.oa_mirror import resolve_oa_html_mirror
 from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
-from papers.pdf_figures import extract_pdf_figures
+from papers.pdf_figures import _download_pdf, discover_pdf_source, extract_pdf_figures
 from publisher.wechat import _paper_draft_title, _selected_cover_path, format_markdown
 from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
@@ -1831,6 +1831,50 @@ class V1Tests(unittest.TestCase):
             self.assertTrue(
                 (Path(result["formatted_dir"]) / "images" / "qihai-header.png").is_file()
             )
+
+    def test_wiley_pdf_discovery_and_existing_pdf_validation(self):
+        landing = "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2026GL125002"
+        pdf_url = "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/2026GL125002"
+
+        def discover(html):
+            response = MagicMock()
+            response.url = landing
+            response.headers = {"content-type": "text/html"}
+            response.text = html
+            response.raise_for_status.return_value = None
+            client = MagicMock()
+            client.__enter__.return_value = client
+            client.__exit__.return_value = False
+            client.get.return_value = response
+            with patch("papers.pdf_figures.httpx.Client", return_value=client):
+                return discover_pdf_source(
+                    landing,
+                    "10.1029/2026GL125002",
+                )
+
+        linked = discover(
+            '<html><a href="/doi/pdf/10.1029/2026GL125002">Download PDF</a></html>'
+        )
+        self.assertEqual(linked["pdf_url"], pdf_url)
+        constructed = discover("<html><body>No directly parseable link</body></html>")
+        self.assertEqual(constructed["pdf_url"], pdf_url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "paper.pdf"
+            response = MagicMock(content=b"<html>Access denied</html>")
+            response.raise_for_status.return_value = None
+            client = MagicMock()
+            client.__enter__.return_value = client
+            client.__exit__.return_value = False
+            client.get.return_value = response
+            with patch("papers.pdf_figures.httpx.Client", return_value=client):
+                with self.assertRaisesRegex(ValueError, "not a PDF"):
+                    _download_pdf(pdf_url, destination)
+
+            response.content = b"%PDF-1.7 test"
+            with patch("papers.pdf_figures.httpx.Client", return_value=client):
+                _download_pdf(pdf_url, destination)
+            self.assertTrue(destination.read_bytes().startswith(b"%PDF"))
 
     def test_pdf_figure_mapping_uses_number_and_adjacent_text_boxes(self):
         with tempfile.TemporaryDirectory() as tmp:
