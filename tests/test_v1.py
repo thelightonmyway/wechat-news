@@ -16,6 +16,7 @@ from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE
 from db import Database
 from images.policy import apply_policy, assess_image
 from images.search import normalize_search_result, search_public_images
+from news.extract import discover_figure_images
 from news.feeds import canonicalize_url, load_feeds, normalize_title
 from news.pipeline import (
     PAPER_CONTENT,
@@ -1987,6 +1988,46 @@ class V1Tests(unittest.TestCase):
         self.assertLessEqual(len(body), 4)
         tied_cover, _, _ = _select_article_images(images, PAPER_CONTENT, "")
         self.assertEqual(tied_cover["figure_number"], 1)
+
+    def test_wiley_html_figures_parse_title_caption_and_large_image_url(self):
+        html = """
+        <div class="article-section__full">
+          <figure>
+            <div class="figure__title">Figure 1</div>
+            <div class="figure__caption-text">Large-scale circulation response.</div>
+            <img data-lg-src="/images/figure-1-large.png" src="/images/figure-1-small.png"
+                 alt="Circulation response">
+          </figure>
+          <figure>
+            <div class="figure__title">Figure 2</div>
+            <div class="figure__caption-text">Surface wind anomalies.</div>
+            <img src="images/figure-2.png" alt="Surface wind anomalies">
+          </figure>
+        </div>
+        """
+        figures = discover_figure_images(
+            html,
+            "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/example/",
+            "CC BY 4.0",
+        )
+        self.assertEqual(len(figures), 2)
+        self.assertEqual([item["figure_number"] for item in figures], [1, 2])
+        self.assertEqual(
+            [item["caption"] for item in figures],
+            ["Large-scale circulation response.", "Surface wind anomalies."],
+        )
+        self.assertEqual(
+            figures[0]["url"],
+            "https://agupubs.onlinelibrary.wiley.com/images/figure-1-large.png",
+        )
+        self.assertEqual(figures[0]["image_url_source"], "data-lg-src")
+        self.assertEqual(
+            figures[1]["url"],
+            "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/example/images/figure-2.png",
+        )
+        self.assertEqual(figures[1]["image_url_source"], "src")
+        self.assertTrue(all(item["publishable"] for item in figures))
+        self.assertTrue(all(item["image_role"] == "figure" for item in figures))
 
     def test_news_public_search_preserves_metadata_and_rejects_unknown_license(self):
         licensed = {

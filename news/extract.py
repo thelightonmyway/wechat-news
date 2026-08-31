@@ -64,26 +64,56 @@ def discover_figure_images(html: str, base_url: str, page_license: str) -> list[
         if not figure_images:
             continue
         image = figure_images[0]
-        src = str(image.get("src") or image.get("data-src") or image.get("data-original") or "")
+        wiley_figure = figure.find_parent(class_="article-section__full") is not None
+        if wiley_figure:
+            src = str(image.get("data-lg-src") or image.get("src") or "")
+            image_url_source = "data-lg-src" if image.get("data-lg-src") else "src"
+            title_node = figure.select_one(".figure__title")
+            caption_node = figure.select_one(".figure__caption-text")
+            figure_title = title_node.get_text(" ", strip=True) if title_node else ""
+            caption = caption_node.get_text(" ", strip=True) if caption_node else ""
+        else:
+            src = str(
+                image.get("src")
+                or image.get("data-src")
+                or image.get("data-original")
+                or ""
+            )
+            image_url_source = "src"
+            caption_node = figure.find("figcaption")
+            figure_title = ""
+            caption = caption_node.get_text(" ", strip=True) if caption_node else ""
         if not src:
             continue
-        caption_node = figure.find("figcaption")
-        caption = caption_node.get_text(" ", strip=True) if caption_node else ""
+        figure_number_match = re.search(
+            r"\bfig(?:ure)?\.?\s*(\d+)\b",
+            figure_title,
+            re.IGNORECASE,
+        )
         alt = str(image.get("alt") or "").strip()
         credit = _credit_for_figure(figure)
+        image_url = urljoin(base_url, src)
         images.append(
             apply_policy(
                 {
-                    "url": urljoin(base_url, src),
+                    "url": image_url,
+                    "original_url": image_url,
+                    "source_url": base_url,
                     "local_path": "",
                     "caption": caption or alt,
+                    "original_caption": caption,
                     "alt": alt,
                     "credit": credit,
                     "license": page_license,
                     "image_source": "html_figure",
                     "image_role": "figure",
+                    "figure_number": (
+                        int(figure_number_match.group(1)) if figure_number_match else None
+                    ),
+                    "figure_title": figure_title,
                     "figure_image_count": len(figure_images),
-                    "metadata_title": caption or alt,
+                    "image_url_source": image_url_source,
+                    "metadata_title": figure_title or caption or alt,
                 }
             )
         )
