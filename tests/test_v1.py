@@ -1424,10 +1424,19 @@ class V1Tests(unittest.TestCase):
 
         self.assertIn("约800到1200个中文字符", paper_prompt)
         self.assertIn("最多3到4个小节", paper_prompt)
-        self.assertIn("结论→论文证据或关键数值→用自然中文解释", paper_prompt)
-        self.assertIn("准确，但不是摘要；专业，但不用论文腔", paper_prompt)
-        self.assertIn("短示例", paper_prompt)
-        self.assertIn("只模仿句长、节奏和解释方式", paper_prompt)
+        self.assertIn(
+            "像中文科技媒体编辑或科研作者整理一篇刚发表的研究",
+            paper_prompt,
+        )
+        self.assertIn("直接陈述研究发现、数据和作者判断", paper_prompt)
+        self.assertIn("专业准确，但不是论文摘要，也不要扮演老师给读者讲课", paper_prompt)
+        self.assertNotIn("解释这个结果说明什么", paper_prompt)
+        self.assertIn("作者比较了三组模式试验", paper_prompt)
+        self.assertIn("去掉 Z 过程后，Y 的响应明显减弱", paper_prompt)
+        self.assertIn("不同区域的结果也有明显差别", paper_prompt)
+        self.assertIn("句长、段落节奏、信息密度和自然推进方式", paper_prompt)
+        self.assertIn("不把它当作固定模板", paper_prompt)
+        self.assertIn("A、B、X、Y、Z 都只是占位符", paper_prompt)
         self.assertIn("所有科学事实必须来自输入论文材料", paper_prompt)
         self.assertIn("禁止逐句翻译英文", paper_prompt)
         self.assertIn("必须逐字复制自paper_text", paper_prompt)
@@ -1441,8 +1450,9 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("This quotation was invented by the model.", paper_markdown)
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("约800到1200个中文字符", news_prompt)
-        self.assertNotIn("结论→论文证据", news_prompt)
-        self.assertNotIn("短示例", news_prompt)
+        self.assertNotIn("像中文科技媒体编辑或科研作者", news_prompt)
+        self.assertNotIn("作者比较了三组模式试验", news_prompt)
+        self.assertNotIn("A、B、X、Y、Z 都只是占位符", news_prompt)
 
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(
