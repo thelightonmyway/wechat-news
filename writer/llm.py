@@ -415,26 +415,77 @@ NEWS_ARTICLE_PROMPT = (
     "图片只可依据图注文字理解，不得声称看过或分析过图片。"
 )
 
+PAPER_STYLE_EXAMPLE = (
+    "短示例（以下问题、结果和数字均为虚构；只模仿句长、节奏和解释方式，不得复制示例内容，方括号也不得输出）：\n"
+    "这项研究先问了一个具体问题：某种外部扰动会不会改变区域过程？作者把多组观测与模拟放在一起比较，"
+    "核心指标在实验组约提高一成，而对照组变化很小。\n"
+    "> 原文：“[仅在此处逐字放入paper_text中不超过25个英文词的关键句]”\n"
+    "引用不是装饰，它应直接支撑刚才的判断。接着解释结果：这意味着差异并非只出现在单一资料或参数设置中，"
+    "而是指向一个较稳定的响应。段落到这里就结束，不再罗列次要变量。"
+)
+
+
 PAPER_STYLE_GUIDE = (
     "根据提供的论文metadata、abstract和正文材料，写一篇约800到1200个中文字符的中文论文解读。"
-    "这是短篇解读，绝对不要扩写成长篇综述。正文最多3到4个小节，每段尽量短，一段只讲一个主要信息点。"
-    "不要平均展开背景、方法、结果和讨论，优先解释论文最重要的2到4个发现、机制或判断。"
-    "先理解论文，再用自然中文重新组织，禁止逐句翻译英文摘要或正文。整体应像中文科研作者给同行或研究生"
-    "讲一篇新论文，而不是机翻摘要。多用短句和中等长度句，避免英文式长定语、多层从句和被动句。"
-    "能直接使用动词时，不使用‘进行、开展、实现、予以’等空动词。少用‘首先、其次、此外、值得注意的是、"
-    "综上所述’等模板连接词。避免‘通过对……进行分析……’、‘在……背景下……’、"
-    "‘这一发现不仅……而且……’、‘从……的角度来看……’、‘研究结果表明了……’等机翻或模板句式。"
-    "专业术语、数值、趋势、时间范围、模型、数据集、因果关系、机制解释和结论必须忠于输入论文材料。"
-    "材料没有明确支持时不要补充常识性机制，不写空洞拔高，不添加原论文没有支持的意义。"
-    "正文可以加入1到2处关键英文原文短引，但每处必须逐字复制自用户提供的论文材料，绝对不能自行生成、"
-    "改写或拼接后冒充原文。每处最多约25个英文词，只选真正支撑关键结论的句子；没有合适原文时宁可不引用。"
+    "这是短篇解读，不要扩写成长篇综述。正文最多3到4个小节，每段尽量短，并承担一个明确功能。"
+    "重点解释论文最重要的2到4个发现，不追求覆盖论文全部背景、方法、结果和讨论。"
+    "文风应像一位熟悉该领域的中文科研作者，在给研究生解释一篇刚读完的论文：准确，但不是摘要；"
+    "专业，但不用论文腔。先把问题说清楚，再围绕关键发现组织正文。"
+    "核心结果优先按‘结论→论文证据或关键数值→用自然中文解释这个结果说明什么’来写。"
+    "不要连续多句只罗列模式名、变量、数值、数据集或术语；给出证据后，必须帮助读者理解它为何重要、"
+    "它支持了什么判断。先理解论文，再用自然中文重新组织，禁止逐句翻译英文摘要或正文。"
+    "多用短句和中等长度句，避免英文式长定语、多层从句和被动表达。"
+    "所有科学事实必须来自输入论文材料。专业术语、数值、趋势、时间范围、模型、数据集、因果关系、"
+    "机制解释和结论必须忠于材料；材料没有明确支持时，不补充机制，不拔高意义。"
+    "如果paper_text中有适合支撑关键结论的句子，优先加入1到2处英文原文短引。每处最多25个英文词，"
+    "必须逐字复制自paper_text，绝对不能自行生成、改写或拼接；找不到合适原文就不引用。"
     "引用格式为Markdown引用块：> 原文：“……”；引用后紧接自然中文解释，不要大段复制论文。"
     "结构采用简短开场，然后围绕关键发现或机制设置2到4个有信息量的小标题，最后用一小段说明真正重要的"
     "科学含义。不要固定写成‘研究背景/研究方法/研究结果/研究意义’，不要在正文重复标题或文章信息。"
     "Markdown首行仍必须以‘# ’加用户数据中的display_title字段原文，之后不得再次重复标题。"
     "不要创建来源、参考文献或文章信息栏目，不要自行插入图片；图片、图注和文章信息由现有pipeline处理。"
-    "图片只可依据图注文字理解，不得声称看过或分析过图片。"
+    "图片只可依据图注文字理解，不得声称看过或分析过图片。\n\n"
+    + PAPER_STYLE_EXAMPLE
 )
+
+
+def _remove_unverified_paper_quotes(markdown: str, paper_text: str) -> str:
+    """Drop model-labelled original quotes that are not verbatim paper text."""
+    normalized_source = re.sub(r"\s+", " ", paper_text).strip()
+    lines = markdown.splitlines()
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].lstrip().startswith(">"):
+            output.append(lines[index])
+            index += 1
+            continue
+
+        end = index
+        while end < len(lines) and lines[end].lstrip().startswith(">"):
+            end += 1
+        block_lines = lines[index:end]
+        block_text = " ".join(
+            re.sub(r"^\s*>\s?", "", line).strip() for line in block_lines
+        )
+        if "原文" not in block_text:
+            output.extend(block_lines)
+            index = end
+            continue
+
+        match = re.search(r'原文\s*[：:]\s*[“"](.+?)[”"]', block_text)
+        quote = re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+        english_words = re.findall(r"\b[A-Za-z]+(?:[-'][A-Za-z]+)*\b", quote)
+        if (
+            quote
+            and english_words
+            and len(english_words) <= 25
+            and quote in normalized_source
+        ):
+            output.extend(block_lines)
+        index = end
+
+    return "\n".join(output)
 
 
 def generate_article_markdown(
@@ -496,6 +547,11 @@ def generate_article_markdown(
     markdown = _remove_generated_terminal_sections(
         (response.choices[0].message.content or "").strip()
     )
+    if content_type == "paper":
+        markdown = _remove_unverified_paper_quotes(
+            markdown,
+            str(safe_input["paper_text"]),
+        )
     markdown = _normalize_article_markdown(markdown, display_title)
     if not markdown:
         raise RuntimeError("model returned empty article")

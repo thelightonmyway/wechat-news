@@ -946,6 +946,32 @@ def _has_publishable_html_image(images: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _numbered_paper_figure(image: dict[str, Any]) -> int | None:
+    if str(image.get("image_role") or "").lower() != "figure":
+        return None
+    try:
+        number = int(image.get("figure_number"))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _paper_body_image_order(images: list[dict[str, Any]]) -> list[int]:
+    order = list(range(len(images)))
+    numbered_positions = [
+        position
+        for position, image in enumerate(images)
+        if _numbered_paper_figure(image) is not None
+    ]
+    numbered_sources = sorted(
+        numbered_positions,
+        key=lambda position: _numbered_paper_figure(images[position]) or 0,
+    )
+    for target, source in zip(numbered_positions, numbered_sources):
+        order[target] = source
+    return order
+
+
 def _select_article_images(
     images: list[dict[str, Any]],
     content_type: str,
@@ -1001,6 +1027,8 @@ def _select_article_images(
         body.append(image)
         if len(body) == limit:
             break
+    if content_type == PAPER_CONTENT:
+        body = [body[index] for index in _paper_body_image_order(body)]
     return cover, body, redundant_count
 
 
@@ -1116,23 +1144,70 @@ def _insert_paper_figures(
         if not sections:
             sections.append((0, len(lines), "\n".join(lines)))
 
+    image_order = _paper_body_image_order(images)
+    ordered_entries = [
+        (
+            images[source_index],
+            generated_captions[source_index]
+            if source_index < len(generated_captions)
+            else "",
+        )
+        for source_index in image_order
+    ]
+    numbered_total = sum(
+        _numbered_paper_figure(image) is not None for image, _ in ordered_entries
+    )
+    numbered_position = 0
+    last_numbered_section = -1
     insertions: dict[int, list[str]] = {}
     used_sections: set[int] = set()
     effective_captions: list[str] = []
-    for index, image in enumerate(images, start=1):
-        generated = generated_captions[index - 1] if index <= len(generated_captions) else ""
+    for index, (image, generated) in enumerate(ordered_entries, start=1):
         figure_number, caption = _paper_figure_caption(image, generated, index)
         effective_captions.append(caption)
-        ranked_sections = sorted(
-            range(len(sections)),
-            key=lambda section_index: (
-                section_index not in used_sections,
-                _text_relevance_score(image, sections[section_index][2]),
-                -section_index,
-            ),
-            reverse=True,
-        )
-        section_index = ranked_sections[0]
+        if _numbered_paper_figure(image) is not None:
+            minimum_section = (
+                min(last_numbered_section + 1, len(sections) - 1)
+                if last_numbered_section >= 0
+                else 0
+            )
+            eligible_sections = range(minimum_section, len(sections))
+            relevance = {
+                section_index: _text_relevance_score(
+                    image,
+                    sections[section_index][2],
+                )
+                for section_index in eligible_sections
+            }
+            if relevance and max(relevance.values()) > 0:
+                section_index = max(
+                    relevance,
+                    key=lambda candidate: (
+                        relevance[candidate],
+                        candidate not in used_sections,
+                        -candidate,
+                    ),
+                )
+            else:
+                fallback = (
+                    round(numbered_position * (len(sections) - 1) / (numbered_total - 1))
+                    if numbered_total > 1
+                    else 0
+                )
+                section_index = max(minimum_section, min(fallback, len(sections) - 1))
+            last_numbered_section = section_index
+            numbered_position += 1
+        else:
+            ranked_sections = sorted(
+                range(len(sections)),
+                key=lambda section_index: (
+                    section_index not in used_sections,
+                    _text_relevance_score(image, sections[section_index][2]),
+                    -section_index,
+                ),
+                reverse=True,
+            )
+            section_index = ranked_sections[0]
         used_sections.add(section_index)
         _, section_end, _ = sections[section_index]
         insertion_index = section_end

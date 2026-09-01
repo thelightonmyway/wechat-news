@@ -1369,7 +1369,15 @@ class V1Tests(unittest.TestCase):
         response = SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content="# 测试标题\n\n简短正文。")
+                    message=SimpleNamespace(
+                        content=(
+                            "# 测试标题\n\n## 关键结果\n\n简短正文。\n\n"
+                            "> 原文：“The supplied paper states an exact scientific result.”\n\n"
+                            "这句原文支持上述判断。\n\n"
+                            "> 原文：“This quotation was invented by the model.”\n\n"
+                            "这条引文不应保留。"
+                        )
+                    )
                 )
             ]
         )
@@ -1380,7 +1388,7 @@ class V1Tests(unittest.TestCase):
             return_value=client,
         ):
             root = Path(tmp)
-            generate_article_markdown(
+            paper_path, _ = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
                     "title": "Test paper",
@@ -1396,6 +1404,7 @@ class V1Tests(unittest.TestCase):
             paper_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
                 "content"
             ]
+            paper_markdown = paper_path.read_text(encoding="utf-8")
             client.chat.completions.create.reset_mock()
             generate_article_markdown(
                 {
@@ -1415,15 +1424,25 @@ class V1Tests(unittest.TestCase):
 
         self.assertIn("约800到1200个中文字符", paper_prompt)
         self.assertIn("最多3到4个小节", paper_prompt)
+        self.assertIn("结论→论文证据或关键数值→用自然中文解释", paper_prompt)
+        self.assertIn("准确，但不是摘要；专业，但不用论文腔", paper_prompt)
+        self.assertIn("短示例", paper_prompt)
+        self.assertIn("只模仿句长、节奏和解释方式", paper_prompt)
+        self.assertIn("所有科学事实必须来自输入论文材料", paper_prompt)
         self.assertIn("禁止逐句翻译英文", paper_prompt)
-        self.assertIn("自然中文重新组织", paper_prompt)
-        self.assertIn("必须逐字复制", paper_prompt)
-        self.assertIn("每处最多约25个英文词", paper_prompt)
-        self.assertIn("没有合适原文时宁可不引用", paper_prompt)
+        self.assertIn("必须逐字复制自paper_text", paper_prompt)
+        self.assertIn("每处最多25个英文词", paper_prompt)
+        self.assertIn("找不到合适原文就不引用", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
+        self.assertIn(
+            "The supplied paper states an exact scientific result.",
+            paper_markdown,
+        )
+        self.assertNotIn("This quotation was invented by the model.", paper_markdown)
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("约800到1200个中文字符", news_prompt)
-        self.assertNotIn("英文原文短引", news_prompt)
+        self.assertNotIn("结论→论文证据", news_prompt)
+        self.assertNotIn("短示例", news_prompt)
 
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(
@@ -1831,11 +1850,17 @@ class V1Tests(unittest.TestCase):
             text = markdown.read_text(encoding="utf-8")
             self.assertEqual(
                 captions,
-                ["大尺度环流与近地面风。", "Moisture transport and precipitation."],
+                ["Moisture transport and precipitation.", "大尺度环流与近地面风。"],
             )
             self.assertLess(text.index("论文第一页"), text.index("## Atmospheric circulation"))
-            self.assertLess(text.index("Fig. 5 | 大尺度环流与近地面风。"), text.index("## Precipitation mechanisms"))
-            self.assertGreater(text.index("Fig. 2 | Moisture transport and precipitation."), text.index("## Precipitation mechanisms"))
+            self.assertGreater(
+                text.index("Fig. 2 | Moisture transport and precipitation."),
+                text.index("## Precipitation mechanisms"),
+            )
+            self.assertLess(
+                text.index("Fig. 2 | Moisture transport and precipitation."),
+                text.index("Fig. 5 | 大尺度环流与近地面风。"),
+            )
             self.assertNotIn("图1.", text)
 
             (root / "metadata.json").write_text(
@@ -1869,10 +1894,115 @@ class V1Tests(unittest.TestCase):
             )
             plain_lines = plain_markdown.read_text(encoding="utf-8").splitlines()
             figure_lines = [
-                index for index, line in enumerate(plain_lines) if line.startswith("![Fig. ")
+                (index, line)
+                for index, line in enumerate(plain_lines)
+                if line.startswith("![Fig. ")
             ]
-            self.assertEqual(len(figure_lines), 2)
-            self.assertGreater(figure_lines[1] - figure_lines[0], 3)
+            self.assertEqual([line for _, line in figure_lines], [
+                "![Fig. 2](images/figure-02.png)",
+                "![Fig. 5](images/figure-05.png)",
+            ])
+            self.assertLess(figure_lines[0][0], figure_lines[1][0])
+
+    def test_paper_numbered_figures_sort_before_monotonic_insertion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            captions_by_number = {
+                1: "Baseline circulation response",
+                3: "Moisture transport evidence",
+                6: "Surface wind mechanism",
+                8: "Future projection signal",
+            }
+            selected = []
+            for number in (8, 1, 3, 6):
+                path = root / f"figure-{number:02d}.png"
+                path.write_bytes(b"png")
+                selected.append(
+                    {
+                        "url": f"https://example.test/figure-{number}.png",
+                        "local_path": str(path),
+                        "image_role": "figure",
+                        "figure_number": number,
+                        "metadata_title": f"Figure {number} {captions_by_number[number]}",
+                        "caption": captions_by_number[number],
+                    }
+                )
+
+            _, body, _ = _select_article_images(
+                selected,
+                PAPER_CONTENT,
+                " ".join(captions_by_number.values()),
+            )
+            self.assertEqual(
+                [image["figure_number"] for image in body],
+                [1, 3, 6, 8],
+            )
+
+            markdown = root / "ordered.md"
+            markdown.write_text(
+                "## Baseline circulation\n\nBaseline circulation response is identified.\n\n"
+                "## Moisture transport\n\nMoisture transport evidence is quantified.\n\n"
+                "## Surface wind\n\nThe surface wind mechanism is evaluated.\n\n"
+                "## Future projection\n\nThe future projection signal is compared.\n",
+                encoding="utf-8",
+            )
+            effective_captions = _insert_paper_figures(
+                markdown,
+                selected,
+                [f"图{number}说明。" for number in (8, 1, 3, 6)],
+                {"content_type": PAPER_CONTENT},
+            )
+            text = markdown.read_text(encoding="utf-8")
+            figure_numbers = [
+                int(line.split("![Fig. ", 1)[1].split("]", 1)[0])
+                for line in text.splitlines()
+                if line.startswith("![Fig. ")
+            ]
+            self.assertEqual(figure_numbers, [1, 3, 6, 8])
+            self.assertEqual(
+                effective_captions,
+                ["图1说明。", "图3说明。", "图6说明。", "图8说明。"],
+            )
+            figure_positions = [text.index(f"![Fig. {number}]") for number in figure_numbers]
+            self.assertEqual(figure_positions, sorted(figure_positions))
+            for number, heading in (
+                (1, "## Baseline circulation"),
+                (3, "## Moisture transport"),
+                (6, "## Surface wind"),
+                (8, "## Future projection"),
+            ):
+                self.assertGreater(
+                    text.index(f"![Fig. {number}]"),
+                    text.index(heading),
+                )
+
+    def test_paper_images_without_figure_numbers_keep_relevance_order(self):
+        ordinary_images = [
+            {
+                "url": "https://example.test/supporting.png",
+                "local_path": "/tmp/supporting.png",
+                "image_role": "article_image",
+                "caption": "Supporting appendix material",
+            },
+            {
+                "url": "https://example.test/hero.png",
+                "local_path": "/tmp/hero.png",
+                "image_role": "hero",
+                "caption": "Central circulation result",
+            },
+        ]
+        _, body, _ = _select_article_images(
+            ordinary_images,
+            PAPER_CONTENT,
+            "Central circulation result",
+        )
+        self.assertEqual(
+            [image["url"] for image in body],
+            [
+                "https://example.test/hero.png",
+                "https://example.test/supporting.png",
+            ],
+        )
 
     def test_paper_title_first_page_and_cover_use_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
