@@ -2098,6 +2098,13 @@ class NewsPipeline:
                         dossier["pdf_figure_fallback"]["pdf_download"] = pdf_metadata.get(
                             "pdf_download", {}
                         )
+                        download_info = dossier["pdf_figure_fallback"]["pdf_download"]
+                        dossier["pdf_figure_fallback"].update(
+                            {
+                                "source": download_info.get("source", "ordinary_pdf"),
+                                "status": download_info.get("status"),
+                            }
+                        )
                         if pdf_figures:
                             dossier["actual_image_source"] = "pdf_figure"
                     else:
