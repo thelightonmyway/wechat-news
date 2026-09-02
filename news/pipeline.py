@@ -20,7 +20,11 @@ from news.feeds import fetch_all_feeds, normalize_title
 from papers.doi import resolve_doi_landing_page
 from papers.first_page import render_paper_first_page
 from papers.oa_mirror import resolve_oa_html_mirror
-from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
+from papers.openalex import (
+    OpenAlexAdapter,
+    is_allowed_paper_journal,
+    journal_display_name,
+)
 from papers.pdf_figures import (
     discover_pdf_source,
     download_pdf_with_wiley_tdm,
@@ -1389,7 +1393,7 @@ def _openalex_discovery_item(record: dict[str, Any], run_date: str) -> dict[str,
     doi = str(record.get("doi") or "").strip().lower()
     url = f"https://doi.org/{doi}" if doi else ""
     publication_date = str(record.get("publication_date") or "")
-    journal = str(record.get("journal") or "")
+    journal = journal_display_name(str(record.get("journal") or ""))
     publisher = str(record.get("publisher") or "")
     work_type = str(record.get("type") or "")
     return {
@@ -1439,7 +1443,10 @@ class NewsPipeline:
         self.refresh_lock = asyncio.Lock()
         self.last_source_counts: dict[str, int] = {}
         self.last_paper_discovery_stats: dict[str, int] = {}
+        self.last_paper_journal_counts: dict[str, int] = {}
         self.last_paper_refresh_warning = ""
+        self.last_paper_batch_total = 0
+        self.last_paper_batch_only = False
 
     async def _extract_shortlist(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         preliminary = sorted(items, key=deterministic_score, reverse=True)[:40]
@@ -1487,13 +1494,14 @@ class NewsPipeline:
                     except Exception as exc:
                         self.logger.warning("OpenAlex DOI lookup failed: %s", exc)
                         return None
+            journal = journal_display_name(str(metadata.get("journal") or ""))
             if not is_allowed_paper_journal(
-                str(metadata.get("journal") or ""),
+                journal,
                 str(metadata.get("publisher") or ""),
             ):
                 return None
             merged = dict(item)
-            merged["openalex"] = metadata
+            merged["openalex"] = dict(metadata, journal=journal)
             run_day = date_type.fromisoformat(run_date)
             if not self.openalex.is_formally_published(
                 metadata,
@@ -1505,9 +1513,9 @@ class NewsPipeline:
             merged["title"] = metadata.get("title") or merged.get("title") or ""
             merged["normalized_title"] = normalize_title(str(merged["title"]))
             merged["summary"] = metadata.get("abstract") or merged.get("summary") or ""
-            merged["journal"] = metadata.get("journal") or ""
+            merged["journal"] = journal
             merged["publisher"] = metadata.get("publisher") or ""
-            merged["source"] = metadata.get("journal") or merged.get("source") or "OpenAlex"
+            merged["source"] = journal or merged.get("source") or "OpenAlex"
             merged["work_type"] = metadata.get("work_type") or merged.get("work_type") or ""
             if metadata.get("publication_date"):
                 merged["published_at"] = f"{metadata['publication_date']}T00:00:00+00:00"
@@ -1528,6 +1536,7 @@ class NewsPipeline:
         content_type: str | None = None,
         *,
         exclude_seen: bool = False,
+        append: bool = False,
     ) -> list[dict[str, Any]]:
         run_date = date or local_date(self.settings)
         run_type = content_type or content_type_for_date(run_date)
@@ -1535,6 +1544,9 @@ class NewsPipeline:
             raise ValueError(f"unsupported content type: {run_type}")
         async with self.refresh_lock:
             self.last_paper_refresh_warning = ""
+            if not append:
+                self.last_paper_batch_total = 0
+                self.last_paper_batch_only = False
             existing_paper_candidates = (
                 self.db.get_candidates(run_date, PAPER_CONTENT)
                 if run_type == PAPER_CONTENT
@@ -1558,24 +1570,14 @@ class NewsPipeline:
                 topic_items: list[dict[str, Any]] = []
                 enriched: list[dict[str, Any]] = []
                 lookback_hours = LOOKBACK_HOURS[0]
-                openalex_papers: list[dict[str, Any]] = []
-                if run_type == PAPER_CONTENT and self.openalex.configured:
-                    run_day = date_type.fromisoformat(run_date)
-                    discovered = await asyncio.to_thread(
-                        self.openalex.discover_recent_papers,
-                        run_day - timedelta(days=30),
-                        run_day,
-                    )
-                    openalex_papers = await self._published_papers(
-                        [
-                            _openalex_discovery_item(record, run_date)
-                            for record in discovered
-                        ],
-                        run_date,
-                    )
-
                 rss_paper_count = 0
                 openalex_added_count = 0
+                journal_first_count = 0
+                topic_openalex_count = 0
+                merged_unique_count = 0
+                after_journal_whitelist_count = 0
+                after_published_seen_count = 0
+                journal_counts: dict[str, int] = {}
                 for window_hours in LOOKBACK_HOURS:
                     items, window_errors, window_counts = await asyncio.to_thread(
                         fetch_all_feeds,
@@ -1586,6 +1588,35 @@ class NewsPipeline:
                     source_counts = window_counts
                     lookback_hours = window_hours
                     if run_type == PAPER_CONTENT:
+                        openalex_papers: list[dict[str, Any]] = []
+                        if self.openalex.configured:
+                            run_day = date_type.fromisoformat(run_date)
+                            window_days = max(1, (window_hours + 23) // 24)
+                            discovered = await asyncio.to_thread(
+                                self.openalex.discover_recent_papers,
+                                run_day - timedelta(days=window_days),
+                                run_day,
+                            )
+                            openalex_papers = await self._published_papers(
+                                [
+                                    _openalex_discovery_item(record, run_date)
+                                    for record in discovered
+                                ],
+                                run_date,
+                            )
+                            journal_first_count = getattr(
+                                self.openalex,
+                                "last_journal_first_count",
+                                0,
+                            )
+                            topic_openalex_count = getattr(
+                                self.openalex,
+                                "last_topic_count",
+                                0,
+                            )
+                            journal_counts = dict(
+                                getattr(self.openalex, "last_journal_first_counts", {})
+                            )
                         topic_items = [
                             item
                             for item in items
@@ -1608,6 +1639,8 @@ class NewsPipeline:
                             rss_papers,
                             openalex_papers,
                         )
+                        merged_unique_count = len(merged_papers)
+                        after_journal_whitelist_count = len(merged_papers)
                         openalex_added_count = sum(
                             item.get("discovery_origin") == "openalex"
                             for item in merged_papers
@@ -1619,7 +1652,23 @@ class NewsPipeline:
                                 deterministic_score(item),
                             ),
                             reverse=True,
-                        )[:30]
+                        )
+                        eligible: list[dict[str, Any]] = []
+                        for item in enriched:
+                            if _is_published_article(item, published):
+                                continue
+                            article_id = self.db.upsert_article(item)
+                            item["article_id"] = article_id
+                            if article_id in seen_paper_ids:
+                                continue
+                            if _is_published_article(item, published):
+                                continue
+                            if item.get("images") is not None:
+                                self.db.replace_images(article_id, item.get("images") or [])
+                            item["score"] = deterministic_score(item)
+                            eligible.append(item)
+                        enriched = eligible
+                        after_published_seen_count = len(enriched)
                     else:
                         topic_items = [
                             item
@@ -1642,35 +1691,76 @@ class NewsPipeline:
                         break
                 self.last_source_counts = source_counts
                 if run_type == PAPER_CONTENT:
+                    self.last_paper_journal_counts = journal_counts
                     self.last_paper_discovery_stats = {
+                        "lookback": lookback_hours,
+                        "journal_first": journal_first_count,
+                        "topic_openalex": topic_openalex_count,
+                        "rss": rss_paper_count,
+                        "merged_unique": merged_unique_count,
+                        "after_journal_whitelist": after_journal_whitelist_count,
+                        "after_published_seen": after_published_seen_count,
+                        "after_local_relevance": len(enriched),
+                        "ai_examined": 0,
+                        "ai_kept": 0,
+                        "final": 0,
                         "rss_candidates": rss_paper_count,
                         "openalex_added": openalex_added_count,
                         "coarse_filtered": len(enriched),
                     }
 
-                eligible: list[dict[str, Any]] = []
-                for item in enriched:
-                    if _is_published_article(item, published):
-                        continue
-                    article_id = self.db.upsert_article(item)
-                    item["article_id"] = article_id
-                    if article_id in seen_paper_ids:
-                        continue
-                    if _is_published_article(item, published):
-                        continue
-                    if item.get("images") is not None:
-                        self.db.replace_images(article_id, item.get("images") or [])
-                    item["score"] = deterministic_score(item)
-                    eligible.append(item)
-                enriched = eligible
+                if run_type != PAPER_CONTENT:
+                    eligible: list[dict[str, Any]] = []
+                    for item in enriched:
+                        if _is_published_article(item, published):
+                            continue
+                        article_id = self.db.upsert_article(item)
+                        item["article_id"] = article_id
+                        if _is_published_article(item, published):
+                            continue
+                        if item.get("images") is not None:
+                            self.db.replace_images(article_id, item.get("images") or [])
+                        item["score"] = deterministic_score(item)
+                        eligible.append(item)
+                    enriched = eligible
 
                 title_error = ""
                 if run_type == PAPER_CONTENT:
-                    selected, used_model, llm_error = await asyncio.to_thread(
-                        select_paper_top_ten,
-                        enriched[:30],
-                        self.settings,
-                    )
+                    selected: list[dict[str, Any]] = []
+                    used_model = True
+                    llm_error = ""
+                    ai_examined = 0
+                    if not self.settings.model_configured:
+                        selected = [
+                            dict(item, title_cn=str(item.get("title_cn") or ""))
+                            for item in enriched
+                            if int(item.get("paper_local_score") or 0) >= 2
+                        ][:10]
+                        used_model = False
+                        llm_error = "model not configured"
+                    else:
+                        for offset in range(0, len(enriched), 30):
+                            batch = enriched[offset : offset + 30]
+                            if not batch:
+                                break
+                            ai_examined += len(batch)
+                            batch_selected, batch_used, batch_error = await asyncio.to_thread(
+                                select_paper_top_ten,
+                                batch,
+                                self.settings,
+                            )
+                            if not batch_used:
+                                used_model = False
+                                llm_error = batch_error
+                                selected = [
+                                    dict(item, title_cn=str(item.get("title_cn") or ""))
+                                    for item in enriched
+                                    if int(item.get("paper_local_score") or 0) >= 2
+                                ][:10]
+                                break
+                            selected.extend(batch_selected)
+                            if len(selected) >= 10:
+                                break
                     selected = sorted(
                         selected,
                         key=lambda item: (
@@ -1679,12 +1769,14 @@ class NewsPipeline:
                         ),
                         reverse=True,
                     )[:10]
-                    self.last_paper_discovery_stats.update(
-                        {
-                            "llm_selected": len(selected),
-                            "top10": len(selected),
-                        }
-                    )
+                    if self.last_paper_discovery_stats:
+                        self.last_paper_discovery_stats.update(
+                            {
+                                "ai_examined": ai_examined,
+                                "ai_kept": len(selected) if used_model else 0,
+                                "final": len(selected),
+                            }
+                        )
                     if used_model and selected:
                         translated, _, title_error = await asyncio.to_thread(
                             translate_paper_titles,
@@ -1695,6 +1787,8 @@ class NewsPipeline:
                             dict(item, title_cn=translated[index] or str(item.get("title_cn") or ""))
                             for index, item in enumerate(selected)
                         ]
+                        if self.last_paper_discovery_stats:
+                            self.last_paper_discovery_stats["final"] = len(selected)
                 else:
                     prioritized = prioritize_candidates(enriched)
                     selected, used_model, llm_error = await asyncio.to_thread(
@@ -1736,24 +1830,46 @@ class NewsPipeline:
                     self.last_paper_refresh_warning = (
                         "⚠ AI 筛选暂时不可用，当前显示本地筛选结果"
                     )
-                self.db.replace_candidates(run_date, selected, run_type)
+                if append:
+                    self.db.append_candidates(run_date, selected, run_type)
+                else:
+                    self.db.replace_candidates(run_date, selected, run_type)
                 if run_type == PAPER_CONTENT and selected:
                     self.db.add_seen_candidates(
                         run_date,
                         PAPER_CONTENT,
                         [int(item["article_id"]) for item in selected],
                     )
+                stored_candidates = self.db.get_candidates(run_date, run_type)
                 status = "success" if selected else "empty"
                 if feed_errors and selected:
                     status = "partial"
                 self.db.set_daily_run(
                     run_date,
                     fetched_at=utc_now(),
-                    candidate_count=len(selected),
+                    candidate_count=len(stored_candidates),
                     content_type=run_type,
                     status=status,
                     error=" | ".join(errors)[:2000],
                 )
+                if run_type == PAPER_CONTENT:
+                    self.logger.info(
+                        "PAPER discovery stats lookback=%sh journal_first=%s topic_openalex=%s rss=%s "
+                        "merged_unique=%s after_journal_whitelist=%s after_published_seen=%s "
+                        "after_local_relevance=%s ai_examined=%s ai_kept=%s final=%s journals=%s",
+                        lookback_hours,
+                        self.last_paper_discovery_stats.get("journal_first", 0),
+                        self.last_paper_discovery_stats.get("topic_openalex", 0),
+                        self.last_paper_discovery_stats.get("rss", 0),
+                        self.last_paper_discovery_stats.get("merged_unique", 0),
+                        self.last_paper_discovery_stats.get("after_journal_whitelist", 0),
+                        self.last_paper_discovery_stats.get("after_published_seen", 0),
+                        self.last_paper_discovery_stats.get("after_local_relevance", 0),
+                        self.last_paper_discovery_stats.get("ai_examined", 0),
+                        self.last_paper_discovery_stats.get("ai_kept", 0),
+                        self.last_paper_discovery_stats.get("final", 0),
+                        self.last_paper_journal_counts,
+                    )
                 self.logger.info(
                     "News refresh complete date=%s type=%s lookback=%sh feeds=%s topic=%s unique=%s candidates=%s llm=%s",
                     run_date,
@@ -1784,12 +1900,18 @@ class NewsPipeline:
         run_date = date or local_date(self.settings)
         run_type = content_type or content_type_for_date(run_date)
         self.last_paper_refresh_warning = ""
+        self.last_paper_batch_total = 0
+        self.last_paper_batch_only = False
         existing = self.db.get_candidates(run_date, run_type)
         run = self.db.get_daily_run(run_date, run_type)
         if existing and (
             run_type == PAPER_CONTENT
             or (run and run.get("content_type") == run_type)
         ):
+            if run_type != PAPER_CONTENT:
+                published = self.db.published_article_identifiers()
+                if any(_is_published_article(item, published) for item in existing):
+                    return await self.refresh(run_date, run_type)
             if self.settings.model_configured and any(
                 not str(item.get("title_cn") or "").strip() for item in existing
             ):
@@ -1849,10 +1971,13 @@ class NewsPipeline:
         date: str | None = None,
     ) -> list[dict[str, Any]]:
         run_date = date or local_date(self.settings)
+        self.last_paper_batch_total = 0
+        self.last_paper_batch_only = False
         current = self.db.get_candidates(run_date, PAPER_CONTENT)
         if not current:
             return await self.refresh(run_date, PAPER_CONTENT)
         current_ids = {int(item["id"]) for item in current}
+        current_count = len(current)
         self.db.add_seen_candidates(
             run_date,
             PAPER_CONTENT,
@@ -1862,21 +1987,34 @@ class NewsPipeline:
             run_date,
             PAPER_CONTENT,
             exclude_seen=True,
+            append=True,
         )
-        if {int(item["id"]) for item in result} == current_ids:
-            self.last_paper_refresh_warning = "⚠ 换一批失败，继续保留当前论文列表"
+        if len(result) > current_count:
+            self.last_paper_batch_total = len(result)
+            self.last_paper_batch_only = True
+            return result[current_count:]
+        self.last_paper_refresh_warning = "⚠ 换一批失败，继续保留当前论文列表"
         return result
 
     def format_news(self, candidates: list[dict[str, Any]]) -> str:
         if not candidates:
             return "今日暂无可用科研新闻候选。"
         content_type = str(candidates[0].get("content_type") or POPULAR_CONTENT)
-        heading = "今日已发表论文 Top 10" if content_type == PAPER_CONTENT else "今日科普新闻 Top 10"
+        if content_type == PAPER_CONTENT:
+            heading = (
+                f"今日已发表论文（本批次新增{len(candidates)}篇，累计{self.last_paper_batch_total}篇）"
+                if self.last_paper_batch_only
+                else f"今日已发表论文（共{len(candidates)}篇）"
+            )
+            visible_candidates = candidates
+        else:
+            heading = "今日科普新闻 Top 10"
+            visible_candidates = candidates[:10]
         lines = []
         if content_type == PAPER_CONTENT and self.last_paper_refresh_warning:
             lines.append(self.last_paper_refresh_warning)
         lines.append(f"## {heading}")
-        for item in candidates[:10]:
+        for item in visible_candidates:
             title_cn = str(item.get("title_cn") or "").strip()
             english = str(item.get("title") or "")
             published = str(item.get("published_at") or "")[:16].replace("T", " ")

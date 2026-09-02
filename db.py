@@ -249,6 +249,37 @@ class Database:
                     ),
                 )
 
+    def append_candidates(
+        self,
+        date: str,
+        candidates: Iterable[dict[str, Any]],
+        content_type: str = "",
+    ) -> None:
+        values = list(candidates)
+        if not values:
+            return
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COALESCE(MAX(rank), 0) AS max_rank
+                FROM daily_candidates WHERE date=? AND content_type=?""",
+                (date, content_type),
+            ).fetchone()
+            next_rank = int(row["max_rank"] or 0) + 1
+            for offset, candidate in enumerate(values):
+                connection.execute(
+                    """INSERT INTO daily_candidates
+                    (date,content_type,rank,article_id,title_cn,score)
+                    VALUES (?,?,?,?,?,?)""",
+                    (
+                        date,
+                        content_type,
+                        next_rank + offset,
+                        int(candidate["article_id"]),
+                        str(candidate.get("title_cn") or ""),
+                        float(candidate.get("score") or 0),
+                    ),
+                )
+
     def add_seen_candidates(
         self,
         date: str,

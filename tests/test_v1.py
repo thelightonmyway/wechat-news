@@ -45,7 +45,11 @@ from news.pipeline import (
 )
 from papers.doi import resolve_doi_landing_page
 from papers.oa_mirror import resolve_oa_html_mirror
-from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
+from papers.openalex import (
+    OpenAlexAdapter,
+    is_allowed_paper_journal,
+    journal_display_name,
+)
 from papers.pdf_figures import (
     _download_pdf,
     discover_pdf_source,
@@ -734,9 +738,14 @@ class V1Tests(unittest.TestCase):
 
                 self.assertEqual(calls, [48, 168, 720])
                 self.assertEqual(len(candidates), 4)
-                pipeline.openalex.discover_recent_papers.assert_called_once_with(
-                    date_type(2026, 7, 27),
-                    date_type(2026, 8, 26),
+                self.assertEqual(pipeline.openalex.discover_recent_papers.call_count, 3)
+                self.assertEqual(
+                    pipeline.openalex.discover_recent_papers.call_args_list,
+                    [
+                        unittest.mock.call(date_type(2026, 8, 24), date_type(2026, 8, 26)),
+                        unittest.mock.call(date_type(2026, 8, 19), date_type(2026, 8, 26)),
+                        unittest.mock.call(date_type(2026, 7, 27), date_type(2026, 8, 26)),
+                    ],
                 )
                 self.assertEqual(pipeline.last_paper_discovery_stats["rss_candidates"], 3)
                 self.assertEqual(pipeline.last_paper_discovery_stats["openalex_added"], 1)
@@ -831,6 +840,286 @@ class V1Tests(unittest.TestCase):
         for journal, publisher in rejected:
             with self.subTest(journal=journal):
                 self.assertFalse(is_allowed_paper_journal(journal, publisher))
+
+    def test_jgra_alias_whitelist_and_source_match(self):
+        aliases = (
+            "Journal of Geophysical Research: Atmospheres",
+            "Journal of Geophysical Research - Atmospheres",
+            "JGR: Atmospheres",
+            "JGR Atmospheres",
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                self.assertTrue(
+                    is_allowed_paper_journal(alias, "American Geophysical Union")
+                )
+                self.assertEqual(
+                    journal_display_name(alias),
+                    "Journal of Geophysical Research: Atmospheres",
+                )
+        self.assertFalse(
+            is_allowed_paper_journal(
+                "Journal of Geophysical Research: Oceans",
+                "American Geophysical Union",
+            )
+        )
+
+        class FakeSources:
+            def __init__(self):
+                self.query = ""
+                self.calls = []
+
+            def search(self, query):
+                self.query = query
+                return self
+
+            def get(self, **kwargs):
+                self.calls.append((self.query, kwargs))
+                return [
+                    {
+                        "id": "https://openalex.org/S-JGRA",
+                        "display_name": "Journal of Geophysical Research: Atmospheres",
+                        "host_organization_name": "American Geophysical Union",
+                    },
+                    {
+                        "id": "https://openalex.org/S-OCEANS",
+                        "display_name": "Journal of Geophysical Research: Oceans",
+                        "host_organization_name": "American Geophysical Union",
+                    },
+                ]
+
+        sources = FakeSources()
+        with patch("papers.openalex.Sources", return_value=sources):
+            adapter = OpenAlexAdapter("test-openalex-key")
+            self.assertEqual(adapter._resolve_source_id("JGR Atmospheres"), "S-JGRA")
+            self.assertEqual(
+                adapter._resolve_source_id("Journal of Geophysical Research: Atmospheres"),
+                "S-JGRA",
+            )
+        self.assertEqual(len(sources.calls), 1)
+        self.assertEqual(sources.calls[0][0], "JGR Atmospheres")
+
+    def test_openalex_journal_first_paginates_target_sources(self):
+        class FakeSources:
+            def search(self, query):
+                self.query = query
+                return self
+
+            def get(self, **_kwargs):
+                return [
+                    {
+                        "id": f"https://openalex.org/S-{self.query}",
+                        "display_name": self.query,
+                        "host_organization_name": "American Geophysical Union",
+                    }
+                ]
+
+        works_pages = [
+            [
+                {
+                    "title": "GRL paper outside topic shortlist",
+                    "doi": "https://doi.org/10.1000/grl-1",
+                    "publication_date": "2026-08-26",
+                    "type": "article",
+                    "primary_location": {
+                        "source": {
+                            "display_name": "Geophysical Research Letters",
+                            "host_organization_name": "American Geophysical Union",
+                        }
+                    },
+                }
+            ],
+            [
+                {
+                    "title": "ESD paper page two",
+                    "doi": "https://doi.org/10.1000/esd-2",
+                    "publication_date": "2026-08-25",
+                    "type": "article",
+                    "primary_location": {
+                        "source": {
+                            "display_name": "Earth System Dynamics",
+                            "host_organization_name": "Copernicus Publications",
+                        }
+                    },
+                }
+            ],
+            [
+                {
+                    "title": "Science paper",
+                    "doi": "https://doi.org/10.1000/science-3",
+                    "publication_date": "2026-08-24",
+                    "type": "article",
+                    "primary_location": {
+                        "source": {
+                            "display_name": "Science",
+                            "host_organization_name": "AAAS",
+                        }
+                    },
+                }
+            ],
+            [
+                {
+                    "title": "PNAS paper",
+                    "doi": "https://doi.org/10.1000/pnas-4",
+                    "publication_date": "2026-08-23",
+                    "type": "article",
+                    "primary_location": {
+                        "source": {
+                            "display_name": "Proceedings of the National Academy of Sciences",
+                            "host_organization_name": "National Academy of Sciences",
+                        }
+                    },
+                }
+            ],
+        ]
+
+        class FakeWorks:
+            def __init__(self):
+                self.filters = []
+                self.page = 0
+
+            def filter(self, **kwargs):
+                self.filters.append(kwargs)
+                return self
+
+            def select(self, _value):
+                return self
+
+            def get(self, **_kwargs):
+                page = works_pages[self.page]
+                self.page += 1
+                return page
+
+        with (
+            patch("papers.openalex.JOURNAL_FIRST_TARGETS", (
+                "Geophysical Research Letters",
+                "Earth System Dynamics",
+                "Science",
+                "PNAS",
+            )),
+            patch("papers.openalex.DISCOVERY_QUERIES", ()),
+            patch("papers.openalex.Sources", return_value=FakeSources()),
+            patch("papers.openalex.Works", return_value=FakeWorks()),
+        ):
+            adapter = OpenAlexAdapter("test-openalex-key")
+            records = adapter.discover_recent_papers(
+                date_type(2026, 8, 23),
+                date_type(2026, 8, 26),
+            )
+
+        self.assertEqual(
+            {record["doi"] for record in records},
+            {
+                "10.1000/grl-1",
+                "10.1000/esd-2",
+                "10.1000/science-3",
+                "10.1000/pnas-4",
+            },
+        )
+        self.assertEqual(adapter.last_journal_first_count, 4)
+        self.assertEqual(adapter.last_topic_count, 0)
+
+    def test_openalex_journal_first_follows_cursor_until_exhausted(self):
+        class Page(list):
+            def __init__(self, values, next_cursor):
+                super().__init__(values)
+                self.meta = {"next_cursor": next_cursor}
+
+        class FakeSources:
+            def search(self, _query):
+                return self
+
+            def get(self, **_kwargs):
+                return [{
+                    "id": "https://openalex.org/S-GRL",
+                    "display_name": "Geophysical Research Letters",
+                    "host_organization_name": "American Geophysical Union",
+                }]
+
+        def work(doi):
+            return {
+                "title": f"GRL work {doi}",
+                "doi": f"https://doi.org/{doi}",
+                "publication_date": "2026-08-26",
+                "type": "article",
+                "primary_location": {
+                    "source": {
+                        "display_name": "Geophysical Research Letters",
+                        "host_organization_name": "American Geophysical Union",
+                    }
+                },
+            }
+
+        class FakeWorks:
+            def __init__(self):
+                self.get_calls = []
+
+            def filter(self, **_kwargs):
+                return self
+
+            def select(self, _value):
+                return self
+
+            def get(self, **kwargs):
+                self.get_calls.append(kwargs)
+                if kwargs["cursor"] == "*":
+                    return Page([work("10.1000/page-1")], "cursor-2")
+                return Page([work("10.1000/page-2")], None)
+
+        works = FakeWorks()
+        with (
+            patch("papers.openalex.JOURNAL_FIRST_TARGETS", ("Geophysical Research Letters",)),
+            patch("papers.openalex.DISCOVERY_QUERIES", ()),
+            patch("papers.openalex.Sources", return_value=FakeSources()),
+            patch("papers.openalex.Works", return_value=works),
+        ):
+            records = OpenAlexAdapter("test-openalex-key").discover_recent_papers(
+                date_type(2026, 8, 26),
+                date_type(2026, 8, 26),
+            )
+        self.assertEqual(len(records), 2)
+        self.assertEqual([call["per_page"] for call in works.get_calls], [100, 100])
+        self.assertEqual([call["cursor"] for call in works.get_calls], ["*", "cursor-2"])
+
+    def test_openalex_nsws_query_reaches_ai_candidate_pool(self):
+        work = {
+            "title": "Near-surface wind speed trend over land",
+            "doi": "https://doi.org/10.1000/nsws",
+            "publication_date": "2026-08-26",
+            "type": "article",
+            "primary_location": {
+                "source": {
+                    "display_name": "Geophysical Research Letters",
+                    "host_organization_name": "American Geophysical Union",
+                }
+            },
+        }
+        class FakeWorks:
+            def search(self, query):
+                self.query = query
+                return self
+
+            def filter(self, **_kwargs):
+                return self
+
+            def select(self, _value):
+                return self
+
+            def get(self, **_kwargs):
+                return [work] if self.query == "near-surface wind speed trend" else []
+
+        with (
+            patch("papers.openalex.JOURNAL_FIRST_TARGETS", ()),
+            patch("papers.openalex.DISCOVERY_QUERIES", ("near-surface wind speed trend",)),
+            patch("papers.openalex.Works", return_value=FakeWorks()),
+        ):
+            records = OpenAlexAdapter("test-openalex-key").discover_recent_papers(
+                date_type(2026, 8, 26),
+                date_type(2026, 8, 26),
+                per_query=15,
+            )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["doi"], "10.1000/nsws")
 
     def test_refresh_excludes_drafted_url_and_doi_but_keeps_failed(self):
         def item(index, title, *, doi="", canonical_url=None):
@@ -2877,6 +3166,227 @@ class V1Tests(unittest.TestCase):
             ["核心论文", "相关论文"],
         )
 
+    def test_paper_refresh_expands_window_after_seen_filter(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "seen-window.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+
+                def make_item(index):
+                    return {
+                        "source": "Journal of Climate",
+                        "url": f"https://example.test/window-{index}",
+                        "canonical_url": f"https://example.test/window-{index}",
+                        "title": f"Window paper {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-08-26T00:00:00+00:00",
+                        "doi": f"10.1000/window-{index}",
+                        "journal": "Journal of Climate",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": "2026-08-26T00:00:00+00:00",
+                    }
+
+                seen_items = [make_item(index) for index in range(2)]
+                seen_ids = [pipeline.db.upsert_article(item) for item in seen_items]
+                pipeline.db.add_seen_candidates("2026-08-26", PAPER_CONTENT, seen_ids)
+                windows = {
+                    48: seen_items + [make_item(index) for index in range(2, 8)],
+                    168: [make_item(index) for index in range(8, 20)],
+                }
+                calls = []
+
+                def fake_fetch(_path, hours):
+                    calls.append(hours)
+                    return copy.deepcopy(windows.get(hours, [])), [], {"test": len(windows.get(hours, []))}
+
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(
+                    0, result=copy.deepcopy(values)
+                )
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0,
+                    result=[dict(value, paper_local_score=2) for value in values],
+                )
+                with (
+                    patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch),
+                    patch(
+                        "news.pipeline.select_paper_top_ten",
+                        side_effect=lambda values, _settings: (
+                            [dict(value, paper_relevance_score=3) for value in values[:10]],
+                            True,
+                            "",
+                        ),
+                    ),
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        side_effect=lambda values, _settings: (
+                            ["" for _ in values],
+                            True,
+                            "",
+                        ),
+                    ),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                ):
+                    selected = await pipeline.refresh(
+                        "2026-08-26",
+                        PAPER_CONTENT,
+                        exclude_seen=True,
+                    )
+
+                self.assertEqual(calls, [48, 168])
+                self.assertEqual(len(selected), 10)
+                self.assertTrue(
+                    all(item["id"] not in set(seen_ids) for item in selected)
+                )
+
+        asyncio.run(check())
+
+    def test_paper_ai_selection_processes_multiple_30_item_batches(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "ai-batches.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+                items = [
+                    {
+                        "source": "Journal of Climate",
+                        "url": f"https://example.test/ai-{index}",
+                        "canonical_url": f"https://example.test/ai-{index}",
+                        "title": f"Distinct paper {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-08-26T00:00:00+00:00",
+                        "doi": f"10.1000/ai-{index}",
+                        "journal": "Journal of Climate",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": "2026-08-26T00:00:00+00:00",
+                    }
+                    for index in range(60)
+                ]
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(
+                    0, result=copy.deepcopy(values)
+                )
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0,
+                    result=[dict(value, paper_local_score=2) for value in values],
+                )
+                batch_sizes = []
+
+                def select_batch(values, _settings):
+                    batch_sizes.append(len(values))
+                    keep = 3 if len(batch_sizes) == 1 else 7
+                    return [
+                        dict(value, paper_relevance_score=3)
+                        for value in values[:keep]
+                    ], True, ""
+
+                with (
+                    patch("news.pipeline.fetch_all_feeds", return_value=(items, [], {"test": 60})),
+                    patch("news.pipeline.select_paper_top_ten", side_effect=select_batch),
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        side_effect=lambda values, _settings: (
+                            ["" for _ in values],
+                            True,
+                            "",
+                        ),
+                    ),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                ):
+                    selected = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual(batch_sizes, [30, 30])
+                self.assertEqual(len(selected), 10)
+                self.assertEqual(
+                    pipeline.last_paper_discovery_stats["ai_examined"],
+                    60,
+                )
+                self.assertEqual(pipeline.last_paper_discovery_stats["ai_kept"], 10)
+
+        asyncio.run(check())
+
+    def test_paper_refresh_returns_six_after_30_day_pool_is_exhausted(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "six.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+                items = [
+                    {
+                        "source": "Journal of Climate",
+                        "url": f"https://example.test/six-{index}",
+                        "canonical_url": f"https://example.test/six-{index}",
+                        "title": f"Strict paper {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-08-26T00:00:00+00:00",
+                        "doi": f"10.1000/six-{index}",
+                        "journal": "Journal of Climate",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": "2026-08-26T00:00:00+00:00",
+                    }
+                    for index in range(6)
+                ]
+                calls = []
+
+                def fake_fetch(_path, hours):
+                    calls.append(hours)
+                    return copy.deepcopy(items), [], {"test": len(items)}
+
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(
+                    0, result=copy.deepcopy(values)
+                )
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0,
+                    result=[dict(value, paper_local_score=2) for value in values],
+                )
+                with (
+                    patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch),
+                    patch(
+                        "news.pipeline.select_paper_top_ten",
+                        side_effect=lambda values, _settings: (
+                            [dict(value, paper_relevance_score=3) for value in values],
+                            True,
+                            "",
+                        ),
+                    ),
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        side_effect=lambda values, _settings: (
+                            ["" for _ in values],
+                            True,
+                            "",
+                        ),
+                    ),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                ):
+                    selected = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual(calls, [48, 168, 720])
+                self.assertEqual(len(selected), 6)
+                self.assertEqual(pipeline.last_paper_discovery_stats["final"], 6)
+
+        asyncio.run(check())
+
     def test_paper_refresh_failure_keeps_same_day_last_known_good(self):
         async def check():
             with tempfile.TemporaryDirectory() as tmp:
@@ -3346,11 +3856,21 @@ class V1Tests(unittest.TestCase):
                 ):
                     first = await pipeline.next_paper_batch("2026-08-26")
                     second = await pipeline.next_paper_batch("2026-08-26")
+                    second_text = pipeline.format_news(second)
                     third = await pipeline.next_paper_batch("2026-08-26")
 
                 self.assertEqual([item["title"] for item in first], [f"Paper {i}" for i in range(1, 11)])
                 self.assertEqual([item["title"] for item in second], [f"Paper {i}" for i in range(11, 21)])
                 self.assertEqual([item["title"] for item in third], [f"Paper {i}" for i in range(21, 25)])
+                self.assertIn("本批次新增10篇，累计20篇", second_text)
+                self.assertIn("11.", second_text)
+                with patch(
+                    "news.pipeline.translate_paper_titles",
+                    return_value=(['' for _ in range(24)], True, ""),
+                ):
+                    all_current = await pipeline.get_or_refresh("2026-08-26", PAPER_CONTENT)
+                self.assertEqual(len(all_current), 24)
+                self.assertIn("今日已发表论文（共24篇）", pipeline.format_news(all_current))
                 self.assertEqual(
                     len(pipeline.db.get_seen_candidate_ids("2026-08-26", PAPER_CONTENT)),
                     24,
@@ -3382,9 +3902,13 @@ class V1Tests(unittest.TestCase):
                     failed = await pipeline.next_paper_batch("2026-08-26")
                 self.assertEqual(
                     [item["title"] for item in failed],
-                    [f"Paper {i}" for i in range(21, 25)],
+                    [f"Paper {i}" for i in range(1, 25)],
                 )
                 self.assertIn("⚠ 换一批失败，继续保留当前论文列表", pipeline.format_news(failed))
+                self.assertEqual(
+                    len(pipeline.db.get_seen_candidate_ids("2026-08-26", PAPER_CONTENT)),
+                    24,
+                )
 
         asyncio.run(check())
 
