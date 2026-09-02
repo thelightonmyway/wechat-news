@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 import pymupdf4llm
@@ -16,6 +17,7 @@ from bs4 import BeautifulSoup
 from images.policy import apply_policy, is_no_derivatives_license
 
 USER_AGENT = "Mozilla/5.0 (compatible; wechat-news/0.1; +local-research-bot)"
+WILEY_TDM_ENDPOINT = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/"
 FIGURE_NUMBER = re.compile(r"^\s*(?:fig(?:ure)?\.?)\s*(\d+)\s*(?:[|:.-]\s*)?", re.IGNORECASE)
 PDF_EXCLUSIONS = ("supplement", "moesm", "peer-review", "peer_review", "reviewer")
 WILEY_LIBRARY_HOST_SUFFIX = ".onlinelibrary.wiley.com"
@@ -208,16 +210,94 @@ def _credit_from_caption(caption: str) -> str:
     )
 
 
-def _download_pdf(url: str, destination: Path) -> None:
-    with httpx.Client(timeout=60.0, follow_redirects=True, trust_env=True) as client:
-        response = client.get(url, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-        content = response.content
+def _save_validated_pdf(content: bytes, destination: Path) -> None:
     if not content.startswith(b"%PDF"):
         raise ValueError("downloaded content is not a PDF")
     if len(content) > 50 * 1024 * 1024:
         raise ValueError("PDF exceeds 50 MiB")
     destination.write_bytes(content)
+
+
+def _download_pdf(url: str, destination: Path) -> None:
+    with httpx.Client(timeout=60.0, follow_redirects=True, trust_env=True) as client:
+        response = client.get(url, headers={"User-Agent": USER_AGENT})
+        response.raise_for_status()
+        content = response.content
+    _save_validated_pdf(content, destination)
+
+
+def _download_wiley_tdm_pdf(
+    doi: str,
+    token: str,
+    destination: Path,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "source": "wiley_tdm",
+        "attempted": True,
+        "success": False,
+        "status": None,
+        "error": "",
+    }
+    endpoint = f"{WILEY_TDM_ENDPOINT}{quote(doi.strip(), safe='')}"
+    try:
+        with httpx.Client(timeout=60.0, follow_redirects=True, trust_env=True) as client:
+            for attempt in range(2):
+                response = client.get(
+                    endpoint,
+                    headers={"Wiley-TDM-Client-Token": token},
+                )
+                result["status"] = response.status_code
+                if response.status_code in {502, 503, 504} and attempt == 0:
+                    time.sleep(1)
+                    continue
+                if response.status_code != 200:
+                    result["error"] = f"HTTP {response.status_code}"
+                    return result
+                _save_validated_pdf(response.content, destination)
+                result["success"] = True
+                return result
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"[:1000]
+    return result
+
+
+def download_pdf_with_wiley_tdm(
+    url: str,
+    destination: Path,
+    *,
+    doi: str = "",
+    token: str = "",
+    article_url: str = "",
+) -> dict[str, Any]:
+    """Download an ordinary PDF, then use Wiley TDM only for Wiley failures."""
+    ordinary_error = ""
+    try:
+        _download_pdf(url, destination)
+        return {
+            "source": "ordinary_pdf",
+            "attempted": False,
+            "success": True,
+            "status": 200,
+            "error": "",
+        }
+    except Exception as exc:
+        ordinary_error = f"{type(exc).__name__}: {exc}"[:1000]
+
+    if not token or not doi or not (
+        _is_wiley_library_url(url) or _is_wiley_library_url(article_url)
+    ):
+        return {
+            "source": "ordinary_pdf",
+            "attempted": False,
+            "success": False,
+            "status": None,
+            "error": ordinary_error,
+        }
+
+    tdm_result = _download_wiley_tdm_pdf(doi, token, destination)
+    if not tdm_result["success"] and ordinary_error:
+        tdm_result["ordinary_error"] = ordinary_error
+    return tdm_result
 
 
 def extract_pdf_figures(
@@ -227,13 +307,23 @@ def extract_pdf_figures(
     article_url: str = "",
     article_license: str = "",
     license_url: str = "",
+    doi: str = "",
+    wiley_tdm_token: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Extract complete numbered figures without inventing a separate crop algorithm."""
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = output_dir / "pdf_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir.parent / "source_reference.pdf"
-    _download_pdf(pdf_url, pdf_path)
+    pdf_download = download_pdf_with_wiley_tdm(
+        pdf_url,
+        pdf_path,
+        doi=doi,
+        token=wiley_tdm_token,
+        article_url=article_url,
+    )
+    if not pdf_download["success"]:
+        raise RuntimeError(str(pdf_download.get("error") or "PDF download failed"))
 
     layout = pymupdf4llm.to_json(
         pdf_path,
@@ -378,6 +468,7 @@ def extract_pdf_figures(
     metadata = {
         "pdf_url": pdf_url,
         "local_pdf": str(pdf_path),
+        "pdf_download": pdf_download,
         "layout_picture_regions": picture_count,
         "matched_figures": len(matched),
         "rejected_picture_regions": rejected,

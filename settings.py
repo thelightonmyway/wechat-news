@@ -88,6 +88,7 @@ class Settings:
     model_api_key: str
     model_name: str
     openalex_api_key: str
+    wiley_tdm_api_token: str
     wechat_app_id: str
     wechat_app_secret: str
     wechat_author: str
@@ -118,6 +119,7 @@ def load_settings() -> Settings:
         model_api_key=values.get("MODEL_API_KEY", ""),
         model_name=values.get("MODEL_NAME", ""),
         openalex_api_key=values.get("OPENALEX_API_KEY", ""),
+        wiley_tdm_api_token=values.get("WILEY_TDM_API_TOKEN", ""),
         wechat_app_id=values.get("WECHAT_APP_ID", ""),
         wechat_app_secret=values.get("WECHAT_APP_SECRET", ""),
         wechat_author=values.get("WECHAT_AUTHOR", ""),

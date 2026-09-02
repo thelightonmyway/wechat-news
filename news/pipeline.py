@@ -21,7 +21,11 @@ from papers.doi import resolve_doi_landing_page
 from papers.first_page import render_paper_first_page
 from papers.oa_mirror import resolve_oa_html_mirror
 from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
-from papers.pdf_figures import _download_pdf, discover_pdf_source, extract_pdf_figures
+from papers.pdf_figures import (
+    discover_pdf_source,
+    download_pdf_with_wiley_tdm,
+    extract_pdf_figures,
+)
 from settings import PROJECT_ROOT, Settings
 from writer.llm import (
     article_output_dir,
@@ -2085,10 +2089,15 @@ class NewsPipeline:
                             article_url=str(source.get("landing_url") or dossier.get("url") or ""),
                             article_license=str(source.get("license") or ""),
                             license_url=str(source.get("license_url") or ""),
+                            doi=str(dossier.get("doi") or ""),
+                            wiley_tdm_token=self.settings.wiley_tdm_api_token,
                         )
                         dossier["images"] = list(dossier.get("images") or []) + pdf_figures
                         dossier["pdf_figure_metadata"] = pdf_metadata
                         dossier["pdf_figure_fallback"]["matched_figures"] = len(pdf_figures)
+                        dossier["pdf_figure_fallback"]["pdf_download"] = pdf_metadata.get(
+                            "pdf_download", {}
+                        )
                         if pdf_figures:
                             dossier["actual_image_source"] = "pdf_figure"
                     else:
@@ -2155,11 +2164,19 @@ class NewsPipeline:
                             str(openalex.get("license") or ""),
                         )
                     if paper_pdf_source.get("pdf_url"):
-                        await asyncio.to_thread(
-                            _download_pdf,
+                        paper_pdf_download = await asyncio.to_thread(
+                            download_pdf_with_wiley_tdm,
                             str(paper_pdf_source["pdf_url"]),
                             source_pdf,
+                            doi=str(dossier.get("doi") or ""),
+                            token=self.settings.wiley_tdm_api_token,
+                            article_url=str(dossier.get("url") or ""),
                         )
+                        dossier["paper_pdf_download"] = paper_pdf_download
+                        if not paper_pdf_download.get("success"):
+                            raise RuntimeError(
+                                str(paper_pdf_download.get("error") or "PDF download failed")
+                            )
                     else:
                         dossier["paper_first_page_error"] = "no formal/reference PDF found"
                 except Exception as exc:

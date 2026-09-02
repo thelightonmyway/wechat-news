@@ -46,7 +46,12 @@ from news.pipeline import (
 from papers.doi import resolve_doi_landing_page
 from papers.oa_mirror import resolve_oa_html_mirror
 from papers.openalex import OpenAlexAdapter, is_allowed_paper_journal
-from papers.pdf_figures import _download_pdf, discover_pdf_source, extract_pdf_figures
+from papers.pdf_figures import (
+    _download_pdf,
+    discover_pdf_source,
+    download_pdf_with_wiley_tdm,
+    extract_pdf_figures,
+)
 from publisher.wechat import _paper_draft_title, _selected_cover_path, format_markdown
 from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
@@ -2176,6 +2181,154 @@ class V1Tests(unittest.TestCase):
             with patch("papers.pdf_figures.httpx.Client", return_value=client):
                 _download_pdf(pdf_url, destination)
             self.assertTrue(destination.read_bytes().startswith(b"%PDF"))
+
+    def test_wiley_tdm_is_skipped_without_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "paper.pdf"
+            with (
+                patch(
+                    "papers.pdf_figures._download_pdf",
+                    side_effect=RuntimeError("HTTP 403"),
+                ),
+                patch("papers.pdf_figures.httpx.Client") as client,
+            ):
+                result = download_pdf_with_wiley_tdm(
+                    "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/example",
+                    destination,
+                    doi="10.1029/example",
+                )
+            self.assertFalse(result["success"])
+            self.assertFalse(result["attempted"])
+            client.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_wiley_tdm_uses_encoded_doi_and_validates_pdf(self):
+        class Response:
+            def __init__(self, status_code, content):
+                self.status_code = status_code
+                self.content = content
+
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.get.return_value = Response(200, b"%PDF-1.7 redirected PDF")
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "paper.pdf"
+            with (
+                patch(
+                    "papers.pdf_figures._download_pdf",
+                    side_effect=RuntimeError("HTTP 403"),
+                ),
+                patch("papers.pdf_figures.httpx.Client", return_value=client) as http_client,
+            ):
+                result = download_pdf_with_wiley_tdm(
+                    "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/2025GL121477",
+                    destination,
+                    doi="10.1029/2025GL121477",
+                    token="test-tdm-token",
+                )
+            self.assertTrue(result["success"])
+            self.assertEqual(result["source"], "wiley_tdm")
+            self.assertEqual(result["status"], 200)
+            http_client.assert_called_once_with(
+                timeout=60.0,
+                follow_redirects=True,
+                trust_env=True,
+            )
+            request_url, request_kwargs = client.get.call_args.args[0], client.get.call_args.kwargs
+            self.assertEqual(
+                request_url,
+                "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1029%2F2025GL121477",
+            )
+            self.assertEqual(
+                request_kwargs["headers"],
+                {"Wiley-TDM-Client-Token": "test-tdm-token"},
+            )
+            self.assertTrue(destination.read_bytes().startswith(b"%PDF"))
+
+    def test_wiley_tdm_rejects_html_and_non_wiley_urls(self):
+        class Response:
+            status_code = 200
+            content = b"<html>Access denied</html>"
+
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.get.return_value = Response()
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "paper.pdf"
+            with (
+                patch(
+                    "papers.pdf_figures._download_pdf",
+                    side_effect=RuntimeError("HTTP 403"),
+                ),
+                patch("papers.pdf_figures.httpx.Client", return_value=client),
+            ):
+                result = download_pdf_with_wiley_tdm(
+                    "https://example.org/doi/pdf/example",
+                    destination,
+                    doi="10.1029/example",
+                    token="test-tdm-token",
+                )
+            self.assertFalse(result["success"])
+            self.assertFalse(result["attempted"])
+            self.assertFalse(destination.exists())
+
+            with (
+                patch(
+                    "papers.pdf_figures._download_pdf",
+                    side_effect=RuntimeError("HTTP 403"),
+                ),
+                patch("papers.pdf_figures.httpx.Client", return_value=client),
+            ):
+                result = download_pdf_with_wiley_tdm(
+                    "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/example",
+                    destination,
+                    doi="10.1029/example",
+                    token="test-tdm-token",
+                )
+            self.assertFalse(result["success"])
+            self.assertEqual(result["source"], "wiley_tdm")
+            self.assertIn("not a PDF", result["error"])
+            self.assertFalse(destination.exists())
+
+    def test_wiley_tdm_retries_5xx_once_and_stops_on_403(self):
+        class Response:
+            def __init__(self, status_code, content=b""):
+                self.status_code = status_code
+                self.content = content
+
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        client.get.side_effect = [Response(503), Response(403)]
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch(
+                    "papers.pdf_figures._download_pdf",
+                    side_effect=RuntimeError("HTTP 403"),
+                ),
+                patch("papers.pdf_figures.httpx.Client", return_value=client),
+                patch("papers.pdf_figures.time.sleep") as sleep,
+            ):
+                result = download_pdf_with_wiley_tdm(
+                    "https://agupubs.onlinelibrary.wiley.com/doi/pdf/10.1029/example",
+                    Path(tmp) / "paper.pdf",
+                    doi="10.1029/example",
+                    token="test-tdm-token",
+                )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], 403)
+        self.assertEqual(
+            client.get.call_args_list[0].args[0],
+            "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1029%2Fexample",
+        )
+        self.assertEqual(
+            client.get.call_args_list[0].kwargs["headers"],
+            {"Wiley-TDM-Client-Token": "test-tdm-token"},
+        )
+        self.assertEqual(client.get.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_pdf_figure_mapping_uses_number_and_adjacent_text_boxes(self):
         with tempfile.TemporaryDirectory() as tmp:
