@@ -1732,9 +1732,9 @@ class V1Tests(unittest.TestCase):
                     message=SimpleNamespace(
                         content=(
                             "# 测试标题\n\n## 关键结果\n\n简短正文。\n\n"
-                            "> 原文：“The supplied paper states an exact scientific result.”\n\n"
-                            "这句原文支持上述判断。\n\n"
-                            "> 原文：“This quotation was invented by the model.”\n\n"
+                            "> “The supplied paper states an exact scientific result.”\n\n"
+                            "这句引文支持上述判断。\n\n"
+                            "> “This quotation was invented by the model.”\n\n"
                             "这条引文不应保留。"
                         )
                     )
@@ -1800,13 +1800,18 @@ class V1Tests(unittest.TestCase):
         self.assertIn("所有科学事实必须来自输入论文材料", paper_prompt)
         self.assertIn("禁止逐句翻译英文", paper_prompt)
         self.assertIn("必须逐字复制自paper_text", paper_prompt)
+        self.assertIn("优先加入2到3处英文短引", paper_prompt)
         self.assertIn("每处最多25个英文词", paper_prompt)
-        self.assertIn("找不到合适原文就不引用", paper_prompt)
+        self.assertIn("全篇英文引用总量尽量控制在约25个英文词以内", paper_prompt)
+        self.assertIn("引用格式为自然的Markdown引用块", paper_prompt)
+        self.assertIn("找不到合适原文就少引或不引", paper_prompt)
+        self.assertNotIn("> 原文：", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
         self.assertIn(
-            "The supplied paper states an exact scientific result.",
+            "> “The supplied paper states an exact scientific result.”",
             paper_markdown,
         )
+        self.assertNotIn("原文：", paper_markdown)
         self.assertNotIn("This quotation was invented by the model.", paper_markdown)
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("约800到1200个中文字符", news_prompt)
@@ -2106,7 +2111,10 @@ class V1Tests(unittest.TestCase):
                     destination.mkdir(parents=True, exist_ok=True)
                     markdown = destination / "article.md"
                     metadata = destination / "metadata.json"
-                    markdown.write_text("# 大气环流论文\n\nPaper body", encoding="utf-8")
+                    markdown.write_text(
+                        "# 大气环流论文\n\nAtmospheric circulation paper body",
+                        encoding="utf-8",
+                    )
                     metadata.write_text("{}", encoding="utf-8")
                     return markdown, metadata
 
@@ -2199,7 +2207,7 @@ class V1Tests(unittest.TestCase):
                     "url": "https://example.test/figure-5.png",
                     "image_role": "figure",
                     "figure_number": 5,
-                    "caption": "Fig. 5 | Atmospheric circulation and surface wind.",
+                    "caption": "Fig. 5 | Moisture transport and precipitation.",
                     "publishable": True,
                 },
                 {
@@ -2207,7 +2215,7 @@ class V1Tests(unittest.TestCase):
                     "url": "https://example.test/figure-2.png",
                     "image_role": "figure",
                     "figure_number": 2,
-                    "caption": "Fig. 2 | Moisture transport and precipitation.",
+                    "caption": "Fig. 2 | Atmospheric circulation and surface wind.",
                     "publishable": True,
                 },
             ]
@@ -2220,16 +2228,20 @@ class V1Tests(unittest.TestCase):
             text = markdown.read_text(encoding="utf-8")
             self.assertEqual(
                 captions,
-                ["Moisture transport and precipitation.", "大尺度环流与近地面风。"],
+                ["Atmospheric circulation and surface wind.", "大尺度环流与近地面风。"],
             )
             self.assertLess(text.index("论文第一页"), text.index("## Atmospheric circulation"))
             self.assertGreater(
-                text.index("Fig. 2 | Moisture transport and precipitation."),
-                text.index("## Precipitation mechanisms"),
+                text.index("Fig. 2 | Atmospheric circulation and surface wind."),
+                text.index("## Atmospheric circulation"),
             )
             self.assertLess(
-                text.index("Fig. 2 | Moisture transport and precipitation."),
+                text.index("Fig. 2 | Atmospheric circulation and surface wind."),
                 text.index("Fig. 5 | 大尺度环流与近地面风。"),
+            )
+            self.assertGreater(
+                text.index("Fig. 5 | 大尺度环流与近地面风。"),
+                text.index("## Precipitation mechanisms"),
             )
             self.assertNotIn("图1.", text)
 
@@ -2345,6 +2357,69 @@ class V1Tests(unittest.TestCase):
                     text.index(f"![Fig. {number}]"),
                     text.index(heading),
                 )
+
+    def test_paper_figures_match_specific_paragraphs_and_skip_unrelated_figures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "matched.md"
+            markdown.write_text(
+                "## Forecast uncertainty\n\n"
+                "The ensemble spread quantifies forecast errors across the experiments.\n\n"
+                "## Hydroclimate response\n\n"
+                "Large-scale circulation controls regional precipitation changes.\n\n"
+                "## Background\n\n"
+                "The paper describes the observational period.\n",
+                encoding="utf-8",
+            )
+            images = []
+            captions = {
+                1: "Ensemble spread and forecast errors.",
+                2: "Circulation and precipitation response.",
+                4: "Ocean chlorophyll concentration.",
+            }
+            for number in (4, 2, 1):
+                path = root / f"figure-{number:02d}.png"
+                path.write_bytes(b"png")
+                images.append(
+                    {
+                        "url": f"https://example.test/{number}.png",
+                        "local_path": str(path),
+                        "image_role": "figure",
+                        "figure_number": number,
+                        "caption": captions[number],
+                    }
+                )
+            dossier = {"content_type": PAPER_CONTENT, "body_images": images}
+            effective = _insert_paper_figures(
+                markdown,
+                images,
+                ["", "", ""],
+                dossier,
+            )
+            text = markdown.read_text(encoding="utf-8")
+            self.assertEqual(
+                [image["figure_number"] for image in dossier["body_images"]],
+                [1, 2],
+            )
+            self.assertEqual(effective, [captions[1], captions[2]])
+            self.assertEqual(
+                [
+                    int(line.split("![Fig. ", 1)[1].split("]", 1)[0])
+                    for line in text.splitlines()
+                    if line.startswith("![Fig. ")
+                ],
+                [1, 2],
+            )
+            self.assertGreater(
+                text.index("![Fig. 1]"),
+                text.index("ensemble spread quantifies forecast errors"),
+            )
+            self.assertGreater(
+                text.index("![Fig. 2]"),
+                text.index("circulation controls regional precipitation"),
+            )
+            self.assertLess(text.index("![Fig. 1]"), text.index("![Fig. 2]"))
+            self.assertNotIn("Ocean chlorophyll", text)
 
     def test_paper_images_without_figure_numbers_keep_relevance_order(self):
         ordinary_images = [

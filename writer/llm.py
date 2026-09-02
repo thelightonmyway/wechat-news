@@ -520,9 +520,10 @@ PAPER_STYLE_GUIDE = (
     "禁止逐句翻译英文摘要或正文。多用短句和中等长度句，避免英文式长定语、多层从句和被动表达。"
     "所有科学事实必须来自输入论文材料。专业术语、数值、趋势、时间范围、模型、数据集、因果关系、"
     "机制解释和结论必须忠于材料；材料没有明确支持时，不补充机制，不拔高意义。"
-    "如果paper_text中有适合支撑关键结论的句子，优先加入1到2处英文原文短引。每处最多25个英文词，"
-    "必须逐字复制自paper_text，绝对不能自行生成、改写或拼接；找不到合适原文就不引用。"
-    "引用格式为Markdown引用块：> 原文：“……”；引用后可以直接继续正常叙述，不强制另写解释句，"
+    "如果paper_text中有适合支撑关键结论的句子，优先加入2到3处英文短引；每处最多25个英文词，全篇英文引用总量尽量控制在约25个英文词以内。"
+    "每处引用必须逐字复制自paper_text，绝对不能自行生成、改写或拼接；找不到合适原文就少引或不引。"
+    "引用格式为自然的Markdown引用块：> “……”；不要添加‘原文：’、‘英文原文：’或‘Original text:’标签。"
+    "引用可以自然嵌在相关中文段落之间，引用后可以直接继续正常叙述，不强制另写解释句，"
     "也不要大段复制论文。"
     "结构采用简短开场，然后围绕关键发现或机制设置2到4个有信息量的小标题。"
     "不要固定写成‘研究背景/研究方法/研究结果/研究意义’，不要在正文重复标题或文章信息。"
@@ -534,10 +535,11 @@ PAPER_STYLE_GUIDE = (
 
 
 def _remove_unverified_paper_quotes(markdown: str, paper_text: str) -> str:
-    """Drop model-labelled original quotes that are not verbatim paper text."""
+    """Drop or normalize English blockquotes that are not verbatim paper text."""
     normalized_source = re.sub(r"\s+", " ", paper_text).strip()
     lines = markdown.splitlines()
     output: list[str] = []
+    quoted_word_count = 0
     index = 0
     while index < len(lines):
         if not lines[index].lstrip().startswith(">"):
@@ -551,22 +553,32 @@ def _remove_unverified_paper_quotes(markdown: str, paper_text: str) -> str:
         block_lines = lines[index:end]
         block_text = " ".join(
             re.sub(r"^\s*>\s?", "", line).strip() for line in block_lines
+        ).strip()
+        labelled_match = re.search(
+            r"(?:英文)?原文\s*[：:]\s*[“\"](.+?)[”\"]",
+            block_text,
         )
-        if "原文" not in block_text:
+        plain_match = re.fullmatch(r"[“\"](.+?)[”\"]", block_text)
+        match = labelled_match or plain_match
+        if not match:
             output.extend(block_lines)
             index = end
             continue
 
-        match = re.search(r'原文\s*[：:]\s*[“"](.+?)[”"]', block_text)
-        quote = re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+        quote = re.sub(r"\s+", " ", match.group(1)).strip()
         english_words = re.findall(r"\b[A-Za-z]+(?:[-'][A-Za-z]+)*\b", quote)
+        if not english_words:
+            output.extend(block_lines)
+            index = end
+            continue
         if (
             quote
-            and english_words
             and len(english_words) <= 25
+            and quoted_word_count + len(english_words) <= 25
             and quote in normalized_source
         ):
-            output.extend(block_lines)
+            output.append(f"> “{quote}”")
+            quoted_word_count += len(english_words)
         index = end
 
     return "\n".join(output)

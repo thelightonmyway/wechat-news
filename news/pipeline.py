@@ -829,7 +829,15 @@ def _image_visual_score(image: dict[str, Any], content_type: str) -> int:
 
 def _image_information_tokens(image: dict[str, Any]) -> set[str]:
     text = " ".join(
-        str(image.get(key) or "") for key in ("metadata_title", "caption", "alt")
+        str(image.get(key) or "")
+        for key in (
+            "metadata_title",
+            "caption",
+            "original_caption",
+            "figure_title",
+            "description",
+            "alt",
+        )
     ).lower()
     stopwords = {
         "file",
@@ -864,6 +872,45 @@ def _text_relevance_score(image: dict[str, Any], context: str) -> int:
         return 0
     overlap = image_tokens & context_tokens
     return len(overlap) * 4 + round(10 * len(overlap) / len(image_tokens))
+
+
+_PAPER_GENERIC_FIGURE_TOKENS = {
+    "analysis",
+    "climate",
+    "comparison",
+    "distribution",
+    "figure",
+    "model",
+    "models",
+    "pattern",
+    "patterns",
+    "result",
+    "results",
+    "response",
+    "simulation",
+    "study",
+    "variability",
+}
+
+
+def _paper_figure_match_score(image: dict[str, Any], context: str) -> int:
+    """Score a figure only when its caption has specific textual evidence."""
+    score = _text_relevance_score(image, context)
+    if not score:
+        return 0
+    image_tokens = _image_information_tokens(image)
+    context_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", context.lower()) if len(token) >= 3
+    }
+    meaningful_overlap = (image_tokens & context_tokens) - _PAPER_GENERIC_FIGURE_TOKENS
+    if not meaningful_overlap:
+        return 0
+    # One specific keyword is enough for a short, focused caption; longer captions
+    # need two matching terms so generic overlap cannot place a figure by accident.
+    minimum_overlap = 1 if len(image_tokens) <= 4 else 2
+    if len(meaningful_overlap) < minimum_overlap:
+        return 0
+    return score
 
 
 def _images_redundant(
@@ -1113,6 +1160,54 @@ def _paper_figure_caption(
     return figure_number, caption or str(image.get("figure_title") or f"Figure {figure_number}")
 
 
+def _paper_text_slots(lines: list[str]) -> list[tuple[int, int, str]]:
+    """Return paragraph insertion points in document order."""
+    heading_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^#{2,3}\s+", line.strip())
+    ]
+    ranges: list[tuple[int, int, str]] = []
+    if heading_indexes:
+        for position, start in enumerate(heading_indexes):
+            end = (
+                heading_indexes[position + 1]
+                if position + 1 < len(heading_indexes)
+                else len(lines)
+            )
+            ranges.append((start, end, lines[start].strip()))
+    else:
+        ranges.append((0, len(lines), ""))
+
+    slots: list[tuple[int, int, str]] = []
+    for section_index, (section_start, section_end, heading) in enumerate(ranges):
+        index = section_start + (1 if heading else 0)
+        paragraph_starts: list[tuple[int, int]] = []
+        while index < section_end:
+            while index < section_end and not lines[index].strip():
+                index += 1
+            if index >= section_end:
+                break
+            start = index
+            while index < section_end and lines[index].strip():
+                index += 1
+            paragraph_starts.append((start, index))
+        if not paragraph_starts and heading:
+            paragraph_starts.append((section_start, section_end))
+        for paragraph_number, (start, end) in enumerate(paragraph_starts):
+            paragraph_lines = lines[start:end]
+            if paragraph_lines and all(line.strip().startswith("![") for line in paragraph_lines):
+                continue
+            context = "\n".join(paragraph_lines).strip()
+            if paragraph_number == 0 and heading:
+                context = f"{heading}\n{context}".strip()
+            if context:
+                slots.append((end, section_index, context))
+    if not slots:
+        slots.append((len(lines), 0, "\n".join(lines)))
+    return slots
+
+
 def _insert_paper_figures(
     markdown_path: Path,
     images: list[dict[str, Any]],
@@ -1122,37 +1217,7 @@ def _insert_paper_figures(
     if not images:
         return []
     lines = markdown_path.read_text(encoding="utf-8").splitlines()
-    heading_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if re.match(r"^#{2,3}\s+", line.strip())
-    ]
-    sections: list[tuple[int, int, str]] = []
-    if heading_indexes:
-        for position, start in enumerate(heading_indexes):
-            end = (
-                heading_indexes[position + 1]
-                if position + 1 < len(heading_indexes)
-                else len(lines)
-            )
-            sections.append((start, end, "\n".join(lines[start:end])))
-    else:
-        index = 0
-        while index < len(lines):
-            while index < len(lines) and not lines[index].strip():
-                index += 1
-            start = index
-            while index < len(lines) and lines[index].strip():
-                index += 1
-            end = index
-            text = "\n".join(lines[start:end]).strip()
-            if text and not all(
-                line.strip().startswith("![") for line in lines[start:end]
-            ):
-                sections.append((start, end, text))
-        if not sections:
-            sections.append((0, len(lines), "\n".join(lines)))
-
+    slots = _paper_text_slots(lines)
     image_order = _paper_body_image_order(images)
     ordered_entries = [
         (
@@ -1163,65 +1228,53 @@ def _insert_paper_figures(
         )
         for source_index in image_order
     ]
-    numbered_total = sum(
-        _numbered_paper_figure(image) is not None for image, _ in ordered_entries
-    )
-    numbered_position = 0
-    last_numbered_section = -1
     insertions: dict[int, list[str]] = {}
-    used_sections: set[int] = set()
+    retained_images: list[dict[str, Any]] = []
+    retained_generated_captions: list[str] = []
     effective_captions: list[str] = []
+    last_insertion_index = -1
+    used_slots: set[int] = set()
     for index, (image, generated) in enumerate(ordered_entries, start=1):
         figure_number, caption = _paper_figure_caption(image, generated, index)
-        effective_captions.append(caption)
-        if _numbered_paper_figure(image) is not None:
-            minimum_section = (
-                min(last_numbered_section + 1, len(sections) - 1)
-                if last_numbered_section >= 0
-                else 0
-            )
-            eligible_sections = range(minimum_section, len(sections))
+        numbered = _numbered_paper_figure(image) is not None
+        eligible = [
+            (slot_index, slot)
+            for slot_index, slot in enumerate(slots)
+            if slot_index not in used_slots and slot[0] > last_insertion_index
+        ]
+        if numbered:
             relevance = {
-                section_index: _text_relevance_score(
-                    image,
-                    sections[section_index][2],
-                )
-                for section_index in eligible_sections
+                slot_index: _paper_figure_match_score(image, slot[2])
+                for slot_index, slot in eligible
             }
-            if relevance and max(relevance.values()) > 0:
-                section_index = max(
-                    relevance,
-                    key=lambda candidate: (
-                        relevance[candidate],
-                        candidate not in used_sections,
-                        -candidate,
-                    ),
-                )
-            else:
-                fallback = (
-                    round(numbered_position * (len(sections) - 1) / (numbered_total - 1))
-                    if numbered_total > 1
-                    else 0
-                )
-                section_index = max(minimum_section, min(fallback, len(sections) - 1))
-            last_numbered_section = section_index
-            numbered_position += 1
-        else:
-            ranked_sections = sorted(
-                range(len(sections)),
-                key=lambda section_index: (
-                    section_index not in used_sections,
-                    _text_relevance_score(image, sections[section_index][2]),
-                    -section_index,
-                ),
-                reverse=True,
+            if not relevance or max(relevance.values()) <= 0:
+                # Do not invent a placement for a figure whose caption is not
+                # supported by any later paragraph.
+                continue
+            slot_index = max(
+                relevance,
+                key=lambda candidate: (relevance[candidate], -candidate),
             )
-            section_index = ranked_sections[0]
-        used_sections.add(section_index)
-        _, section_end, _ = sections[section_index]
-        insertion_index = section_end
-        while insertion_index > 0 and not lines[insertion_index - 1].strip():
-            insertion_index -= 1
+        else:
+            if not eligible:
+                eligible = [
+                    (slot_index, slot)
+                    for slot_index, slot in enumerate(slots)
+                    if slot_index not in used_slots
+                ]
+            slot_index = max(
+                eligible,
+                key=lambda candidate: (
+                    _text_relevance_score(image, candidate[1][2]),
+                    -candidate[0],
+                ),
+            )[0]
+        insertion_index = slots[slot_index][0]
+        used_slots.add(slot_index)
+        last_insertion_index = insertion_index
+        retained_images.append(image)
+        retained_generated_captions.append(generated)
+        effective_captions.append(caption)
         local_name = Path(str(image["local_path"])).name
         block = [
             f"![Fig. {figure_number}](images/{local_name})",
@@ -1232,6 +1285,9 @@ def _insert_paper_figures(
             block.append(f"*{attribution}*")
         insertions.setdefault(insertion_index, []).append("\n".join(block))
 
+    if dossier.get("content_type") == PAPER_CONTENT:
+        dossier["body_images"] = retained_images
+        dossier["generated_body_image_captions"] = retained_generated_captions
     output: list[str] = []
     for index in range(len(lines) + 1):
         for block in insertions.get(index, []):
