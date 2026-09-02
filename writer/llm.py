@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,29 @@ def _json_from_text(text: str) -> Any:
         if not match:
             raise
         return json.loads(match.group(0))
+
+
+def _is_transient_server_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if status_code in {502, 503}:
+        return True
+    message = str(exc).lower()
+    return bool(re.search(r"\b(?:502|503)\b", message))
+
+
+def _paper_completion_with_retry(client: OpenAI, **kwargs: Any) -> Any:
+    for attempt in range(2):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if attempt == 0 and _is_transient_server_error(exc):
+                time.sleep(3)
+                continue
+            raise
+    raise RuntimeError("unreachable paper completion retry state")
 
 
 def select_top_ten(
@@ -136,10 +160,11 @@ def select_paper_top_ten(
         api_key=settings.model_api_key,
         base_url=settings.model_base_url,
         timeout=90.0,
-        max_retries=2,
+        max_retries=0,
     )
     try:
-        response = client.chat.completions.create(
+        response = _paper_completion_with_retry(
+            client,
             model=settings.model_name,
             temperature=0.1,
             messages=[
@@ -157,8 +182,8 @@ def select_paper_top_ten(
                         "排除没有气候机制的水文/大地测量、生态植被、生物地球化学或"
                         "海洋化学、泛环境变化、通用模型/软件benchmark，以及Reply、Correction、Editorial、"
                         "Comment、Correspondence。只返回2或3分论文，3分优先；最多10篇，允许少于10篇，禁止凑数。"
-                        "title_cn必须忠实翻译英文标题，不得添加原题没有的信息。返回严格JSON："
-                        '{"items":[{"index":1,"score":3,"title_cn":"...","reason":"..."}]}。'
+                        "只返回筛选结果，不负责中文标题翻译。返回严格JSON："
+                        '{"items":[{"index":1,"score":3,"reason":"..."}]}。'
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -177,7 +202,6 @@ def select_paper_top_ten(
                 or index > len(payload)
                 or index in seen
                 or score not in {2, 3}
-                or not title_cn
             ):
                 continue
             scored.append((score, index, title_cn))
@@ -186,13 +210,71 @@ def select_paper_top_ten(
             selected.append(
                 dict(
                     candidates[index - 1],
-                    title_cn=title_cn,
+                    title_cn=title_cn or str(candidates[index - 1].get("title_cn") or ""),
                     paper_relevance_score=score,
                 )
             )
         return selected, True, ""
     except Exception as exc:
         return fallback, False, f"{type(exc).__name__}: {exc}"
+
+
+def translate_paper_titles(
+    candidates: list[dict[str, Any]],
+    settings: Settings,
+) -> tuple[list[str], bool, str]:
+    """Translate missing PAPER titles without changing candidate selection."""
+    titles = [str(item.get("title_cn") or "").strip() for item in candidates]
+    missing = [
+        (index, str(item.get("title") or "").strip())
+        for index, item in enumerate(candidates)
+        if not titles[index] and str(item.get("title") or "").strip()
+    ]
+    if not missing:
+        return titles, True, ""
+    if not settings.model_configured:
+        return titles, False, "model not configured"
+
+    payload = [
+        {"index": index + 1, "title": title}
+        for index, title in missing
+    ]
+    client = OpenAI(
+        api_key=settings.model_api_key,
+        base_url=settings.model_base_url,
+        timeout=90.0,
+        max_retries=0,
+    )
+    try:
+        response = _paper_completion_with_retry(
+            client,
+            model=settings.model_name,
+            temperature=0.1,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是中文科技论文标题翻译编辑。只根据给出的英文原标题做忠实、简洁的中文翻译，"
+                        "不得扩写、解释、补充原标题没有的信息，也不要改变论文顺序。返回严格JSON："
+                        '{"items":[{"index":1,"title_cn":"..."}]}。'
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+        )
+        parsed = _json_from_text(response.choices[0].message.content or "")
+        translated: dict[int, str] = {}
+        valid_indexes = {index + 1 for index, _ in missing}
+        for choice in parsed.get("items", []):
+            index = int(choice.get("index", 0))
+            title_cn = str(choice.get("title_cn") or "").strip()
+            if index in valid_indexes and title_cn:
+                translated[index] = title_cn
+        for index, _ in missing:
+            titles[index] = translated.get(index + 1, "")
+        return titles, True, ""
+    except Exception as exc:
+        return titles, False, f"{type(exc).__name__}: {exc}"
 
 
 def _title_related_image_context(title: str, summary: str) -> str:

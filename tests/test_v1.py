@@ -57,6 +57,7 @@ from writer.llm import (
     generate_image_search_keywords,
     select_paper_top_ten,
     select_top_ten,
+    translate_paper_titles,
 )
 
 
@@ -2657,6 +2658,425 @@ class V1Tests(unittest.TestCase):
             [item["title_cn"] for item in selected],
             ["核心论文", "相关论文"],
         )
+
+    def test_paper_refresh_failure_keeps_same_day_last_known_good(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "last-good.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="test-openalex-key",
+                )
+                pipeline = NewsPipeline(settings)
+                old_id = pipeline.db.upsert_article(
+                    {
+                        "source": "Journal of Climate",
+                        "url": "https://example.test/old",
+                        "canonical_url": "https://example.test/old",
+                        "title": "Previously selected paper",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-08-25T00:00:00+00:00",
+                        "doi": "10.1000/old",
+                        "journal": "Journal of Climate",
+                        "word_count": 800,
+                        "status": "published_paper",
+                        "discovered_at": "2026-08-25T00:00:00+00:00",
+                    }
+                )
+                pipeline.db.replace_candidates(
+                    "2026-08-26",
+                    [{"article_id": old_id, "score": 20, "title_cn": "昨日成功结果"}],
+                    PAPER_CONTENT,
+                )
+                new_item = {
+                    "source": "Journal of Climate",
+                    "url": "https://example.test/new",
+                    "canonical_url": "https://example.test/new",
+                    "title": "New candidate B",
+                    "summary": "Near-surface wind climate mechanism",
+                    "published_at": "2026-08-26T00:00:00+00:00",
+                    "doi": "10.1000/new",
+                    "journal": "Journal of Climate",
+                    "word_count": 800,
+                    "status": "discovered",
+                    "discovered_at": "2026-08-26T00:00:00+00:00",
+                }
+                pipeline._extract_shortlist = lambda items: asyncio.sleep(
+                    0, result=copy.deepcopy(items)
+                )
+                pipeline._published_papers = lambda items, _date: asyncio.sleep(
+                    0,
+                    result=[dict(item, paper_local_score=2) for item in items],
+                )
+                with (
+                    patch.object(
+                        pipeline.openalex,
+                        "discover_recent_papers",
+                        return_value=[],
+                    ),
+                    patch(
+                        "news.pipeline.fetch_all_feeds",
+                        return_value=([new_item], [], {"test": 1}),
+                    ),
+                    patch(
+                        "news.pipeline.select_paper_top_ten",
+                        return_value=(
+                            [dict(new_item, article_id=999, score=10)],
+                            False,
+                            "502 server_is_overloaded",
+                        ),
+                    ),
+                ):
+                    candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual([item["title"] for item in candidates], ["Previously selected paper"])
+                self.assertEqual(
+                    [item["title"] for item in pipeline.db.get_candidates("2026-08-26", PAPER_CONTENT)],
+                    ["Previously selected paper"],
+                )
+                self.assertIn("继续使用今日最近一次成功结果", pipeline.format_news(candidates))
+
+        asyncio.run(check())
+
+    def test_paper_refresh_failure_uses_fallback_when_no_same_day_candidates(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "fallback.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="test-openalex-key",
+                )
+                pipeline = NewsPipeline(settings)
+                item = {
+                    "source": "Journal of Climate",
+                    "url": "https://example.test/fallback",
+                    "canonical_url": "https://example.test/fallback",
+                    "title": "Local fallback paper",
+                    "summary": "Near-surface wind climate mechanism",
+                    "published_at": "2026-08-26T00:00:00+00:00",
+                    "doi": "10.1000/fallback",
+                    "journal": "Journal of Climate",
+                    "word_count": 800,
+                    "status": "discovered",
+                    "discovered_at": "2026-08-26T00:00:00+00:00",
+                }
+                pipeline._extract_shortlist = lambda items: asyncio.sleep(
+                    0, result=copy.deepcopy(items)
+                )
+                pipeline._published_papers = lambda items, _date: asyncio.sleep(
+                    0,
+                    result=[dict(value, paper_local_score=2) for value in items],
+                )
+                with (
+                    patch.object(
+                        pipeline.openalex,
+                        "discover_recent_papers",
+                        return_value=[],
+                    ),
+                    patch(
+                        "news.pipeline.fetch_all_feeds",
+                        return_value=([item], [], {"test": 1}),
+                    ),
+                    patch(
+                        "news.pipeline.select_paper_top_ten",
+                        return_value=(
+                            [dict(item, article_id=1, score=10, title_cn="")],
+                            False,
+                            "429 usage_limit_reached",
+                        ),
+                    ),
+                ):
+                    candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual([value["title"] for value in candidates], ["Local fallback paper"])
+                self.assertIn("当前显示本地筛选结果", pipeline.format_news(candidates))
+                self.assertEqual(
+                    len(pipeline.db.get_candidates("2026-08-26", PAPER_CONTENT)),
+                    1,
+                )
+
+        asyncio.run(check())
+
+    def test_paper_selection_saves_before_independent_title_translation_failure(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "translation-failure.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="test-openalex-key",
+                )
+                pipeline = NewsPipeline(settings)
+                items = [
+                    {
+                        "source": "Journal of Climate",
+                        "url": f"https://example.test/selected-{index}",
+                        "canonical_url": f"https://example.test/selected-{index}",
+                        "title": (
+                            "Near-surface wind circulation variability"
+                            if index == 1
+                            else "Stratospheric ozone climate coupling"
+                        ),
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-08-26T00:00:00+00:00",
+                        "doi": f"10.1000/selected-{index}",
+                        "journal": "Journal of Climate",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": "2026-08-26T00:00:00+00:00",
+                    }
+                    for index in (1, 2)
+                ]
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(
+                    0, result=copy.deepcopy(values)
+                )
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0,
+                    result=[dict(value, paper_local_score=2) for value in values],
+                )
+                def fake_selection(values, _settings):
+                    return [dict(values[1]), dict(values[0])], True, ""
+
+                with (
+                    patch.object(
+                        pipeline.openalex,
+                        "discover_recent_papers",
+                        return_value=[],
+                    ),
+                    patch(
+                        "news.pipeline.fetch_all_feeds",
+                        return_value=(items, [], {"test": 2}),
+                    ),
+                    patch(
+                        "news.pipeline.select_paper_top_ten",
+                        side_effect=fake_selection,
+                    ),
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        return_value=(['', ''], False, "502 server_is_overloaded"),
+                    ) as translate,
+                ):
+                    candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual(translate.call_count, 1)
+                self.assertEqual(
+                    [value["title"] for value in candidates],
+                    [
+                        "Stratospheric ozone climate coupling",
+                        "Near-surface wind circulation variability",
+                    ],
+                )
+                self.assertEqual([value["title_cn"] for value in candidates], ["", ""])
+
+        asyncio.run(check())
+
+    def test_paper_title_translation_only_fills_missing_without_selection(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "translation-success.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                )
+                pipeline = NewsPipeline(settings)
+                article_ids = [
+                    pipeline.db.upsert_article(
+                        {
+                            "source": "Journal of Climate",
+                            "url": f"https://example.test/title-{index}",
+                            "canonical_url": f"https://example.test/title-{index}",
+                            "title": f"English title {index}",
+                            "summary": "Near-surface wind climate mechanism",
+                            "published_at": "2026-08-26T00:00:00+00:00",
+                            "doi": f"10.1000/title-{index}",
+                            "journal": "Journal of Climate",
+                            "word_count": 800,
+                            "status": "published_paper",
+                            "discovered_at": "2026-08-26T00:00:00+00:00",
+                        }
+                    )
+                    for index in (1, 2, 3)
+                ]
+                pipeline.db.replace_candidates(
+                    "2026-08-26",
+                    [
+                        {"article_id": article_ids[0], "score": 30, "title_cn": "已有标题"},
+                        {"article_id": article_ids[1], "score": 20, "title_cn": ""},
+                        {"article_id": article_ids[2], "score": 10, "title_cn": ""},
+                    ],
+                    PAPER_CONTENT,
+                )
+                pipeline.db.set_daily_run(
+                    "2026-08-26",
+                    content_type=PAPER_CONTENT,
+                    status="success",
+                )
+                with (
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        return_value=(
+                            ["已有标题", "补充标题2", "补充标题3"],
+                            True,
+                            "",
+                        ),
+                    ) as translate,
+                    patch("news.pipeline.select_paper_top_ten") as select,
+                ):
+                    candidates = await pipeline.get_or_refresh("2026-08-26", PAPER_CONTENT)
+
+                self.assertEqual(translate.call_count, 1)
+                self.assertEqual(select.call_count, 0)
+                self.assertEqual(
+                    [(value["rank"], value["title_cn"]) for value in candidates],
+                    [(1, "已有标题"), (2, "补充标题2"), (3, "补充标题3")],
+                )
+
+        asyncio.run(check())
+
+    def test_paper_model_retries_502_once_but_not_429(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        candidates = [
+            {
+                "title": "Climate paper",
+                "summary": "Near-surface wind climate mechanism",
+                "paper_local_score": 2,
+            }
+        ]
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"items": [{"index": 1, "score": 2}]})
+                    )
+                )
+            ]
+        )
+
+        class HttpError(Exception):
+            def __init__(self, status_code, message):
+                super().__init__(message)
+                self.status_code = status_code
+
+        retry_client = MagicMock()
+        retry_client.chat.completions.create.side_effect = [
+            HttpError(502, "server_is_overloaded"),
+            response,
+        ]
+        with (
+            patch("writer.llm.OpenAI", return_value=retry_client),
+            patch("writer.llm.time.sleep") as sleep,
+        ):
+            selected, used_model, error = select_paper_top_ten(candidates, settings)
+        self.assertTrue(used_model)
+        self.assertEqual(error, "")
+        self.assertEqual(retry_client.chat.completions.create.call_count, 2)
+        sleep.assert_called_once_with(3)
+        self.assertEqual(len(selected), 1)
+
+        rate_client = MagicMock()
+        rate_client.chat.completions.create.side_effect = HttpError(
+            429,
+            "usage_limit_reached",
+        )
+        with (
+            patch("writer.llm.OpenAI", return_value=rate_client),
+            patch("writer.llm.time.sleep") as sleep,
+        ):
+            selected, used_model, error = select_paper_top_ten(candidates, settings)
+        self.assertFalse(used_model)
+        self.assertIn("usage_limit_reached", error)
+        self.assertEqual(rate_client.chat.completions.create.call_count, 1)
+        sleep.assert_not_called()
+
+        title_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"items": [{"index": 1, "title_cn": "中文标题"}]},
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        title_client = MagicMock()
+        title_client.chat.completions.create.side_effect = [
+            HttpError(503, "temporarily unavailable"),
+            title_response,
+        ]
+        with (
+            patch("writer.llm.OpenAI", return_value=title_client),
+            patch("writer.llm.time.sleep") as sleep,
+        ):
+            titles, used_model, error = translate_paper_titles(
+                [{"title": "English title", "title_cn": ""}],
+                settings,
+            )
+        self.assertTrue(used_model)
+        self.assertEqual(error, "")
+        self.assertEqual(titles, ["中文标题"])
+        self.assertEqual(title_client.chat.completions.create.call_count, 2)
+        sleep.assert_called_once_with(3)
+
+    def test_paper_title_translation_sends_only_missing_titles_in_order(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        candidates = [
+            {"title": "Already translated", "title_cn": "已有标题"},
+            {"title": "Second English title", "title_cn": ""},
+            {"title": "Third English title", "title_cn": ""},
+        ]
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "items": [
+                                    {"index": 2, "title_cn": "第二个标题"},
+                                    {"index": 3, "title_cn": "第三个标题"},
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+        with patch("writer.llm.OpenAI", return_value=client):
+            titles, used_model, error = translate_paper_titles(candidates, settings)
+        self.assertTrue(used_model)
+        self.assertEqual(error, "")
+        self.assertEqual(titles, ["已有标题", "第二个标题", "第三个标题"])
+        payload = json.loads(
+            client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        )
+        self.assertEqual(payload, [
+            {"index": 2, "title": "Second English title"},
+            {"index": 3, "title": "Third English title"},
+        ])
 
     def test_news_restores_chinese_title_and_keeps_english_title(self):
         async def check():
