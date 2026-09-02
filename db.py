@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS daily_candidates (
     PRIMARY KEY (date, content_type, rank)
 );
 
+CREATE TABLE IF NOT EXISTS daily_seen_candidates (
+    date TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    article_id INTEGER NOT NULL REFERENCES articles(id),
+    PRIMARY KEY (date, content_type, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_seen_candidates_date
+    ON daily_seen_candidates(date, content_type);
+
 CREATE TABLE IF NOT EXISTS images (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     article_id INTEGER NOT NULL REFERENCES articles(id),
@@ -239,6 +248,31 @@ class Database:
                         float(candidate.get("score") or 0),
                     ),
                 )
+
+    def add_seen_candidates(
+        self,
+        date: str,
+        content_type: str,
+        article_ids: Iterable[int],
+    ) -> None:
+        unique_ids = {int(article_id) for article_id in article_ids}
+        if not unique_ids:
+            return
+        with self.connect() as connection:
+            connection.executemany(
+                """INSERT OR IGNORE INTO daily_seen_candidates
+                (date, content_type, article_id) VALUES (?,?,?)""",
+                [(date, content_type, article_id) for article_id in unique_ids],
+            )
+
+    def get_seen_candidate_ids(self, date: str, content_type: str) -> set[int]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT article_id FROM daily_seen_candidates
+                WHERE date=? AND content_type=?""",
+                (date, content_type),
+            ).fetchall()
+        return {int(row["article_id"]) for row in rows}
 
     def get_candidates(
         self,

@@ -1526,6 +1526,8 @@ class NewsPipeline:
         self,
         date: str | None = None,
         content_type: str | None = None,
+        *,
+        exclude_seen: bool = False,
     ) -> list[dict[str, Any]]:
         run_date = date or local_date(self.settings)
         run_type = content_type or content_type_for_date(run_date)
@@ -1537,6 +1539,11 @@ class NewsPipeline:
                 self.db.get_candidates(run_date, PAPER_CONTENT)
                 if run_type == PAPER_CONTENT
                 else []
+            )
+            seen_paper_ids = (
+                self.db.get_seen_candidate_ids(run_date, PAPER_CONTENT)
+                if run_type == PAPER_CONTENT and exclude_seen
+                else set()
             )
             self.db.set_daily_run(
                 run_date,
@@ -1647,6 +1654,8 @@ class NewsPipeline:
                         continue
                     article_id = self.db.upsert_article(item)
                     item["article_id"] = article_id
+                    if article_id in seen_paper_ids:
+                        continue
                     if _is_published_article(item, published):
                         continue
                     if item.get("images") is not None:
@@ -1728,6 +1737,12 @@ class NewsPipeline:
                         "⚠ AI 筛选暂时不可用，当前显示本地筛选结果"
                     )
                 self.db.replace_candidates(run_date, selected, run_type)
+                if run_type == PAPER_CONTENT and selected:
+                    self.db.add_seen_candidates(
+                        run_date,
+                        PAPER_CONTENT,
+                        [int(item["article_id"]) for item in selected],
+                    )
                 status = "success" if selected else "empty"
                 if feed_errors and selected:
                     status = "partial"
@@ -1771,62 +1786,86 @@ class NewsPipeline:
         self.last_paper_refresh_warning = ""
         existing = self.db.get_candidates(run_date, run_type)
         run = self.db.get_daily_run(run_date, run_type)
-        if existing and run and run.get("content_type") == run_type:
-            published = self.db.published_article_identifiers()
-            if not any(_is_published_article(item, published) for item in existing):
-                if self.settings.model_configured and any(
-                    not str(item.get("title_cn") or "").strip() for item in existing
-                ):
-                    if run_type == PAPER_CONTENT:
-                        titled, used_model, title_error = await asyncio.to_thread(
-                            translate_paper_titles,
-                            existing,
-                            self.settings,
-                        )
-                        if used_model:
-                            titled_candidates = [
-                                dict(
-                                    item,
-                                    article_id=int(item["id"]),
-                                    title_cn=titled[index] or str(item.get("title_cn") or ""),
-                                )
-                                for index, item in enumerate(existing)
-                            ]
-                            self.db.replace_candidates(
-                                run_date,
-                                titled_candidates,
-                                run_type,
-                            )
-                            return self.db.get_candidates(run_date, run_type)
-                        self.logger.warning(
-                            "PAPER title translation unavailable date=%s error=%s",
-                            run_date,
-                            title_error,
-                        )
-                    else:
-                        title_candidates = [
+        if existing and (
+            run_type == PAPER_CONTENT
+            or (run and run.get("content_type") == run_type)
+        ):
+            if self.settings.model_configured and any(
+                not str(item.get("title_cn") or "").strip() for item in existing
+            ):
+                if run_type == PAPER_CONTENT:
+                    titled, used_model, title_error = await asyncio.to_thread(
+                        translate_paper_titles,
+                        existing,
+                        self.settings,
+                    )
+                    if used_model:
+                        titled_candidates = [
                             dict(
                                 item,
                                 article_id=int(item["id"]),
-                                paper_local_score=item.get("paper_local_score", 0),
+                                title_cn=titled[index] or str(item.get("title_cn") or ""),
                             )
-                            for item in existing
+                            for index, item in enumerate(existing)
                         ]
-                        titled, used_model, title_error = await asyncio.to_thread(
-                            select_top_ten,
-                            title_candidates,
-                            self.settings,
-                        )
-                        if used_model:
-                            self.db.replace_candidates(run_date, titled, run_type)
-                            return self.db.get_candidates(run_date, run_type)
-                        self.logger.warning(
-                            "Chinese title batch fallback date=%s error=%s",
+                        self.db.replace_candidates(
                             run_date,
-                            title_error,
+                            titled_candidates,
+                            run_type,
                         )
-                return existing
+                        return self.db.get_candidates(run_date, run_type)
+                    self.logger.warning(
+                        "PAPER title translation unavailable date=%s error=%s",
+                        run_date,
+                        title_error,
+                    )
+                else:
+                    title_candidates = [
+                        dict(
+                            item,
+                            article_id=int(item["id"]),
+                            paper_local_score=item.get("paper_local_score", 0),
+                        )
+                        for item in existing
+                    ]
+                    titled, used_model, title_error = await asyncio.to_thread(
+                        select_top_ten,
+                        title_candidates,
+                        self.settings,
+                    )
+                    if used_model:
+                        self.db.replace_candidates(run_date, titled, run_type)
+                        return self.db.get_candidates(run_date, run_type)
+                    self.logger.warning(
+                        "Chinese title batch fallback date=%s error=%s",
+                        run_date,
+                        title_error,
+                    )
+            return existing
         return await self.refresh(run_date, run_type)
+
+    async def next_paper_batch(
+        self,
+        date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        run_date = date or local_date(self.settings)
+        current = self.db.get_candidates(run_date, PAPER_CONTENT)
+        if not current:
+            return await self.refresh(run_date, PAPER_CONTENT)
+        current_ids = {int(item["id"]) for item in current}
+        self.db.add_seen_candidates(
+            run_date,
+            PAPER_CONTENT,
+            current_ids,
+        )
+        result = await self.refresh(
+            run_date,
+            PAPER_CONTENT,
+            exclude_seen=True,
+        )
+        if {int(item["id"]) for item in result} == current_ids:
+            self.last_paper_refresh_warning = "⚠ 换一批失败，继续保留当前论文列表"
+        return result
 
     def format_news(self, candidates: list[dict[str, Any]]) -> str:
         if not candidates:

@@ -14,7 +14,7 @@ from settings import Settings
 NEWS_COMMAND = re.compile(r"^/news\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
 PAPER_COMMAND = re.compile(r"^/paper\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
 NEWS_USAGE = "用法：\n/news\n/news N\n/news N generate\n/news N publish"
-PAPER_USAGE = "用法：\n/papers\n/paper N\n/paper N generate\n/paper N publish"
+PAPER_USAGE = "用法：\n/papers\n/papers next\n/paper N\n/paper N generate\n/paper N publish"
 
 
 def _paper_image_summary(markdown_path: Path, images: list[dict]) -> str:
@@ -55,6 +55,9 @@ class CommandHandler:
             candidates = await self.pipeline.get_or_refresh(
                 content_type=POPULAR_CONTENT,
             )
+            return self.pipeline.format_news(candidates)
+        if lowered == "/papers next":
+            candidates = await self.pipeline.next_paper_batch()
             return self.pipeline.format_news(candidates)
         if lowered == "/papers":
             candidates = await self.pipeline.get_or_refresh(
