@@ -1946,8 +1946,17 @@ class V1Tests(unittest.TestCase):
                 )
             ]
         )
+        abstract_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"abstract_cn": "忠实的中文摘要翻译"}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.side_effect = [response, abstract_response, response]
         with tempfile.TemporaryDirectory() as tmp, patch(
             "writer.llm.OpenAI",
             return_value=client,
@@ -1964,16 +1973,19 @@ class V1Tests(unittest.TestCase):
                         "forecast errors decline during the validation period and improve "
                         "seasonal predictability."
                     ),
-                    "summary": "Paper abstract",
+                    "summary": "Metadata summary that must not replace abstract",
                     "openalex": {"abstract": "Paper abstract"},
                     "images": [],
                 },
                 settings,
                 root / "paper",
             )
-            paper_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
-                "content"
-            ]
+            paper_call = client.chat.completions.create.call_args_list[0]
+            paper_prompt = paper_call.kwargs["messages"][0]["content"]
+            paper_input = json.loads(paper_call.kwargs["messages"][1]["content"])
+            abstract_call = client.chat.completions.create.call_args_list[1]
+            abstract_prompt = abstract_call.kwargs["messages"][0]["content"]
+            abstract_input = json.loads(abstract_call.kwargs["messages"][1]["content"])
             paper_markdown = paper_path.read_text(encoding="utf-8")
             client.chat.completions.create.reset_mock()
             generate_article_markdown(
@@ -1991,6 +2003,9 @@ class V1Tests(unittest.TestCase):
             news_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
                 "content"
             ]
+            news_input = json.loads(
+                client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+            )
 
         self.assertIn("正文主体优先约650到800个中文字符", paper_prompt)
         self.assertIn("标题、英文摘录、图片图注和文章信息不计入正文主体", paper_prompt)
@@ -2027,11 +2042,22 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("> 原文：", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
         self.assertIn("独立的中文导语开场", paper_prompt)
-        self.assertIn("识别论文的核心结果结构", paper_prompt)
-        self.assertIn("two modes、two mechanisms、two regimes", paper_prompt)
-        self.assertIn("必须分别覆盖每一个核心模态或机制", paper_prompt)
+        self.assertIn("原始abstract的核心结果结构", paper_prompt)
+        self.assertIn("two modes、first mode/second mode、two regimes、two mechanisms", paper_prompt)
+        self.assertIn("只有当abstract明确写出", paper_prompt)
+        self.assertIn("绝对不要自行创造第一模态、第二模态、第一类、第二类", paper_prompt)
+        self.assertIn("Results或paper_text只用于补充", paper_prompt)
+        self.assertNotIn("必须分别覆盖每一个核心模态或机制", paper_prompt)
         self.assertIn("空间或对象特征、主要驱动因子和关键物理机制", paper_prompt)
         self.assertIn("完整覆盖核心结果优先于机械保持固定section数量", paper_prompt)
+        self.assertEqual(paper_input["abstract"], "Paper abstract")
+        self.assertEqual(paper_input["news_summary"], "")
+        self.assertIn("只根据用户提供的原始Abstract", abstract_prompt)
+        self.assertEqual(abstract_input, {"abstract": "Paper abstract"})
+        self.assertNotIn("paper_text", abstract_input)
+        self.assertNotIn("abstract", news_input)
+        self.assertEqual(news_input["news_summary"], "News summary")
+        self.assertIn("忠实的中文摘要翻译", paper_markdown)
         self.assertIn(
             "> “The supplied paper states an exact scientific result.”",
             paper_markdown,

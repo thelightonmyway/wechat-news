@@ -278,6 +278,61 @@ def translate_paper_titles(
         return titles, False, f"{type(exc).__name__}: {exc}"
 
 
+def translate_paper_abstract(abstract: str, settings: Settings) -> str:
+    """Translate a paper Abstract without adding claims or restructuring its findings."""
+    source = re.sub(r"\s+", " ", str(abstract or "")).strip()
+    if not source:
+        return ""
+    if not settings.model_configured:
+        raise RuntimeError("MODEL_BASE_URL / MODEL_API_KEY / MODEL_NAME not configured")
+    client = OpenAI(
+        api_key=settings.model_api_key,
+        base_url=settings.model_base_url,
+        timeout=120.0,
+        max_retries=0,
+    )
+    response = _paper_completion_with_retry(
+        client,
+        model=settings.model_name,
+        temperature=0.1,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是中文科技论文摘要翻译编辑。只根据用户提供的原始Abstract做忠实、自然的中文翻译。"
+                    "短Abstract基本完整翻译；长Abstract只能删除次要细节，不能增加原文没有的结论、分类、机制或表述，"
+                    "也不能自行重组科学结论。不要添加小标题、列表或解释，只返回严格JSON："
+                    '{"abstract_cn":"..."}'
+                ),
+            },
+            {"role": "user", "content": json.dumps({"abstract": source}, ensure_ascii=False)},
+        ],
+    )
+    parsed = _json_from_text(response.choices[0].message.content or "")
+    translated = re.sub(r"\s+", " ", str(parsed.get("abstract_cn") or "")).strip()
+    if not translated:
+        raise RuntimeError("model returned empty Chinese Abstract translation")
+    return translated
+
+
+def _replace_paper_lead(markdown: str, abstract_lead: str) -> str:
+    lines = markdown.splitlines()
+    section_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^##\s+", line.strip())
+        ),
+        None,
+    )
+    title = lines[0] if lines and lines[0].startswith("# ") else ""
+    if section_index is None:
+        body = "\n".join(lines[1:]).strip() if title else markdown.strip()
+        return f"{title}\n\n{abstract_lead}\n\n{body}".strip()
+    sections = "\n".join(lines[section_index:]).strip()
+    return f"{title}\n\n{abstract_lead}\n\n{sections}".strip()
+
+
 def _title_related_image_context(title: str, summary: str) -> str:
     title_terms = {
         term
@@ -511,14 +566,16 @@ PAPER_STYLE_EXAMPLE = (
 
 
 PAPER_STYLE_GUIDE = (
-    "根据提供的论文metadata、abstract和正文材料，写一篇正文主体优先约650到800个中文字符的中文论文解读。"
+    "根据提供的论文metadata、原始abstract和正文材料，写一篇正文主体优先约650到800个中文字符的中文论文解读。"
     "这是硬性篇幅要求：标题、英文摘录、图片图注和文章信息不计入正文主体；返回前必须把正文主体压缩到650到800个中文字以内。"
     "这是短篇高信息密度解读，不要扩写成长篇综述；通常设置3到4个主要小节，每个小节约110到160个中文字，任何小节不得超过180字。每个小节只写紧凑的核心内容，不要把未来意义、限制和背景重复堆在最后一节。"
+    "摘要和正文导语必须优先忠实翻译输入的原始abstract：短摘要基本完整翻译，长摘要只可删除次要细节，不得增加abstract没有的结论、分类、机制或表述，也不得自行重组科学结论；中文应自然但保持原意。若abstract为空或不可用，才可用paper_text写出有据可查的简短fallback导语。"
+    "先以原始abstract的核心结果结构作为全文最高优先级提纲，正文必须覆盖abstract明确写出的主要发现；Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。"
+    "只有当abstract明确写出two modes、first mode/second mode、two regimes、two mechanisms或同等清楚的两部分结构时，才分别覆盖对应部分并避免遗漏；如果abstract没有明确这种结构，绝对不要自行创造第一模态、第二模态、第一类、第二类或其他类似分类。"
+    "对于abstract明确的每个核心mode、mechanism或regime，使用Results或paper_text补充原文支持的空间或对象特征、主要驱动因子和关键物理机制及数据；材料没有明确支持的内容不要补写。完整覆盖核心结果优先于机械保持固定section数量，section标题和正文组织应跟随论文实际科学主线，不套固定模板。"
     "优先保留研究问题、核心结果、关键机制和研究意义，主动删去冗余背景、重复解释、低价值细节和不影响结论的过程描述。"
     "不要机械截断句子或为了凑字数罗列术语，而要在生成阶段压缩表达、合并重复信息，让每段承担一个明确功能。"
     "重点呈现论文最重要的2到4个发现，不追求覆盖论文全部背景、方法、结果和讨论。"
-    "正式写作前先从abstract和results中识别论文的核心结果结构；如果材料明确出现two modes、two mechanisms、two regimes、first mode、second mode、mode 1、mode 2，或两类机制、两种型态、两个主导模态，必须分别覆盖每一个核心模态或机制，不得遗漏或只重点解释其中一个。"
-    "对于每个核心mode、mechanism或regime，至少交代原文支持的空间或对象特征、主要驱动因子和关键物理机制；材料没有明确支持的内容不要补写。若这些模态或机制构成论文主体结果，优先让它们各自占据一个主要小节；section数量仍以3到4个为主，但完整覆盖核心结果优先于机械保持固定section数量。删去低价值背景、重复解释和次要细节，为每个核心结果保留足够篇幅。"
     "文风应像中文科技媒体编辑或科研作者整理一篇刚发表的研究：直接陈述研究发现、数据和作者判断，"
     "让研究逻辑自然推进；专业准确，但不是论文摘要，也不要扮演老师给读者讲课。"
     "研究结果、关键数据和作者判断可以自然连续推进，不要求每个结果后另加解释句或总结句。"
@@ -604,7 +661,7 @@ def generate_article_markdown(
         "content_type": content_type,
         "display_title": display_title,
         "title": dossier.get("title", ""),
-        "news_summary": dossier.get("summary", ""),
+        "news_summary": dossier.get("summary", "") if content_type == "popular" else "",
         "news_text": str(
             dossier.get("news_text")
             or (dossier.get("text") if content_type == "popular" else "")
@@ -624,6 +681,14 @@ def generate_article_markdown(
             for image in dossier.get("images", [])
         ],
     }
+    paper_abstract = ""
+    if content_type == "paper":
+        paper_abstract = str(
+            dossier.get("abstract")
+            or (dossier.get("openalex") or {}).get("abstract")
+            or ""
+        ).strip()
+        safe_input["abstract"] = paper_abstract[:12000]
     system_prompt = (
         PAPER_STYLE_GUIDE if content_type == "paper" else NEWS_ARTICLE_PROMPT
     )
@@ -655,6 +720,9 @@ def generate_article_markdown(
     markdown = _normalize_article_markdown(markdown, display_title)
     if not markdown:
         raise RuntimeError("model returned empty article")
+    if content_type == "paper" and paper_abstract:
+        abstract_lead = translate_paper_abstract(paper_abstract, settings)
+        markdown = _replace_paper_lead(markdown, abstract_lead)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = output_dir / "article.md"
