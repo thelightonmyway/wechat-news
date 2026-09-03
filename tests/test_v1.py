@@ -60,7 +60,6 @@ from papers.pdf_figures import (
 )
 from publisher.wechat import (
     DEFAULT_COVER,
-    _paper_cover_candidate_path,
     _paper_draft_title,
     _selected_cover_path,
     format_markdown,
@@ -2828,6 +2827,7 @@ class V1Tests(unittest.TestCase):
                 "content_type": PAPER_CONTENT,
                 "title_cn": title_cn,
                 "journal": "Communications Earth & Environment",
+                "paper_first_page": {"local_path": str(first_page)},
                 "wechat_cover": {"local_path": str(wechat_cover)},
                 "cover_image": {"local_path": str(figure_cover)},
             }
@@ -2843,7 +2843,7 @@ class V1Tests(unittest.TestCase):
             markdown_text = markdown.read_text(encoding="utf-8")
             self.assertTrue(markdown_text.startswith("![论文第一页](images/paper-first-page.png)"))
             self.assertNotIn(f"# {title_cn}", markdown_text)
-            self.assertEqual(_selected_cover_path(markdown), wechat_cover)
+            self.assertEqual(_selected_cover_path(markdown), first_page)
             draft_title = _paper_draft_title(metadata, title_cn)
             self.assertEqual(
                 draft_title,
@@ -2856,35 +2856,7 @@ class V1Tests(unittest.TestCase):
                 title_cn,
             )
 
-    def test_paper_cover_falls_back_to_first_body_figure(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            images = root / "images"
-            images.mkdir()
-            figure = images / "figure-02.png"
-            figure.write_bytes(b"png")
-            markdown = root / "article.md"
-            markdown.write_text("正文\n", encoding="utf-8")
-            (root / "metadata.json").write_text(
-                json.dumps(
-                    {
-                        "content_type": PAPER_CONTENT,
-                        "body_images": [
-                            {
-                                "image_role": "figure",
-                                "image_source": "pdf_figure",
-                                "local_path": str(figure),
-                                "figure_number": 2,
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            self.assertEqual(_selected_cover_path(markdown), figure)
-
-    def test_paper_first_page_is_cover_candidate_without_changing_default(self):
+    def test_paper_first_page_is_selected_as_default_cover(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             images = root / "images"
@@ -2906,7 +2878,19 @@ class V1Tests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            self.assertEqual(_paper_cover_candidate_path(markdown), first_page)
+            self.assertEqual(_selected_cover_path(markdown), first_page)
+
+            metadata_path = root / "metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "body_images": [{"local_path": str(figure)}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             self.assertEqual(_selected_cover_path(markdown), DEFAULT_COVER)
 
     def test_paper_formatter_removes_duplicate_h1_after_brand_header(self):

@@ -71,22 +71,15 @@ def ensure_tool_config(settings: Settings) -> None:
     os.chmod(TOOL_CONFIG, 0o600)
 
 
-def _paper_cover_candidate_path(markdown_path: Path) -> Path | None:
-    metadata = _article_metadata(markdown_path)
-    if metadata.get("content_type") != "paper":
-        return None
-    local_path = str((metadata.get("paper_first_page") or {}).get("local_path") or "")
-    if local_path and Path(local_path).is_file():
-        return Path(local_path)
-    return None
-
-
 def _selected_cover_path(markdown_path: Path) -> Path:
     metadata = _article_metadata(markdown_path)
     if metadata.get("content_type") == "paper":
-        local_path = str((metadata.get("wechat_cover") or {}).get("local_path") or "")
-        if local_path and Path(local_path).is_file():
-            return Path(local_path)
+        paper_first_page = metadata.get("paper_first_page") or {}
+        for key in ("local_path", "wechat_cover_path"):
+            local_path = str(paper_first_page.get(key) or "")
+            if local_path and Path(local_path).is_file():
+                return Path(local_path)
+        return DEFAULT_COVER
     local_path = str((metadata.get("cover_image") or {}).get("local_path") or "")
     if local_path and Path(local_path).is_file():
         return Path(local_path)
@@ -200,9 +193,6 @@ def create_draft(
         "--cover",
         str(cover_path),
     ]
-    paper_cover_candidate = _paper_cover_candidate_path(markdown_path)
-    if paper_cover_candidate is not None:
-        command.extend(["--cover-candidate", str(paper_cover_candidate)])
     command.extend([
         "--title",
         draft_title,
