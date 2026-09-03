@@ -2850,6 +2850,34 @@ class V1Tests(unittest.TestCase):
                 title_cn,
             )
 
+    def test_paper_cover_falls_back_to_first_body_figure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = root / "images"
+            images.mkdir()
+            figure = images / "figure-02.png"
+            figure.write_bytes(b"png")
+            markdown = root / "article.md"
+            markdown.write_text("正文\n", encoding="utf-8")
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "body_images": [
+                            {
+                                "image_role": "figure",
+                                "image_source": "pdf_figure",
+                                "local_path": str(figure),
+                                "figure_number": 2,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_selected_cover_path(markdown), figure)
+
     def test_paper_formatter_removes_duplicate_h1_after_brand_header(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

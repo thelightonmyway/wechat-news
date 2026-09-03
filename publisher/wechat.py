@@ -80,6 +80,11 @@ def _selected_cover_path(markdown_path: Path) -> Path:
     local_path = str((metadata.get("cover_image") or {}).get("local_path") or "")
     if local_path and Path(local_path).is_file():
         return Path(local_path)
+    if metadata.get("content_type") == "paper":
+        for image in metadata.get("body_images") or []:
+            local_path = str(image.get("local_path") or "")
+            if local_path and Path(local_path).is_file():
+                return Path(local_path)
     return DEFAULT_COVER
 
 
