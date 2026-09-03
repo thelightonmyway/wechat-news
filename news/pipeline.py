@@ -2329,6 +2329,19 @@ def merge_paper_candidate_pool(
     return deduplicate([*rss_candidates, *openalex_candidates])
 
 
+def _direct_paper_dossier_valid(dossier: dict[str, Any]) -> bool:
+    openalex = dossier.get("openalex") or {}
+    if openalex.get("found") and (openalex.get("title") or openalex.get("journal")):
+        return True
+    has_content = bool(
+        str(dossier.get("title") or "").strip()
+        and (str(dossier.get("text") or "").strip() or str(dossier.get("summary") or "").strip())
+    )
+    return bool(dossier.get("doi") and has_content) or bool(
+        dossier.get("paper_url_hint") and has_content
+    )
+
+
 class NewsPipeline:
     def __init__(self, settings: Settings, logger: logging.Logger | None = None) -> None:
         self.settings = settings
@@ -2925,10 +2938,12 @@ class NewsPipeline:
         rank: int,
         date: str | None = None,
         content_type: str | None = None,
+        *,
+        item_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         run_date = date or local_date(self.settings)
         run_type = content_type or content_type_for_date(run_date)
-        item = self.db.get_candidate(run_date, rank, run_type)
+        item = item_override or self.db.get_candidate(run_date, rank, run_type)
         if not item:
             command = "/papers" if run_type == PAPER_CONTENT else "/news"
             raise LookupError(f"今日没有序号 {rank}；请先执行 {command}")
@@ -3106,9 +3121,22 @@ class NewsPipeline:
         rank: int,
         date: str | None = None,
         content_type: str | None = None,
+        *,
+        item_override: dict[str, Any] | None = None,
+        output_dir: Path | None = None,
+        dossier_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        dossier = await self.paper_details(rank, date, content_type)
-        output_dir = article_output_dir(
+        dossier = dossier_override or await self.paper_details(
+            rank,
+            date,
+            content_type,
+            item_override=item_override,
+        )
+        if item_override is not None and not _direct_paper_dossier_valid(dossier):
+            raise LookupError(
+                "未获取到 DOI、论文标题或正文 metadata，无法确认这是论文链接"
+            )
+        output_dir = output_dir or article_output_dir(
             dossier["date"],
             rank,
             str(dossier.get("content_type") or ""),

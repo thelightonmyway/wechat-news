@@ -5,16 +5,50 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from news.feeds import canonicalize_url, extract_doi
 from news.pipeline import PAPER_CONTENT, POPULAR_CONTENT, NewsPipeline, local_date
 from publisher.wechat import create_draft
-from settings import Settings
+from settings import PROJECT_ROOT, Settings
 
 NEWS_COMMAND = re.compile(r"^/news\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
 PAPER_COMMAND = re.compile(r"^/paper\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
+URL_MESSAGE = re.compile(r"^https?://[^\s<>]+$", re.IGNORECASE)
+ACADEMIC_PATH = re.compile(
+    r"/(?:doi|article|articles|paper|papers|publication|publications|abstract|abs|full-text)(?:/|$)",
+    re.IGNORECASE,
+)
 NEWS_USAGE = "用法：\n/news\n/news N\n/news N generate\n/news N publish"
 PAPER_USAGE = "用法：\n/papers\n/papers next\n/paper N\n/paper N generate\n/paper N publish"
+
+
+def _direct_paper_item(url: str) -> dict[str, object] | None:
+    if not URL_MESSAGE.fullmatch(url):
+        return None
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    doi = extract_doi(url)
+    paper_url_hint = bool(doi or ACADEMIC_PATH.search(parsed.path))
+    if not paper_url_hint:
+        return None
+    canonical = canonicalize_url(url)
+    return {
+        "source": "Direct paper URL",
+        "url": url,
+        "canonical_url": canonical or url,
+        "title": "",
+        "summary": "",
+        "published_at": "",
+        "doi": doi,
+        "journal": "",
+        "content_type": PAPER_CONTENT,
+        "paper_url_hint": True,
+        "status": "direct_paper_url",
+    }
 
 
 def _paper_image_summary(markdown_path: Path, images: list[dict]) -> str:
@@ -70,6 +104,8 @@ class CommandHandler:
             return self.status_text()
         if lowered == "/history":
             return self.history_text()
+        if URL_MESSAGE.fullmatch(command):
+            return await self._handle_paper_url(command)
 
         news_match = NEWS_COMMAND.fullmatch(command)
         if news_match:
@@ -90,6 +126,52 @@ class CommandHandler:
         if lowered.startswith("/paper"):
             return PAPER_USAGE
         return None
+
+    async def _handle_paper_url(self, url: str) -> str | None:
+        item = _direct_paper_item(url)
+        if item is None:
+            return None
+        doi = str(item.get("doi") or "") or "未发现"
+        run_date = local_date(self.settings)
+        try:
+            generated = await self.pipeline.generate(
+                0,
+                run_date,
+                PAPER_CONTENT,
+                item_override=item,
+                output_dir=(
+                    PROJECT_ROOT
+                    / "articles"
+                    / PAPER_CONTENT
+                    / f"{run_date}-direct-{uuid.uuid4().hex[:10]}"
+                ),
+            )
+        except LookupError as exc:
+            return f"无法识别为论文或获取 metadata 失败：{exc}"
+        except Exception as exc:
+            return f"PAPER 生成失败：{type(exc).__name__}: {exc}"
+
+        dossier = generated.get("dossier") or {}
+        title = str(
+            dossier.get("title_cn") or dossier.get("title") or "未获取到标题"
+        )
+        journal = str(
+            (dossier.get("openalex") or {}).get("journal")
+            or dossier.get("journal")
+            or "未知"
+        )
+        doi = str(
+            dossier.get("doi")
+            or (dossier.get("openalex") or {}).get("doi")
+            or item.get("doi")
+            or "未发现"
+        )
+        article_id = dossier.get("id") or "未知"
+        return (
+            f"识别到论文：\n《{title}》\n期刊：{journal}\nDOI：{doi}\n\n"
+            "正在生成 PAPER 推文……\n\n"
+            f"PAPER 推文已生成\nID：{article_id}\n标题：{title}"
+        )
 
     async def _handle_candidate(
         self,

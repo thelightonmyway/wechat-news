@@ -12,7 +12,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from bot.bridge import QQNewsBot
-from bot.commands import CommandHandler, NEWS_USAGE, PAPER_USAGE, _paper_image_summary
+from bot.commands import (
+    CommandHandler,
+    NEWS_USAGE,
+    PAPER_USAGE,
+    _direct_paper_item,
+    _paper_image_summary,
+)
 from db import Database
 from images.policy import apply_policy, assess_image
 from images.search import normalize_search_result, search_public_images
@@ -473,6 +479,55 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(await handler.handle("/paper"), PAPER_USAGE)
             self.assertEqual(await handler.handle("/news abc"), NEWS_USAGE)
             self.assertEqual(await handler.handle("/paper abc"), PAPER_USAGE)
+
+        asyncio.run(check())
+
+    def test_direct_paper_url_recognizes_doi_and_ignores_ordinary_url(self):
+        item = _direct_paper_item(
+            "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
+        )
+        self.assertIsNotNone(item)
+        self.assertEqual(item["doi"], "10.1029/2025gl120559")
+        self.assertEqual(item["content_type"], PAPER_CONTENT)
+        self.assertIsNone(_direct_paper_item("https://example.com/news/story"))
+
+    def test_direct_paper_url_generates_without_publish(self):
+        class FakePipeline:
+            def __init__(self):
+                self.calls = []
+
+            async def generate(self, rank, date=None, content_type=None, **kwargs):
+                self.calls.append((rank, date, content_type, kwargs))
+                return {
+                    "dossier": {
+                        "id": 123,
+                        "title": "A paper title",
+                        "journal": "Journal of Climate",
+                    },
+                    "markdown_path": Path("/tmp/direct-paper.md"),
+                }
+
+        async def check():
+            settings = replace(
+                load_settings(),
+                model_base_url="https://model.example/v1",
+                model_api_key="test-key",
+                model_name="test-model",
+            )
+            pipeline = FakePipeline()
+            handler = CommandHandler(settings, pipeline)
+            response = await handler.handle(
+                "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
+            )
+            self.assertIn("识别到论文", response)
+            self.assertIn("PAPER 推文已生成", response)
+            self.assertIn("ID：123", response)
+            self.assertEqual(len(pipeline.calls), 1)
+            call = pipeline.calls[0]
+            self.assertEqual(call[0], 0)
+            self.assertEqual(call[2], PAPER_CONTENT)
+            self.assertEqual(call[3]["item_override"]["doi"], "10.1029/2025gl120559")
+            self.assertFalse(any("publish" in str(value) for value in call[3]))
 
         asyncio.run(check())
 
