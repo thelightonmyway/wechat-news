@@ -61,7 +61,9 @@ from papers.pdf_figures import (
 from publisher.wechat import (
     DEFAULT_COVER,
     _paper_draft_title,
+    _remove_paper_figure_attributions,
     _selected_cover_path,
+    _style_paper_intro,
     format_markdown,
 )
 from scheduler import should_run_startup_catchup
@@ -1829,6 +1831,11 @@ class V1Tests(unittest.TestCase):
         self.assertIn("找不到合适原文就少引或不引", paper_prompt)
         self.assertNotIn("> 原文：", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
+        self.assertIn("识别论文的核心结果结构", paper_prompt)
+        self.assertIn("two modes、two mechanisms、two regimes", paper_prompt)
+        self.assertIn("必须分别覆盖每一个核心模态或机制", paper_prompt)
+        self.assertIn("空间或对象特征、主要驱动因子和关键物理机制", paper_prompt)
+        self.assertIn("完整覆盖核心结果优先于机械保持固定section数量", paper_prompt)
         self.assertIn(
             "> “The supplied paper states an exact scientific result.”",
             paper_markdown,
@@ -2892,6 +2899,20 @@ class V1Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_selected_cover_path(markdown), DEFAULT_COVER)
+
+    def test_paper_final_html_styles_intro_and_hides_figure_source(self):
+        html = (
+            '<p><img alt="论文第一页" src="images/paper-first-page.png" /></p>'
+            '<p>摘要导语内容。</p>'
+            '<section data-role="img-wrapper"><p>Fig. 2 | 图注内容。</em><br />'
+            '<em>图源：作者，CC BY-NC-ND</p></section>'
+        )
+        styled = _style_paper_intro(html)
+        self.assertIn('data-role="paper-intro"', styled)
+        self.assertIn("background:#f3f4f6", styled)
+        cleaned = _remove_paper_figure_attributions(styled)
+        self.assertIn("Fig. 2 | 图注内容。", cleaned)
+        self.assertNotIn("图源：", cleaned)
 
     def test_paper_formatter_removes_duplicate_h1_after_brand_header(self):
         with tempfile.TemporaryDirectory() as tmp:
