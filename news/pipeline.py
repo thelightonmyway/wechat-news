@@ -903,14 +903,335 @@ def _paper_figure_match_score(image: dict[str, Any], context: str) -> int:
         token for token in re.findall(r"[a-z0-9]+", context.lower()) if len(token) >= 3
     }
     meaningful_overlap = (image_tokens & context_tokens) - _PAPER_GENERIC_FIGURE_TOKENS
-    if not meaningful_overlap:
+    image_text = " ".join(
+        str(image.get(key) or "")
+        for key in ("metadata_title", "caption", "original_caption", "figure_title", "description", "alt")
+    )
+    identifier_tokens = {
+        token.lower()
+        for token in re.findall(
+            r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Za-z0-9-]*|[A-Za-z]{2,}\d[A-Za-z0-9-]*)(?![A-Za-z0-9])",
+            image_text,
+        )
+    }
+    context_identifiers = {
+        token.lower()
+        for token in re.findall(
+            r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Za-z0-9-]*|[A-Za-z]{2,}\d[A-Za-z0-9-]*)(?![A-Za-z0-9])",
+            context,
+        )
+    }
+    identifier_overlap = identifier_tokens & context_identifiers
+    if not meaningful_overlap and not identifier_overlap:
         return 0
-    # One specific keyword is enough for a short, focused caption; longer captions
-    # need two matching terms so generic overlap cannot place a figure by accident.
+    # One specific identifier (for example NAO, GRIP, or GeoB25206) can
+    # establish a match even when the surrounding text is Chinese.
     minimum_overlap = 1 if len(image_tokens) <= 4 else 2
-    if len(meaningful_overlap) < minimum_overlap:
+    if len(meaningful_overlap) < minimum_overlap and not identifier_overlap:
         return 0
     return score
+
+
+_PAPER_SCIENTIFIC_CONCEPTS: dict[str, tuple[str, ...]] = {
+    "nao": ("nao", "north atlantic oscillation", "大西洋涛动"),
+    "niobium": ("niobium", "niobium content", "nb", "铌"),
+    "hydroclimate": ("hydroclimate", "precipitation", "river discharge", "水文", "降水", "径流"),
+    "temperature": ("temperature", "warming", "cooling", "δ18o", "温度", "变暖", "变冷"),
+    "sediment": ("sediment", "sedimentary", "bioturbation", "ird", "density", "沉积", "岩芯", "冰筏", "密度"),
+    "deglaciation": ("deglaciation", "deglaciated", "ice-free", "glacier", "glacial", "退冰", "冰退", "冰后退缩", "冰川", "无冰"),
+    "mass_balance": ("surface mass balance", "smb", "mass balance", "accumulation", "ablation", "质量平衡", "积雪", "消融", "冰量"),
+    "ice_core": ("ice core", "grip", "dye-3", "δ18o", "冰芯", "同位素"),
+    "holocene": ("holocene", "early holocene", "late holocene", "全新世", "早全新世", "晚全新世"),
+    "geology": ("geology", "geomorphology", "intrusion", "landscape", "地质", "地貌", "景观"),
+    "model": ("simulation", "simulations", "model", "modeled", "模式", "模拟"),
+    "anomaly": ("anomaly", "anomalies", "异常", "湿冷", "更湿", "更冷", "更暖", "更干"),
+    "proxy": ("proxy", "marker", "代用", "指标"),
+    "reconstruction": ("reconstruction", "reconstructed", "重建", "对比"),
+    "late_holocene_event": ("little ice age", "medieval warm period", "lia", "小冰期", "中世纪暖期"),
+}
+
+_PAPER_CONCEPT_WEIGHTS = {
+    "nao": 10,
+    "niobium": 10,
+    "hydroclimate": 8,
+    "temperature": 6,
+    "sediment": 5,
+    "deglaciation": 20,
+    "mass_balance": 8,
+    "ice_core": 6,
+    "holocene": 2,
+    "geology": 2,
+    "model": 2,
+    "anomaly": 8,
+    "proxy": 8,
+    "reconstruction": 6,
+    "late_holocene_event": 8,
+}
+
+
+def _paper_scientific_concepts(text: str) -> set[str]:
+    lowered = text.lower()
+    return {
+        concept
+        for concept, aliases in _PAPER_SCIENTIFIC_CONCEPTS.items()
+        if any(alias.lower() in lowered for alias in aliases)
+    }
+
+
+def _paper_heading_match_score(image: dict[str, Any], heading: str) -> int:
+    image_text = " ".join(
+        str(image.get(key) or "")
+        for key in ("metadata_title", "caption", "original_caption", "figure_title", "description", "alt")
+    )
+    shared = _paper_scientific_concepts(image_text) & _paper_scientific_concepts(heading)
+    return sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in shared)
+
+
+def _paper_scientific_match_score(image: dict[str, Any], context: str) -> int:
+    image_text = " ".join(
+        str(image.get(key) or "")
+        for key in ("metadata_title", "caption", "original_caption", "figure_title", "description", "alt")
+    )
+    image_concepts = _paper_scientific_concepts(image_text)
+    context_concepts = _paper_scientific_concepts(context)
+    shared = image_concepts & context_concepts
+    score = sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in shared)
+    heading = context.splitlines()[0] if context.splitlines() else ""
+    heading_shared = image_concepts & _paper_scientific_concepts(heading)
+    # A concept stated in the section heading is more diagnostic than a
+    # generic concept repeated in the body.
+    score += 12 * len(heading_shared)
+    return score
+
+
+def _paper_source_paragraphs(source_text: str) -> list[str]:
+    return [
+        re.sub(r"\s+", " ", paragraph).strip()
+        for paragraph in re.split(r"\n+", source_text)
+        if paragraph.strip()
+    ]
+
+
+def _paper_source_paragraph_records(source_text: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"source-{index}",
+            "index": index,
+            "text": paragraph,
+            "figure_references": sorted(_paper_figure_reference_numbers(paragraph)),
+        }
+        for index, paragraph in enumerate(_paper_source_paragraphs(source_text))
+    ]
+
+
+def _paper_source_heading(text: str) -> bool:
+    stripped = text.strip()
+    return bool(
+        stripped
+        and len(stripped) <= 120
+        and not re.search(r"[.!?。！？:]$", stripped)
+        and len(re.findall(r"[A-Za-z0-9]+", stripped)) <= 16
+    )
+
+
+def _paper_match_source_paragraphs(
+    section_context: str,
+    source_text: str,
+    section_index: int,
+    section_count: int,
+) -> list[dict[str, Any]]:
+    """Return a small, section-specific source window instead of full-text evidence."""
+    records = _paper_source_paragraph_records(source_text)
+    if not records:
+        return []
+    section_concepts = _paper_scientific_concepts(section_context)
+    context_lines = section_context.splitlines()
+    heading = context_lines[0] if context_lines else ""
+    heading_concepts = _paper_scientific_concepts(heading)
+    focus_text = next(
+        (line for line in context_lines[1:] if line.strip()),
+        "",
+    )
+    focus_concepts = _paper_scientific_concepts(focus_text)
+    groups: list[dict[str, Any]] = []
+    heading_indexes = [
+        index for index, record in enumerate(records) if _paper_source_heading(record["text"])
+    ]
+    methods_indexes = [
+        index
+        for index in heading_indexes
+        if records[index]["text"].strip().lower() == "methods"
+    ]
+    if methods_indexes:
+        heading_indexes = [index for index in heading_indexes if index < methods_indexes[0]]
+    for group_number, start in enumerate(heading_indexes):
+        end = heading_indexes[group_number + 1] if group_number + 1 < len(heading_indexes) else len(records)
+        members = [
+            record
+            for record in records[start + 1 : end]
+            if not _paper_source_heading(record["text"])
+        ]
+        if not members:
+            continue
+        source_heading_concepts = _paper_scientific_concepts(records[start]["text"])
+        heading_score = sum(
+            _PAPER_CONCEPT_WEIGHTS[concept]
+            for concept in source_heading_concepts & section_concepts
+        )
+        heading_match_score = sum(
+            _PAPER_CONCEPT_WEIGHTS[concept]
+            for concept in source_heading_concepts & heading_concepts
+        )
+        focus_heading_score = sum(
+            _PAPER_CONCEPT_WEIGHTS[concept]
+            for concept in source_heading_concepts & focus_concepts
+        )
+        paragraph_scores = []
+        for member in members:
+            shared = _paper_scientific_concepts(member["text"]) & section_concepts
+            score = sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in shared)
+            paragraph_scores.append((score, member))
+        best_body_score = max((score for score, _ in paragraph_scores), default=0)
+        if heading_score or best_body_score:
+            groups.append(
+                {
+                    "heading": records[start],
+                    "members": members,
+                    "heading_score": heading_score,
+                    "heading_match_score": heading_match_score,
+                    "focus_heading_score": focus_heading_score,
+                    "best_body_score": best_body_score,
+                    "start": start,
+                }
+            )
+    if not groups:
+        scored_records = []
+        for record in records:
+            shared = _paper_scientific_concepts(record["text"]) & section_concepts
+            score = sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in shared)
+            if score:
+                scored_records.append((score, record))
+        return [
+            record
+            for _, record in sorted(
+                scored_records,
+                key=lambda item: (item[0], -item[1]["index"]),
+                reverse=True,
+            )[:3]
+        ]
+    groups.sort(
+        key=lambda group: (
+            int(group["heading_match_score"] > 0),
+            group["heading_match_score"] * 100
+            + group["focus_heading_score"] * 20
+            + group["heading_score"] * 2
+            + group["best_body_score"],
+            -abs(group["start"] - round((section_index + 1) * len(records) / max(section_count + 1, 1))),
+        ),
+        reverse=True,
+    )
+    selected_groups = [groups[0]]
+    selected_members: dict[int, dict[str, Any]] = {}
+    for selected_group in selected_groups:
+        members = selected_group["members"]
+        scored_members = []
+        for member in members:
+            shared = _paper_scientific_concepts(member["text"]) & section_concepts
+            score = sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in shared)
+            score += 12 * len(_paper_scientific_concepts(member["text"]) & heading_concepts)
+            if score:
+                scored_members.append((score, member))
+        for _, member in sorted(
+            scored_members,
+            key=lambda item: (item[0], -item[1]["index"]),
+            reverse=True,
+        )[:3]:
+            selected_members[member["index"]] = member
+            member_index = member["index"]
+            for neighbor in members:
+                if (
+                    abs(neighbor["index"] - member_index) == 1
+                    and not _paper_source_heading(neighbor["text"])
+                ):
+                    selected_members[neighbor["index"]] = neighbor
+    return [selected_members[index] for index in sorted(selected_members)]
+
+
+def _paper_source_evidence(
+    image: dict[str, Any],
+    section_context: str,
+    source_paragraphs: list[dict[str, Any]],
+) -> tuple[int, str, list[dict[str, Any]]]:
+    figure_number = _numbered_paper_figure(image)
+    if figure_number is None or not source_paragraphs:
+        return 0, "", []
+    section_concepts = _paper_scientific_concepts(section_context)
+    if not section_concepts:
+        return 0, "", []
+    heading = section_context.splitlines()[0] if section_context.splitlines() else ""
+    heading_concepts = _paper_scientific_concepts(heading)
+    image_concepts = _paper_scientific_concepts(
+        " ".join(
+            str(image.get(key) or "")
+            for key in ("metadata_title", "caption", "original_caption", "figure_title", "description", "alt")
+        )
+    )
+    section_image_shared = section_concepts & image_concepts
+    if not section_image_shared:
+        return 0, "", []
+    best_score = 0
+    best_reason = ""
+    best_evidence: list[dict[str, Any]] = []
+    for record in source_paragraphs:
+        paragraph = str(record.get("text") or "")
+        paragraph_concepts = _paper_scientific_concepts(paragraph)
+        paragraph_image_shared = paragraph_concepts & image_concepts
+        shared = section_image_shared & paragraph_concepts
+        references = _paper_figure_reference_numbers(paragraph)
+        referenced = figure_number in references
+        # A Figure citation inside the already matched source window is strong
+        # evidence even when the paragraph names the mechanism rather than the
+        # exact caption vocabulary. Unreferenced evidence still needs direct
+        # section/Figure concept overlap to avoid cross-Figure contamination.
+        if referenced:
+            section_paragraph_shared = section_concepts & paragraph_concepts
+            if not section_paragraph_shared:
+                continue
+            score = sum(
+                _PAPER_CONCEPT_WEIGHTS[concept]
+                for concept in section_paragraph_shared
+            )
+            score += sum(
+                _PAPER_CONCEPT_WEIGHTS[concept]
+                for concept in paragraph_image_shared
+            ) // 2
+            score += 30 * len(section_image_shared & heading_concepts)
+            score += 90
+        else:
+            if not shared or not paragraph_image_shared:
+                continue
+            score = sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in shared)
+            score += sum(_PAPER_CONCEPT_WEIGHTS[concept] for concept in paragraph_image_shared) // 2
+            score += 30 * len(section_image_shared & heading_concepts)
+            if not references:
+                score += 8
+            else:
+                continue
+        if score > best_score:
+            best_score = score
+            best_reason = (
+                "source paragraph explicitly cites this Figure and shares section concepts"
+                if referenced
+                else "source paragraph and Figure content share section concepts"
+            )
+            best_evidence = [
+                {
+                    "id": record.get("id", ""),
+                    "text": paragraph[:600],
+                    "figure_references": record.get("figure_references", []),
+                }
+            ]
+    return best_score, best_reason, best_evidence
 
 
 def _images_redundant(
@@ -1028,10 +1349,410 @@ def _paper_body_image_order(images: list[dict[str, Any]]) -> list[int]:
     return order
 
 
+def _paper_figure_reference_numbers(context: str) -> set[int]:
+    return {
+        int(value)
+        for value in re.findall(
+            r"\b(?:fig(?:ure)?\.?\s*)(\d+)\s*[a-z]?\b",
+            context,
+            re.IGNORECASE,
+        )
+    }
+
+
+def _paper_image_label(image: dict[str, Any]) -> str:
+    figure_number = _numbered_paper_figure(image)
+    if figure_number is not None:
+        return f"Fig. {figure_number}"
+    return str(image.get("metadata_title") or image.get("url") or "image").strip()
+
+
+def _paper_candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        int(candidate["explicit_reference"]),
+        int(candidate.get("heading_score", 0)),
+        int(candidate.get("scientific_score", 0)),
+        int(candidate.get("source_score", 0)),
+        int(candidate["semantic_score"] > 0),
+        int(candidate["semantic_score"]),
+        int(candidate["keyword_score"]),
+        min(int(candidate.get("structural_score", 0)), 8),
+        -int(candidate.get("figure_number") or 0),
+    )
+
+
+def _paper_allocate_images(
+    images: list[dict[str, Any]],
+    context: str,
+    limit: int = 4,
+    source_context: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Map every legal PAPER image before applying the global image limit."""
+    lines = context.splitlines()
+    section_slots = _paper_section_slots(lines) if context.strip() else []
+    numbered_images = [
+        image for image in images if _numbered_paper_figure(image) is not None
+    ]
+    if not numbered_images:
+        selected_images = images[:limit]
+        return selected_images, {
+            "max_images": limit,
+            "input_image_count": len(images),
+            "numbered_figure_count": 0,
+            "sections": [],
+            "selected_figures": [
+                {
+                    "figure": _paper_image_label(image),
+                    "reason": "没有编号 Figure，保留相关性排序靠前的图片",
+                }
+                for image in selected_images
+            ],
+            "discarded_figures": [
+                {
+                    "figure": _paper_image_label(image),
+                    "reason": "超过全局最多4张图片限制",
+                    "candidate_sections": [],
+                }
+                for image in images[limit:]
+            ],
+        }
+    figure_numbers = sorted(
+        {_numbered_paper_figure(image) for image in numbered_images if _numbered_paper_figure(image) is not None}
+    )
+    candidates_by_section: dict[int, list[dict[str, Any]]] = {}
+    all_candidates: list[dict[str, Any]] = []
+    all_scores_by_section: dict[int, list[dict[str, Any]]] = {}
+    matched_source_paragraphs_by_section: dict[int, list[dict[str, Any]]] = {}
+    for section_index, slot in enumerate(section_slots):
+        references = _paper_figure_reference_numbers(slot[3])
+        matched_source_paragraphs = _paper_match_source_paragraphs(
+            slot[3],
+            source_context,
+            section_index,
+            len(section_slots),
+        )
+        matched_source_paragraphs_by_section[section_index] = matched_source_paragraphs
+        for image_index, image in enumerate(images):
+            figure_number = _numbered_paper_figure(image)
+            explicit = bool(figure_number is not None and figure_number in references)
+            semantic_score = (
+                _paper_figure_match_score(image, slot[3])
+                if figure_number is not None
+                else 0
+            )
+            scientific_score = _paper_scientific_match_score(image, slot[3])
+            heading_score = _paper_heading_match_score(
+                image,
+                slot[3].splitlines()[0] if slot[3].splitlines() else "",
+            )
+            source_score, source_reason, source_evidence = _paper_source_evidence(
+                image,
+                slot[3],
+                matched_source_paragraphs,
+            )
+            keyword_score = _text_relevance_score(image, slot[3])
+            structural_score = 0
+            if figure_number in figure_numbers and len(section_slots) > 1:
+                figure_rank = figure_numbers.index(figure_number)
+                expected_section = round(
+                    figure_rank * (len(section_slots) - 1) / max(len(figure_numbers) - 1, 1)
+                )
+                # Figure order is only a weak tie-breaker; it is never a
+                # relationship on its own.
+                structural_score = max(0, 8 - abs(section_index - expected_section) * 2)
+            if figure_number is not None:
+                image_tokens = _image_information_tokens(image)
+                context_tokens = {
+                    token
+                    for token in re.findall(r"[a-z0-9]+", slot[3].lower())
+                    if len(token) >= 3
+                }
+                meaningful_keyword_overlap = (
+                    image_tokens & context_tokens
+                ) - _PAPER_GENERIC_FIGURE_TOKENS
+                related = (
+                    explicit
+                    or source_score > 0
+                    or scientific_score > 0
+                    or semantic_score > 0
+                    or (keyword_score >= 10 and bool(meaningful_keyword_overlap))
+                )
+            else:
+                related = keyword_score > 0
+            method = (
+                "explicit_reference"
+                if explicit
+                else "source_paragraph"
+                if source_score > 0
+                else "semantic"
+                if scientific_score > 0 or semantic_score > 0
+                else "keyword"
+                if related
+                else "fallback"
+            )
+            score = max(
+                source_score,
+                scientific_score,
+                semantic_score,
+                keyword_score,
+            )
+            score_record = {
+                "image_index": image_index,
+                "section_index": section_index,
+                "figure_number": figure_number,
+                "label": _paper_image_label(image),
+                "explicit_reference": explicit,
+                "source_score": source_score,
+                "source_reason": source_reason,
+                "source_evidence": source_evidence,
+                "heading_score": heading_score,
+                "scientific_score": scientific_score,
+                "semantic_score": semantic_score,
+                "keyword_score": keyword_score,
+                "structural_score": structural_score,
+                "score": score,
+                "match_method": method,
+            }
+            all_scores_by_section.setdefault(section_index, []).append(score_record)
+            if not related:
+                continue
+            candidates_by_section.setdefault(section_index, []).append(score_record)
+            all_candidates.append(score_record)
+
+    unique_candidates: dict[int, dict[str, Any]] = {}
+    for candidate in all_candidates:
+        current = unique_candidates.get(candidate["image_index"])
+        if current is None or _paper_candidate_sort_key(candidate) > _paper_candidate_sort_key(current):
+            unique_candidates[candidate["image_index"]] = candidate
+    section_records = []
+    for section_index, slot in enumerate(section_slots):
+        candidates = candidates_by_section.get(section_index, [])
+        section_records.append(
+            {
+                "section_index": section_index,
+                "section": (
+                    re.sub(r"^#{2,3}\s+", "", slot[2].splitlines()[0]).strip()
+                    or f"section_{section_index + 1}"
+                ),
+                "source_paragraphs": [
+                    {
+                        "id": paragraph.get("id", ""),
+                        "text": paragraph.get("text", "")[:600],
+                        "figure_references": paragraph.get("figure_references", []),
+                    }
+                    for paragraph in matched_source_paragraphs_by_section.get(section_index, [])
+                ],
+                "candidates": sorted(
+                    candidates,
+                    key=_paper_candidate_sort_key,
+                    reverse=True,
+                ),
+                "figure_scores": sorted(
+                    all_scores_by_section.get(section_index, []),
+                    key=lambda candidate: (
+                        -int(candidate.get("score", 0)),
+                        -int(candidate.get("source_score", 0)),
+                        -int(candidate.get("scientific_score", 0)),
+                        int(candidate.get("figure_number") or 0),
+                    ),
+                ),
+            }
+        )
+    selected_indices: set[int] = set()
+    selected_reasons: dict[int, str] = {}
+    selected_assignment_by_image: dict[int, int] = {}
+    if section_slots and unique_candidates:
+        numbered_image_indices = sorted(
+            {
+                candidate["image_index"]
+                for candidate in unique_candidates.values()
+                if candidate.get("figure_number") is not None
+            },
+            key=lambda image_index: _numbered_paper_figure(images[image_index]) or 0,
+        )
+        candidates_by_image: dict[int, list[dict[str, Any]]] = {}
+        for candidate in all_candidates:
+            if candidate.get("figure_number") is not None:
+                candidates_by_image.setdefault(candidate["image_index"], []).append(candidate)
+
+        # Select a monotonic path through Figure-number order. This preserves
+        # section coverage without allowing a late Figure to force an earlier
+        # section assignment that the insertion stage cannot honor.
+        states: dict[tuple[int, int, int], tuple[int, int, list[dict[str, Any]]]] = {
+            (0, -1, 0): (0, 0, [])
+        }
+        for image_index in numbered_image_indices:
+            next_states = dict(states)
+            for (count, last_section, covered_mask), (current_count, current_quality, path) in states.items():
+                if current_count >= limit:
+                    continue
+                for candidate in candidates_by_image.get(image_index, []):
+                    section_index = int(candidate["section_index"])
+                    if section_index < last_section:
+                        continue
+                    new_count = current_count + 1
+                    new_mask = covered_mask | (1 << section_index)
+                    quality = (
+                        int(candidate.get("explicit_reference", False)) * 100000
+                        + int(candidate.get("heading_score", 0)) * 1000
+                        + int(candidate.get("scientific_score", 0)) * 100
+                        + int(candidate.get("source_score", 0))
+                        + int(candidate.get("semantic_score", 0)) * 2
+                        + int(candidate.get("keyword_score", 0))
+                    )
+                    new_state = (new_count, section_index, new_mask)
+                    new_value = (
+                        new_count,
+                        current_quality + quality,
+                        [*path, candidate],
+                    )
+                    old_value = next_states.get(new_state)
+                    if old_value is None or (
+                        new_value[0],
+                        new_value[1],
+                        len(new_value[2]),
+                    ) > (
+                        old_value[0],
+                        old_value[1],
+                        len(old_value[2]),
+                    ):
+                        next_states[new_state] = new_value
+            states = next_states
+        best_path = max(
+            states.values(),
+            key=lambda value: (
+                len({candidate["section_index"] for candidate in value[2]}),
+                value[0],
+                value[1],
+            ),
+        )[2]
+        for candidate in best_path:
+            image_index = candidate["image_index"]
+            selected_indices.add(image_index)
+            selected_assignment_by_image[image_index] = int(candidate["section_index"])
+            selected_reasons[image_index] = (
+                f"匹配 {section_records[int(candidate['section_index'])]['section']}，"
+                "按科学证据和 section 覆盖选择"
+            )
+
+        non_numbered_candidates = sorted(
+            (
+                candidate
+                for candidate in unique_candidates.values()
+                if candidate.get("figure_number") is None
+            ),
+            key=_paper_candidate_sort_key,
+            reverse=True,
+        )
+        for candidate in non_numbered_candidates:
+            if len(selected_indices) >= limit:
+                break
+            image_index = candidate["image_index"]
+            if image_index in selected_indices:
+                continue
+            selected_indices.add(image_index)
+            selected_reasons[image_index] = "覆盖 section 后的最高优先级剩余候选"
+
+    if not section_slots or not unique_candidates:
+        selected_indices = set(range(min(limit, len(images))))
+        selected_reasons = {
+            index: "正文没有可用 mapping，使用视觉/相关性排序兜底"
+            for index in selected_indices
+        }
+
+    selected_images = [images[index] for index in sorted(selected_indices)]
+    selected_images = [
+        selected_images[index] for index in _paper_body_image_order(selected_images)
+    ]
+    selected_image_indices = {id(image): index for index, image in enumerate(images)}
+    selected_by_index = {
+        selected_image_indices[id(image)] for image in selected_images
+    }
+    for record in section_records:
+        selected_candidates = [
+            candidate
+            for candidate in record["candidates"]
+            if candidate["image_index"] in selected_by_index
+            and selected_assignment_by_image.get(candidate["image_index"])
+            == record["section_index"]
+        ]
+        record["selected_figures"] = [
+            candidate["label"]
+            for candidate in sorted(
+                selected_candidates,
+                key=lambda candidate: candidate.get("figure_number") or 0,
+            )
+        ]
+    discarded: list[dict[str, Any]] = []
+    for image_index, image in enumerate(images):
+        if image_index in selected_by_index:
+            continue
+        related_sections = [
+            record["section"]
+            for record in section_records
+            if any(
+                candidate["image_index"] == image_index
+                for candidate in record["candidates"]
+            )
+        ]
+        discarded.append(
+            {
+                "figure": _paper_image_label(image),
+                "reason": (
+                    "全局最多4张，已优先覆盖主要 section"
+                    if related_sections
+                    else "没有足够的正文对应关系"
+                ),
+                "candidate_sections": related_sections,
+            }
+        )
+    for record in section_records:
+        def public_score(candidate: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "figure": candidate["label"],
+                "score": candidate["score"],
+                "explicit_reference": candidate["explicit_reference"],
+                "source_score": candidate.get("source_score", 0),
+                "source_reason": candidate.get("source_reason", ""),
+                "source_evidence": candidate.get("source_evidence", []),
+                "heading_score": candidate.get("heading_score", 0),
+                "scientific_score": candidate.get("scientific_score", 0),
+                "semantic_score": candidate["semantic_score"],
+                "structural_score": candidate["structural_score"],
+                "keyword_score": candidate["keyword_score"],
+                "match_method": candidate["match_method"],
+            }
+        record["candidates"] = [
+            public_score(candidate) for candidate in record["candidates"]
+        ]
+        record["figure_scores"] = [
+            public_score(candidate) for candidate in record.get("figure_scores", [])
+        ]
+    diagnostics = {
+        "max_images": limit,
+        "input_image_count": len(images),
+        "numbered_figure_count": len(numbered_images),
+        "sections": section_records,
+        "selected_figures": [
+            {
+                "figure": _paper_image_label(image),
+                "reason": selected_reasons.get(
+                    selected_image_indices[id(image)], "section coverage"
+                ),
+            }
+            for image in selected_images
+        ],
+        "discarded_figures": discarded,
+    }
+    return selected_images, diagnostics
+
+
 def _select_article_images(
     images: list[dict[str, Any]],
     content_type: str,
     context: str = "",
+    allocation: dict[str, Any] | None = None,
+    source_context: str = "",
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
     ranked = sorted(
         images,
@@ -1081,10 +1802,18 @@ def _select_article_images(
             redundant_count += 1
             continue
         body.append(image)
-        if len(body) == limit:
-            break
     if content_type == PAPER_CONTENT:
-        body = [body[index] for index in _paper_body_image_order(body)]
+        body, diagnostics = _paper_allocate_images(
+            body,
+            context,
+            limit,
+            source_context,
+        )
+        if allocation is not None:
+            allocation.clear()
+            allocation.update(diagnostics)
+    else:
+        body = body[:limit]
     return cover, body, redundant_count
 
 
@@ -1208,6 +1937,47 @@ def _paper_text_slots(lines: list[str]) -> list[tuple[int, int, str]]:
     return slots
 
 
+def _paper_section_slots(
+    lines: list[str],
+) -> list[tuple[int, int, str, str]]:
+    """Return one aggregate text slot for each major ``##`` section."""
+    all_heading_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^##\s+", line.strip())
+    ]
+    heading_indexes = [
+        index
+        for index in all_heading_indexes
+        if not re.match(
+            r"^##\s+(文章信息|来源|参考文献)\s*$",
+            lines[index].strip(),
+        )
+    ]
+    if not heading_indexes:
+        return []
+    sections: list[tuple[int, int, str, str]] = []
+    for start in heading_indexes:
+        following_headings = [index for index in all_heading_indexes if index > start]
+        end = following_headings[0] if following_headings else len(lines)
+        heading = lines[start].strip()
+        body_lines: list[str] = []
+        for line in lines[start + 1 : end]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(">"):
+                continue
+            if stripped.startswith("![") or stripped.startswith("*Fig."):
+                continue
+            body_lines.append(stripped)
+        context = "\n".join([heading, *body_lines]).strip()
+        sections.append((start, end, heading, context or heading))
+    return sections
+
+
+def _paper_section_heading_text(heading: str) -> str:
+    return re.sub(r"^##\s+", "", heading.strip()).strip()
+
+
 def _insert_paper_figures(
     markdown_path: Path,
     images: list[dict[str, Any]],
@@ -1218,6 +1988,7 @@ def _insert_paper_figures(
         return []
     lines = markdown_path.read_text(encoding="utf-8").splitlines()
     slots = _paper_text_slots(lines)
+    section_slots = _paper_section_slots(lines)
     image_order = _paper_body_image_order(images)
     ordered_entries = [
         (
@@ -1233,29 +2004,80 @@ def _insert_paper_figures(
     retained_generated_captions: list[str] = []
     effective_captions: list[str] = []
     last_insertion_index = -1
+    last_numbered_section = -1
+    allocation = dossier.get("paper_image_allocation")
+    mapped_sections: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(allocation, dict):
+        for section in allocation.get("sections", []):
+            for figure in section.get("selected_figures", []):
+                mapped_sections.setdefault(str(figure), []).append(
+                    {
+                        "section_index": section.get("section_index"),
+                        "section": str(section.get("section") or ""),
+                    }
+                )
     used_slots: set[int] = set()
+    inserted_image_keys: set[str] = set()
+    inserted_section_records: list[dict[str, Any]] = []
     for index, (image, generated) in enumerate(ordered_entries, start=1):
         figure_number, caption = _paper_figure_caption(image, generated, index)
         numbered = _numbered_paper_figure(image) is not None
-        eligible = [
-            (slot_index, slot)
-            for slot_index, slot in enumerate(slots)
-            if slot_index not in used_slots and slot[0] > last_insertion_index
-        ]
-        if numbered:
-            relevance = {
-                slot_index: _paper_figure_match_score(image, slot[2])
-                for slot_index, slot in eligible
-            }
-            if not relevance or max(relevance.values()) <= 0:
-                # Do not invent a placement for a figure whose caption is not
-                # supported by any later paragraph.
+        if numbered and section_slots:
+            image_key = _paper_image_label(image)
+            if image_key in inserted_image_keys:
                 continue
-            slot_index = max(
-                relevance,
-                key=lambda candidate: (relevance[candidate], -candidate),
-            )
+            mapped_section = None
+            mapped_targets = mapped_sections.get(image_key, [])
+            for target in mapped_targets:
+                target_heading = str(target.get("section") or "").strip()
+                matching_sections = [
+                    section_index
+                    for section_index, section in enumerate(section_slots)
+                    if _paper_section_heading_text(section[2]) == target_heading
+                    and section_index >= last_numbered_section
+                ]
+                if matching_sections:
+                    mapped_section = matching_sections[0]
+                    break
+                try:
+                    target_index = int(target.get("section_index"))
+                except (TypeError, ValueError):
+                    target_index = -1
+                if (
+                    0 <= target_index < len(section_slots)
+                    and target_index >= last_numbered_section
+                ):
+                    mapped_section = target_index
+                    break
+            if mapped_section is not None:
+                section_index = mapped_section
+            else:
+                eligible_sections = [
+                    (section_index, section)
+                    for section_index, section in enumerate(section_slots)
+                    if section_index >= last_numbered_section
+                    and section[1] >= last_insertion_index
+                ]
+                relevance = {
+                    section_index: _paper_figure_match_score(image, section[3])
+                    for section_index, section in eligible_sections
+                }
+                if not relevance or max(relevance.values()) <= 0:
+                    # Do not invent a placement for a figure whose caption is not
+                    # supported by any later major section.
+                    continue
+                section_index = max(
+                    relevance,
+                    key=lambda candidate: (relevance[candidate], -candidate),
+                )
+            insertion_index = section_slots[section_index][1]
+            last_numbered_section = section_index
         else:
+            eligible = [
+                (slot_index, slot)
+                for slot_index, slot in enumerate(slots)
+                if slot_index not in used_slots and slot[0] > last_insertion_index
+            ]
             if not eligible:
                 eligible = [
                     (slot_index, slot)
@@ -1269,12 +2091,26 @@ def _insert_paper_figures(
                     -candidate[0],
                 ),
             )[0]
-        insertion_index = slots[slot_index][0]
-        used_slots.add(slot_index)
+            insertion_index = slots[slot_index][0]
+        if not numbered or not section_slots:
+            used_slots.add(slot_index)
         last_insertion_index = insertion_index
+        inserted_image_keys.add(
+            _paper_image_label(image) if numbered else str(id(image))
+        )
         retained_images.append(image)
         retained_generated_captions.append(generated)
         effective_captions.append(caption)
+        if numbered and section_slots:
+            inserted_section_records.append(
+                {
+                    "figure": _paper_image_label(image),
+                    "section_index": section_index,
+                    "section": _paper_section_heading_text(
+                        section_slots[section_index][2]
+                    ),
+                }
+            )
         local_name = Path(str(image["local_path"])).name
         block = [
             f"![Fig. {figure_number}](images/{local_name})",
@@ -1288,6 +2124,8 @@ def _insert_paper_figures(
     if dossier.get("content_type") == PAPER_CONTENT:
         dossier["body_images"] = retained_images
         dossier["generated_body_image_captions"] = retained_generated_captions
+        if isinstance(allocation, dict):
+            allocation["final_inserted_sections"] = inserted_section_records
     output: list[str] = []
     for index in range(len(lines) + 1):
         for block in insertions.get(index, []):
@@ -2485,10 +3323,15 @@ class NewsPipeline:
             if dossier.get("content_type") == PAPER_CONTENT
             else ""
         )
+        paper_image_allocation: dict[str, Any] = {}
         cover_image, body_images, redundant_count = _select_article_images(
             legal_images,
             str(dossier.get("content_type") or POPULAR_CONTENT),
             selection_context,
+            paper_image_allocation if dossier.get("content_type") == PAPER_CONTENT else None,
+            str(dossier.get("text") or "")
+            if dossier.get("content_type") == PAPER_CONTENT
+            else "",
         )
         body_image_captions = await asyncio.to_thread(
             generate_image_captions,
@@ -2498,6 +3341,8 @@ class NewsPipeline:
         dossier["cover_image"] = cover_image or {}
         dossier["body_images"] = body_images
         dossier["generated_body_image_captions"] = body_image_captions
+        if dossier.get("content_type") == PAPER_CONTENT:
+            dossier["paper_image_allocation"] = paper_image_allocation
         if dossier.get("content_type") == PAPER_CONTENT and body_images:
             body_image_captions = _insert_paper_figures(
                 markdown_path,
@@ -2505,6 +3350,13 @@ class NewsPipeline:
                 body_image_captions,
                 dossier,
             )
+            allocation = dossier.get("paper_image_allocation")
+            if isinstance(allocation, dict):
+                allocation["final_inserted_figures"] = [
+                    _paper_image_label(image)
+                    for image in dossier.get("body_images") or []
+                ]
+            body_images = list(dossier.get("body_images") or [])
         dossier["body_image_captions"] = body_image_captions
         dossier["redundant_images_removed"] = redundant_count
         self.logger.info(
@@ -2564,6 +3416,7 @@ class NewsPipeline:
                         "generated_body_image_captions", []
                     ),
                     "body_image_captions": dossier.get("body_image_captions", []),
+                    "paper_image_allocation": dossier.get("paper_image_allocation", {}),
                     "redundant_images_removed": dossier.get("redundant_images_removed", 0),
                     "pdf_figure_fallback": dossier.get("pdf_figure_fallback", {}),
                     "pdf_figure_source": dossier.get("pdf_figure_source", {}),

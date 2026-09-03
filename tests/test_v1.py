@@ -29,6 +29,7 @@ from news.pipeline import (
     _images_redundant,
     _insert_paper_figures,
     _paper_publication_within_window,
+    _paper_match_source_paragraphs,
     _paper_wechat_cover,
     _prepare_paper_markdown,
     _select_article_images,
@@ -1734,6 +1735,7 @@ class V1Tests(unittest.TestCase):
                             "# 测试标题\n\n## 关键结果\n\n简短正文。\n\n"
                             "> “The supplied paper states an exact scientific result.”\n\n"
                             "这句引文支持上述判断。\n\n"
+                            "> “The ensemble spread remains stable across the tested regions while forecast errors decline during the validation period and improve seasonal predictability.”\n\n"
                             "> “This quotation was invented by the model.”\n\n"
                             "这条引文不应保留。"
                         )
@@ -1753,7 +1755,12 @@ class V1Tests(unittest.TestCase):
                     "content_type": PAPER_CONTENT,
                     "title": "Test paper",
                     "title_cn": "测试标题",
-                    "text": "The supplied paper states an exact scientific result.",
+                    "text": (
+                        "The supplied paper states an exact scientific result. "
+                        "The ensemble spread remains stable across the tested regions while "
+                        "forecast errors decline during the validation period and improve "
+                        "seasonal predictability."
+                    ),
                     "summary": "Paper abstract",
                     "openalex": {"abstract": "Paper abstract"},
                     "images": [],
@@ -1782,8 +1789,14 @@ class V1Tests(unittest.TestCase):
                 "content"
             ]
 
-        self.assertIn("约800到1200个中文字符", paper_prompt)
-        self.assertIn("最多3到4个小节", paper_prompt)
+        self.assertIn("正文主体优先约650到800个中文字符", paper_prompt)
+        self.assertIn("标题、英文摘录、图片图注和文章信息不计入正文主体", paper_prompt)
+        self.assertIn("必须把正文主体压缩到650到800个中文字以内", paper_prompt)
+        self.assertIn("每个小节约110到160个中文字", paper_prompt)
+        self.assertIn("任何小节不得超过180字", paper_prompt)
+        self.assertIn("通常设置3到4个主要小节", paper_prompt)
+        self.assertIn("主动删去冗余背景、重复解释、低价值细节", paper_prompt)
+        self.assertIn("不要机械截断句子", paper_prompt)
         self.assertIn(
             "像中文科技媒体编辑或科研作者整理一篇刚发表的研究",
             paper_prompt,
@@ -1800,9 +1813,12 @@ class V1Tests(unittest.TestCase):
         self.assertIn("所有科学事实必须来自输入论文材料", paper_prompt)
         self.assertIn("禁止逐句翻译英文", paper_prompt)
         self.assertIn("必须逐字复制自paper_text", paper_prompt)
-        self.assertIn("优先加入2到3处英文短引", paper_prompt)
-        self.assertIn("每处最多25个英文词", paper_prompt)
-        self.assertIn("全篇英文引用总量尽量控制在约25个英文词以内", paper_prompt)
+        self.assertIn("优先加入2到3组英文短引", paper_prompt)
+        self.assertIn("每组保留1到2个连续且有信息量、语境完整的原文句子", paper_prompt)
+        self.assertIn("不要按固定的全篇英文词数机械截断", paper_prompt)
+        self.assertIn("每组应保持精炼，通常不超过80个英文词", paper_prompt)
+        self.assertNotIn("每处最多25个英文词", paper_prompt)
+        self.assertNotIn("全篇英文引用总量尽量控制在约25个英文词以内", paper_prompt)
         self.assertIn("引用格式为自然的Markdown引用块", paper_prompt)
         self.assertIn("找不到合适原文就少引或不引", paper_prompt)
         self.assertNotIn("> 原文：", paper_prompt)
@@ -1811,10 +1827,15 @@ class V1Tests(unittest.TestCase):
             "> “The supplied paper states an exact scientific result.”",
             paper_markdown,
         )
+        self.assertIn(
+            "> “The ensemble spread remains stable across the tested regions while forecast errors decline during the validation period and improve seasonal predictability.”",
+            paper_markdown,
+        )
         self.assertNotIn("原文：", paper_markdown)
         self.assertNotIn("This quotation was invented by the model.", paper_markdown)
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("约800到1200个中文字符", news_prompt)
+        self.assertNotIn("正文主体优先约650到800个中文字符", news_prompt)
         self.assertNotIn("像中文科技媒体编辑或科研作者", news_prompt)
         self.assertNotIn("作者比较了三组模式试验", news_prompt)
         self.assertNotIn("A、B、X、Y、Z 都只是占位符", news_prompt)
@@ -2357,6 +2378,326 @@ class V1Tests(unittest.TestCase):
                     text.index(f"![Fig. {number}]"),
                     text.index(heading),
                 )
+
+    def test_paper_image_allocation_covers_later_sections_before_four_image_cap(self):
+        context = (
+            "## Ensemble spread\n\n"
+            "The ensemble spread quantifies forecast errors across the experiments.\n\n"
+            "## Circulation and precipitation\n\n"
+            "Large-scale circulation controls regional precipitation changes.\n\n"
+            "## Projection and attribution\n\n"
+            "Figure 4 and Figure 5 show future projection warming trends explained by radiative forcing.\n"
+        )
+        captions = {
+            1: "Ensemble spread and forecast errors.",
+            2: "Forecast uncertainty in ensemble spread.",
+            3: "Circulation and precipitation response.",
+            4: "Future projection warming trend.",
+            5: "Projection warming trend attribution.",
+            6: "Ocean chlorophyll concentration.",
+        }
+        images = [
+            {
+                "url": f"https://example.test/{number}.png",
+                "local_path": f"/tmp/{number}.png",
+                "image_role": "figure",
+                "figure_number": number,
+                "caption": captions[number],
+            }
+            for number in (1, 2, 3, 6, 4, 5)
+        ]
+        allocation = {}
+        _, selected, _ = _select_article_images(
+            images,
+            PAPER_CONTENT,
+            context,
+            allocation,
+        )
+        selected_numbers = [image["figure_number"] for image in selected]
+        self.assertEqual(len(selected), 4)
+        self.assertEqual(selected_numbers, [1, 3, 4, 5])
+        self.assertNotEqual(selected_numbers, [1, 2, 3, 6])
+        self.assertEqual(allocation["input_image_count"], 6)
+        self.assertEqual(allocation["max_images"], 4)
+        self.assertEqual(
+            [section["section"] for section in allocation["sections"]],
+            ["Ensemble spread", "Circulation and precipitation", "Projection and attribution"],
+        )
+        self.assertEqual(
+            [section["selected_figures"] for section in allocation["sections"]],
+            [["Fig. 1"], ["Fig. 3"], ["Fig. 4", "Fig. 5"]],
+        )
+        self.assertEqual(
+            [candidate["figure"] for candidate in allocation["sections"][0]["candidates"]],
+            ["Fig. 1", "Fig. 2"],
+        )
+        discarded = {item["figure"]: item["reason"] for item in allocation["discarded_figures"]}
+        self.assertIn("Fig. 2", discarded)
+        self.assertIn("Fig. 6", discarded)
+        self.assertIn("全局最多4张", discarded["Fig. 2"])
+        self.assertIn("没有足够的正文对应关系", discarded["Fig. 6"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            markdown = Path(tmp) / "article.md"
+            markdown.write_text(context, encoding="utf-8")
+            insertion_dossier = {
+                "content_type": PAPER_CONTENT,
+                "body_images": selected,
+            }
+            _insert_paper_figures(
+                markdown,
+                selected,
+                ["" for _ in selected],
+                insertion_dossier,
+            )
+            rendered = markdown.read_text(encoding="utf-8")
+            self.assertEqual(
+                [
+                    int(line.split("![Fig. ", 1)[1].split("]", 1)[0])
+                    for line in rendered.splitlines()
+                    if line.startswith("![Fig. ")
+                ],
+                [1, 3, 4, 5],
+            )
+            self.assertGreater(rendered.index("![Fig. 1]"), rendered.index("ensemble spread"))
+            self.assertGreater(rendered.index("![Fig. 3]"), rendered.index("regional precipitation"))
+            self.assertGreater(rendered.index("![Fig. 4]"), rendered.index("future projection"))
+            self.assertGreater(rendered.index("![Fig. 5]"), rendered.index("![Fig. 4]"))
+
+    def test_paper_scoring_prefers_scientific_and_source_evidence_over_structure(self):
+        context = (
+            "## Nb proxy for Holocene hydroclimate\n\n"
+            "The niobium record tracks Holocene hydroclimate with GRIP and DYE-3.\n\n"
+            "## Positive NAO response\n\n"
+            "Positive NAO phases produce wetter but colder conditions and alter precipitation.\n"
+        )
+        source = (
+            "The niobium record is compared with GRIP temperatures and DYE-3 isotope data (Fig. 3).\n\n"
+            "Positive NAO phases correspond to higher precipitation and lower temperature in southwestern Greenland (Fig. 4).\n"
+        )
+        captions = {
+            1: "Regional geology and landscape setting.",
+            2: "Sediment properties and IRD concentration during Holocene climate evolution.",
+            3: "Niobium content as a marker for Holocene hydroclimate variability compared with GRIP and DYE-3.",
+            4: "NAO-driven anomalies in temperature and precipitation.",
+            5: "Niobium compared with NAO reconstructions and regional ice accumulation.",
+        }
+        images = [
+            {
+                "url": f"https://example.test/{number}.png",
+                "local_path": f"/tmp/{number}.png",
+                "image_role": "figure",
+                "figure_number": number,
+                "caption": captions[number],
+            }
+            for number in (1, 2, 3, 4, 5)
+        ]
+        allocation = {}
+        _, selected, _ = _select_article_images(
+            images,
+            PAPER_CONTENT,
+            context,
+            allocation,
+            source,
+        )
+        self.assertEqual(
+            [image["figure_number"] for image in selected[:4]],
+            [2, 3, 4, 5],
+        )
+        nao_section = allocation["sections"][1]
+        nao_scores = {
+            score["figure"]: score for score in nao_section["figure_scores"]
+        }
+        self.assertEqual(
+            max(nao_scores, key=lambda figure: nao_scores[figure]["score"]),
+            "Fig. 4",
+        )
+        self.assertEqual(nao_section["selected_figures"][0], "Fig. 4")
+        self.assertGreater(nao_scores["Fig. 4"]["source_score"], nao_scores["Fig. 2"]["source_score"])
+        self.assertEqual(nao_scores["Fig. 4"]["match_method"], "source_paragraph")
+        self.assertLessEqual(nao_scores["Fig. 2"]["structural_score"], 8)
+        self.assertEqual(
+            max(
+                allocation["sections"][0]["figure_scores"],
+                key=lambda score: score["score"],
+            )["figure"],
+            "Fig. 3",
+        )
+
+    def test_paper_source_mapping_is_section_local(self):
+        source = (
+            "Results\n"
+            "Narsaq Sound deglaciated before surrounding land\n"
+            "The IRD layer indicates that the sound became periodically ice-free (Fig. 2).\n"
+            "Niobium as marker for hydroclimate change in southern Greenland\n"
+            "The niobium record agrees with GRIP temperature and DYE-3 isotope data (Fig. 3).\n"
+            "Hydroclimate in southern Greenland driven by NAO variability\n"
+            "Positive NAO phases produce wetter but colder conditions (Fig. 4).\n"
+            "Late Holocene ice accumulation and NAO reconstruction\n"
+            "The Little Ice Age accumulation history is compared with the NAO record (Fig. 5).\n"
+        )
+        nb_section = (
+            "## Nb proxy for Holocene hydroclimate\n"
+            "The niobium record tracks Holocene hydroclimate and agrees with GRIP and DYE-3."
+        )
+        deglaciation_section = (
+            "## Early Holocene deglaciation\n"
+            "The IRD layer shows that the sound became periodically ice-free."
+        )
+        nb_matches = _paper_match_source_paragraphs(nb_section, source, 0, 2)
+        deglaciation_matches = _paper_match_source_paragraphs(
+            deglaciation_section,
+            source,
+            1,
+            2,
+        )
+        self.assertEqual(
+            [paragraph["id"] for paragraph in nb_matches],
+            ["source-4"],
+        )
+        self.assertEqual(nb_matches[0]["figure_references"], [3])
+        self.assertEqual(
+            [paragraph["id"] for paragraph in deglaciation_matches],
+            ["source-2"],
+        )
+        self.assertEqual(deglaciation_matches[0]["figure_references"], [2])
+
+    def test_paper_insertion_uses_allocated_section_heading_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = []
+            for number in (1, 2, 4):
+                path = root / f"figure-{number}.png"
+                path.write_bytes(b"png")
+                images.append(
+                    {
+                        "url": f"https://example.test/{number}.png",
+                        "local_path": str(path),
+                        "image_role": "figure",
+                        "figure_number": number,
+                        "caption": f"Figure {number} caption",
+                    }
+                )
+            markdown = root / "article.md"
+            markdown.write_text(
+                "## First section\n\n"
+                "First正文段落。\n\n"
+                "> quote must remain inside the first section.\n\n"
+                "![existing placeholder](placeholder.png)\n\n"
+                "## Second section\n\n"
+                "Second正文段落。\n\n"
+                "## Third section\n\n"
+                "Third正文段落。\n",
+                encoding="utf-8",
+            )
+            allocation = {
+                "sections": [
+                    {
+                        "section_index": 0,
+                        "section": "First section",
+                        "selected_figures": ["Fig. 1"],
+                    },
+                    {
+                        # Deliberately stale indexes model an insertion offset;
+                        # section headings remain the authoritative targets.
+                        "section_index": 0,
+                        "section": "Second section",
+                        "selected_figures": ["Fig. 2"],
+                    },
+                    {
+                        "section_index": 1,
+                        "section": "Third section",
+                        "selected_figures": ["Fig. 4"],
+                    },
+                ]
+            }
+            dossier = {
+                "content_type": PAPER_CONTENT,
+                "paper_image_allocation": allocation,
+            }
+            _insert_paper_figures(
+                markdown,
+                images,
+                ["", "", ""],
+                dossier,
+            )
+            rendered = markdown.read_text(encoding="utf-8")
+            headings = [
+                "## First section",
+                "## Second section",
+                "## Third section",
+            ]
+            positions = {heading: rendered.index(heading) for heading in headings}
+            positions["END"] = len(rendered)
+            figure_positions = {
+                number: rendered.index(f"![Fig. {number}]") for number in (1, 2, 4)
+            }
+            self.assertLess(positions[headings[0]], figure_positions[1])
+            self.assertLess(figure_positions[1], positions[headings[1]])
+            self.assertLess(positions[headings[1]], figure_positions[2])
+            self.assertLess(figure_positions[2], positions[headings[2]])
+            self.assertLess(positions[headings[2]], figure_positions[4])
+            self.assertLess(figure_positions[4], positions["END"])
+            self.assertEqual(
+                allocation["final_inserted_sections"],
+                [
+                    {
+                        "figure": "Fig. 1",
+                        "section_index": 0,
+                        "section": "First section",
+                    },
+                    {
+                        "figure": "Fig. 2",
+                        "section_index": 1,
+                        "section": "Second section",
+                    },
+                    {
+                        "figure": "Fig. 4",
+                        "section_index": 2,
+                        "section": "Third section",
+                    },
+                ],
+            )
+            self.assertEqual(
+                [image["figure_number"] for image in dossier["body_images"]],
+                [1, 2, 4],
+            )
+
+    def test_paper_mapping_aggregates_major_section_without_quote_slots(self):
+        context = (
+            "## Main result\n\n"
+            "The ensemble spread tracks forecast errors in the tested region.\n\n"
+            "> “The ensemble spread tracks forecast errors in the tested region.”\n\n"
+            "A later paragraph reports the same signal across seasons.\n\n"
+            "## Mechanism\n\n"
+            "Circulation controls regional precipitation through moisture transport.\n"
+        )
+        images = [
+            {
+                "url": "https://example.test/1.png",
+                "local_path": "/tmp/1.png",
+                "image_role": "figure",
+                "figure_number": 1,
+                "caption": "Ensemble spread and forecast errors.",
+            },
+            {
+                "url": "https://example.test/2.png",
+                "local_path": "/tmp/2.png",
+                "image_role": "figure",
+                "figure_number": 2,
+                "caption": "Circulation and precipitation.",
+            },
+        ]
+        allocation = {}
+        _select_article_images(images, PAPER_CONTENT, context, allocation)
+        self.assertEqual(
+            [section["section"] for section in allocation["sections"]],
+            ["Main result", "Mechanism"],
+        )
+        self.assertEqual(
+            [section["candidates"][0]["figure"] for section in allocation["sections"]],
+            ["Fig. 1", "Fig. 2"],
+        )
 
     def test_paper_figures_match_specific_paragraphs_and_skip_unrelated_figures(self):
         with tempfile.TemporaryDirectory() as tmp:
