@@ -16,25 +16,35 @@ from settings import PROJECT_ROOT, Settings
 
 NEWS_COMMAND = re.compile(r"^/news\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
 PAPER_COMMAND = re.compile(r"^/paper\s+(\d+)(?:\s+(generate|publish))?$", re.IGNORECASE)
+PAPER_URL_COMMAND = re.compile(r"^/paperurl\s+(.+)$", re.IGNORECASE)
 URL_MESSAGE = re.compile(r"^https?://[^\s<>]+$", re.IGNORECASE)
 ACADEMIC_PATH = re.compile(
     r"/(?:doi|article|articles|paper|papers|publication|publications|abstract|abs|full-text)(?:/|$)",
     re.IGNORECASE,
 )
 NEWS_USAGE = "用法：\n/news\n/news N\n/news N generate\n/news N publish"
-PAPER_USAGE = "用法：\n/papers\n/papers next\n/paper N\n/paper N generate\n/paper N publish"
+PAPER_USAGE = (
+    "用法：\n/papers\n/papers next\n/paper N\n/paper N generate\n"
+    "/paper N publish\n/paperurl <论文URL或DOI>"
+)
 
 
-def _direct_paper_item(url: str) -> dict[str, object] | None:
-    if not URL_MESSAGE.fullmatch(url):
-        return None
-    parsed = urlsplit(url)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return None
-    doi = extract_doi(url)
-    paper_url_hint = bool(doi or ACADEMIC_PATH.search(parsed.path))
-    if not paper_url_hint:
-        return None
+def _direct_paper_item(value: str) -> dict[str, object] | None:
+    target = value.strip()
+    if URL_MESSAGE.fullmatch(target):
+        parsed = urlsplit(target)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return None
+        doi = extract_doi(target)
+        paper_url_hint = bool(doi or ACADEMIC_PATH.search(parsed.path))
+        if not paper_url_hint:
+            return None
+        url = target
+    else:
+        doi = extract_doi(target)
+        if not doi or target.rstrip(".,;)").lower() != doi:
+            return None
+        url = f"https://doi.org/{doi}"
     canonical = canonicalize_url(url)
     return {
         "source": "Direct paper URL",
@@ -104,8 +114,9 @@ class CommandHandler:
             return self.status_text()
         if lowered == "/history":
             return self.history_text()
-        if URL_MESSAGE.fullmatch(command):
-            return await self._handle_paper_url(command)
+        paper_url_match = PAPER_URL_COMMAND.fullmatch(command)
+        if paper_url_match:
+            return await self._handle_paper_url(paper_url_match.group(1))
 
         news_match = NEWS_COMMAND.fullmatch(command)
         if news_match:

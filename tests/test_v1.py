@@ -489,6 +489,9 @@ class V1Tests(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertEqual(item["doi"], "10.1029/2025gl120559")
         self.assertEqual(item["content_type"], PAPER_CONTENT)
+        doi_item = _direct_paper_item("10.1029/2025GL120559")
+        self.assertIsNotNone(doi_item)
+        self.assertEqual(doi_item["url"], "https://doi.org/10.1029/2025gl120559")
         self.assertIsNone(_direct_paper_item("https://example.com/news/story"))
 
     def test_direct_paper_url_generates_without_publish(self):
@@ -517,7 +520,7 @@ class V1Tests(unittest.TestCase):
             pipeline = FakePipeline()
             handler = CommandHandler(settings, pipeline)
             response = await handler.handle(
-                "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
+                "/paperurl https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
             )
             self.assertIn("识别到论文", response)
             self.assertIn("PAPER 推文已生成", response)
@@ -528,6 +531,12 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(call[2], PAPER_CONTENT)
             self.assertEqual(call[3]["item_override"]["doi"], "10.1029/2025gl120559")
             self.assertFalse(any("publish" in str(value) for value in call[3]))
+            self.assertIsNone(
+                await handler.handle(
+                    "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
+                )
+            )
+            self.assertIn("/paperurl <论文URL或DOI>", PAPER_USAGE)
 
         asyncio.run(check())
 
