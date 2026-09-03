@@ -58,7 +58,13 @@ from papers.pdf_figures import (
     download_pdf_with_wiley_tdm,
     extract_pdf_figures,
 )
-from publisher.wechat import _paper_draft_title, _selected_cover_path, format_markdown
+from publisher.wechat import (
+    DEFAULT_COVER,
+    _paper_cover_candidate_path,
+    _paper_draft_title,
+    _selected_cover_path,
+    format_markdown,
+)
 from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
@@ -2877,6 +2883,31 @@ class V1Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_selected_cover_path(markdown), figure)
+
+    def test_paper_first_page_is_cover_candidate_without_changing_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images = root / "images"
+            images.mkdir()
+            first_page = images / "paper-first-page.png"
+            first_page.write_bytes(b"png")
+            figure = images / "figure-03.png"
+            figure.write_bytes(b"png")
+            markdown = root / "article.md"
+            markdown.write_text("正文\n", encoding="utf-8")
+            (root / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "paper_first_page": {"local_path": str(first_page)},
+                        "body_images": [{"local_path": str(figure)}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_paper_cover_candidate_path(markdown), first_page)
+            self.assertEqual(_selected_cover_path(markdown), DEFAULT_COVER)
 
     def test_paper_formatter_removes_duplicate_h1_after_brand_header(self):
         with tempfile.TemporaryDirectory() as tmp:

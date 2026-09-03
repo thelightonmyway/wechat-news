@@ -288,6 +288,12 @@ def main():
     group.add_argument("--dir", "-d", help="format.py 的输出目录（含 article.html 和 images/）")
     group.add_argument("--input", "-i", help="Markdown 文件路径（自动调用 format.py 排版后发布）")
     parser.add_argument("--cover", "-c", help="封面图片路径")
+    parser.add_argument(
+        "--cover-candidate",
+        action="append",
+        default=[],
+        help="额外上传到永久素材库的可选封面图片路径",
+    )
     parser.add_argument("--title", "-t", help="文章标题（默认从 HTML 提取）")
     parser.add_argument("--theme", default=None,
                         help="排版主题（仅 --input 模式有效，默认读取 gallery 选中的主题）")
@@ -438,6 +444,21 @@ def main():
         print("\n错误: 微信要求必须有封面图。")
         print("  请用 --cover 指定封面图路径，或在 images/ 目录放一张图片")
         sys.exit(1)
+
+    # PAPER 的论文首页作为永久素材上传，但不替换默认封面；用户可在
+    # 微信后台从素材库手动选择它作为推文封面。
+    for candidate in args.cover_candidate:
+        candidate_path = Path(candidate)
+        if not candidate_path.is_file():
+            print(f"  ⚠️ 可选封面图不存在: {candidate}")
+            continue
+        if cover_path and candidate_path.resolve() == cover_path.resolve():
+            continue
+        candidate_media_id = upload_thumb_image(token, str(candidate_path))
+        if candidate_media_id:
+            print(f"  ✓ 可选封面素材已上传: {candidate_path.name} ({candidate_media_id[:20]}...)")
+        else:
+            print(f"  ⚠️ 可选封面素材上传失败: {candidate_path.name}")
 
     # ── 7. 推送草稿箱 ────────────────────────────────────────────────
     if args.dry_run:
