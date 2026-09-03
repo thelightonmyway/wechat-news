@@ -29,6 +29,7 @@ from news.pipeline import (
     _images_redundant,
     _insert_paper_figures,
     _paper_publication_within_window,
+    _paper_figure_reference_numbers,
     _paper_match_source_paragraphs,
     _paper_wechat_cover,
     _prepare_paper_markdown,
@@ -2523,6 +2524,19 @@ class V1Tests(unittest.TestCase):
             )["figure"],
             "Fig. 3",
         )
+
+    def test_paper_figure_reference_parser_excludes_supplementary_figures(self):
+        cases = {
+            "Fig. 4": {4},
+            "Figure 3": {3},
+            "Fig. 4 and Fig. 5": {4, 5},
+            "Fig. 4 and Supplementary Fig. 7": {4},
+            "Supplementary Fig. 7": set(),
+            "Supplementary Figs. 2–4": set(),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(_paper_figure_reference_numbers(text), expected)
 
     def test_paper_source_mapping_is_section_local(self):
         source = (

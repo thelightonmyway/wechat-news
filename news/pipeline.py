@@ -1351,12 +1351,14 @@ def _paper_body_image_order(images: list[dict[str, Any]]) -> list[int]:
 
 def _paper_figure_reference_numbers(context: str) -> set[int]:
     return {
-        int(value)
-        for value in re.findall(
-            r"\b(?:fig(?:ure)?\.?\s*)(\d+)\s*[a-z]?\b",
+        int(match.group("number"))
+        for match in re.finditer(
+            r"\b(?:(?P<supplementary>supplementary)\s+)?"
+            r"fig(?:ure)?\.?\s*(?P<number>\d+)\s*[a-z]?\b",
             context,
             re.IGNORECASE,
         )
+        if not match.group("supplementary")
     }
 
 
