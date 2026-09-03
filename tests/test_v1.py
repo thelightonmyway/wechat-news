@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pymupdf
+
 from bot.bridge import QQNewsBot
 from bot.commands import (
     CommandHandler,
@@ -611,6 +613,63 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(pipeline.calls, ["generate"])
 
         asyncio.run(check())
+
+    def test_direct_paper_generate_translates_title_before_markdown(self):
+        settings = replace(
+            load_settings(),
+            database_path=Path(tempfile.mkdtemp()) / "direct-title.db",
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        pipeline = NewsPipeline(settings)
+        captured = {}
+
+        def fake_markdown(dossier, _settings, output_dir):
+            captured["title_cn"] = dossier.get("title_cn")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            markdown_path = output_dir / "article.md"
+            metadata_path = output_dir / "metadata.json"
+            markdown_path.write_text("# 中文标题\n\n正文。\n", encoding="utf-8")
+            metadata_path.write_text("{}", encoding="utf-8")
+            return markdown_path, metadata_path
+
+        dossier = {
+            "id": 789,
+            "rank": 0,
+            "date": "2026-09-03",
+            "content_type": PAPER_CONTENT,
+            "title": "An English paper title",
+            "title_cn": "",
+            "summary": "Paper abstract",
+            "text": "Paper text",
+            "doi": "10.1029/example",
+            "url": "https://doi.org/10.1029/example",
+            "images": [],
+            "openalex": {},
+        }
+        dossier["id"] = pipeline.db.upsert_article(dossier)
+        with (
+            patch("news.pipeline.translate_paper_titles", return_value=(['中文完整标题'], True, "")),
+            patch("news.pipeline.generate_article_markdown", side_effect=fake_markdown),
+            patch("news.pipeline.download_publishable_images", return_value=[]),
+            patch("news.pipeline.generate_image_captions", return_value=[]),
+            patch("news.pipeline._select_article_images", return_value=({}, [], 0)),
+            patch("news.pipeline.discover_pdf_source", return_value={"pdf_url": ""}),
+            patch("news.pipeline._prepare_paper_markdown"),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                asyncio.run(
+                    pipeline.generate(
+                        0,
+                        "2026-09-03",
+                        PAPER_CONTENT,
+                        item_override={"paper_url_hint": True},
+                        dossier_override=dossier,
+                        output_dir=Path(tmp) / "paper",
+                    )
+                )
+        self.assertEqual(captured["title_cn"], "中文完整标题")
 
     def test_papers_stays_frozen_after_current_candidate_is_published(self):
         async def check():
@@ -1967,6 +2026,7 @@ class V1Tests(unittest.TestCase):
         self.assertIn("找不到合适原文就少引或不引", paper_prompt)
         self.assertNotIn("> 原文：", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
+        self.assertIn("独立的中文导语开场", paper_prompt)
         self.assertIn("识别论文的核心结果结构", paper_prompt)
         self.assertIn("two modes、two mechanisms、two regimes", paper_prompt)
         self.assertIn("必须分别覆盖每一个核心模态或机制", paper_prompt)
@@ -3040,15 +3100,29 @@ class V1Tests(unittest.TestCase):
         html = (
             '<p><img alt="论文第一页" src="images/paper-first-page.png" /></p>'
             '<p>摘要导语内容。</p>'
+            '<h2>第一节</h2><p>第一节正文不能进入摘要框。</p>'
             '<section data-role="img-wrapper"><p>Fig. 2 | 图注内容。</em><br />'
             '<em>图源：作者，CC BY-NC-ND</p></section>'
         )
         styled = _style_paper_intro(html)
         self.assertIn('data-role="paper-intro"', styled)
         self.assertIn("background:#f3f4f6", styled)
+        intro = styled.split('data-role="paper-intro"', 1)[1].split("</section>", 1)[0]
+        self.assertIn("摘要导语内容。", intro)
+        self.assertNotIn("第一节正文不能进入摘要框。", intro)
         cleaned = _remove_paper_figure_attributions(styled)
         self.assertIn("Fig. 2 | 图注内容。", cleaned)
         self.assertNotIn("图源：", cleaned)
+
+        quote_html = (
+            '<p><img alt="论文第一页" src="images/paper-first-page.png" /></p>'
+            '<section data-role="blockquote" style="quote-style">独立摘要。</section>'
+            '<h2>第一节</h2><p>第一节正文。</p>'
+        )
+        quote_styled = _style_paper_intro(quote_html)
+        self.assertEqual(quote_styled.count('data-role="paper-intro"'), 1)
+        self.assertNotIn('data-role="blockquote"', quote_styled)
+        self.assertIn("独立摘要。", quote_styled)
 
     def test_paper_formatter_removes_duplicate_h1_after_brand_header(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3398,6 +3472,108 @@ class V1Tests(unittest.TestCase):
             self.assertIn("Panels a-j", figures[0]["original_caption"])
             self.assertTrue(figures[0]["publishable"])
             self.assertTrue(Path(figures[0]["local_path"]).is_file())
+
+    def test_pdf_figure_mapping_merges_all_panels_for_one_figure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_download(_url, destination):
+                document = pymupdf.open()
+                page = document.new_page(width=600, height=800)
+                page.draw_rect(pymupdf.Rect(100, 100, 250, 250), color=(1, 0, 0), fill=(1, 0, 0))
+                page.draw_rect(pymupdf.Rect(300, 100, 500, 250), color=(0, 0, 1), fill=(0, 0, 1))
+                document.save(destination)
+                document.close()
+
+            def fake_layout(document, **kwargs):
+                raw_dir = Path(kwargs["image_path"])
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                for index in range(4):
+                    (raw_dir / f"{Path(document).name}-0001-0{index}.png").write_bytes(b"png")
+                return {
+                    "page_count": 1,
+                    "pages": [
+                        {
+                            "page_number": 1,
+                            "boxes": [
+                                {
+                                    "x0": 100.0,
+                                    "y0": 100.0,
+                                    "x1": 250.0,
+                                    "y1": 250.0,
+                                    "boxclass": "picture",
+                                    "image": None,
+                                    "table": None,
+                                    "textlines": [],
+                                },
+                                {
+                                    "x0": 300.0,
+                                    "y0": 100.0,
+                                    "x1": 500.0,
+                                    "y1": 250.0,
+                                    "boxclass": "picture",
+                                    "image": None,
+                                    "table": None,
+                                    "textlines": [],
+                                },
+                                {
+                                    "x0": 100.0,
+                                    "y0": 270.0,
+                                    "x1": 250.0,
+                                    "y1": 400.0,
+                                    "boxclass": "picture",
+                                    "image": None,
+                                    "table": None,
+                                    "textlines": [],
+                                },
+                                {
+                                    "x0": 300.0,
+                                    "y0": 270.0,
+                                    "x1": 500.0,
+                                    "y1": 400.0,
+                                    "boxclass": "picture",
+                                    "image": None,
+                                    "table": None,
+                                    "textlines": [],
+                                },
+                                {
+                                    "x0": 100.0,
+                                    "y0": 426.0,
+                                    "x1": 500.0,
+                                    "y1": 486.0,
+                                    "boxclass": "caption",
+                                    "image": None,
+                                    "table": None,
+                                    "textlines": [
+                                        {"spans": [{"text": "Fig. 5 | A complete two-panel result."}]}
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+
+            with (
+                patch("papers.pdf_figures._download_pdf", side_effect=fake_download),
+                patch("papers.pdf_figures.pymupdf4llm.to_json", side_effect=fake_layout),
+            ):
+                figures, metadata = extract_pdf_figures(
+                    "https://example.test/article_reference.pdf",
+                    root / "images",
+                    article_license="CC BY",
+                )
+
+            self.assertEqual(metadata["matched_figures"], 1)
+            self.assertEqual(figures[0]["figure_number"], 5)
+            self.assertEqual(len(figures[0]["picture_bboxes"]), 4)
+            self.assertEqual(figures[0]["picture_bbox"], [100.0, 100.0, 500.0, 400.0])
+            output = pymupdf.open(figures[0]["local_path"])
+            try:
+                self.assertGreater(output[0].rect.width, 390)
+                self.assertGreater(output[0].rect.height, 290)
+            finally:
+                output.close()
+            self.assertNotIn("paper-first-page-cover.png", figures[0]["local_path"])
 
     def test_paper_figure_numbers_prevent_false_deduplication(self):
         figure_one = {
@@ -4428,6 +4604,11 @@ class V1Tests(unittest.TestCase):
         self.assertTrue(used_model)
         self.assertEqual(error, "")
         self.assertEqual(titles, ["已有标题", "第二个标题", "第三个标题"])
+        title_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
+            "content"
+        ]
+        self.assertIn("适合微信公众号显示", title_prompt)
+        self.assertIn("禁止使用省略号或半截标题", title_prompt)
         payload = json.loads(
             client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         )

@@ -95,19 +95,54 @@ def _style_paper_intro(html: str) -> str:
     if first_page is None:
         return html
     tail = html[first_page.end() :]
-    paragraph = re.search(r"<p\b[^>]*>.*?</p>", tail, flags=re.IGNORECASE | re.DOTALL)
-    if paragraph is None or "<img" in paragraph.group(0).lower():
+    first_section = re.search(r"<h2\b", tail, flags=re.IGNORECASE)
+    intro_tail = tail[: first_section.start()] if first_section else tail
+    candidate = re.search(
+        r"<p\b[^>]*>.*?</p>|<section\b[^>]*data-role=[\"']blockquote[\"'][^>]*>.*?</section>",
+        intro_tail,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if candidate is None or "<img" in candidate.group(0).lower():
         return html
     intro_style = (
         "background:#f3f4f6;padding:14px 16px;margin:20px 0 28px;"
         "border-left:4px solid #cbd5e1;border-radius:6px;"
     )
-    styled = (
-        f'<section data-role="paper-intro" style="{intro_style}" '
-        'data-darkmode-bgcolor="#2a2f36">'
-        f"{paragraph.group(0)}</section>"
-    )
-    return html[: first_page.end()] + tail[: paragraph.start()] + styled + tail[paragraph.end() :]
+    candidate_html = candidate.group(0)
+    if candidate_html.lstrip().lower().startswith("<section"):
+        opening = re.match(r"<section\b[^>]*>", candidate_html, flags=re.IGNORECASE)
+        if opening is None:
+            return html
+        opening_tag = opening.group(0)
+        opening_tag = re.sub(
+            r'data-role=["\']blockquote["\']',
+            'data-role="paper-intro"',
+            opening_tag,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if "data-role=\"paper-intro\"" not in opening_tag:
+            opening_tag = opening_tag[:-1] + ' data-role="paper-intro">'
+        if re.search(r"\bstyle=[\"']", opening_tag, flags=re.IGNORECASE):
+            opening_tag = re.sub(
+                r"\bstyle=[\"'][^\"']*[\"']",
+                f'style="{intro_style}"',
+                opening_tag,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        else:
+            opening_tag = opening_tag[:-1] + f' style="{intro_style}">'
+        if "data-darkmode-bgcolor" not in opening_tag.lower():
+            opening_tag = opening_tag[:-1] + ' data-darkmode-bgcolor="#2a2f36">'
+        styled = opening_tag + candidate_html[opening.end() :]
+    else:
+        styled = (
+            f'<section data-role="paper-intro" style="{intro_style}" '
+            'data-darkmode-bgcolor="#2a2f36">'
+            f"{candidate_html}</section>"
+        )
+    return html[: first_page.end()] + tail[: candidate.start()] + styled + tail[candidate.end() :]
 
 
 def _remove_paper_figure_attributions(html: str) -> str:

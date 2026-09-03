@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
+import pymupdf
 import pymupdf4llm
 from bs4 import BeautifulSoup
 
@@ -300,6 +301,34 @@ def download_pdf_with_wiley_tdm(
     return tdm_result
 
 
+def _union_bbox(boxes: list[list[float]]) -> list[float]:
+    return [
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    ]
+
+
+def _render_pdf_figure(
+    pdf_path: Path,
+    page_number: int,
+    bbox: list[float],
+    destination: Path,
+) -> None:
+    document = pymupdf.open(pdf_path)
+    try:
+        page = document[page_number - 1]
+        pixmap = page.get_pixmap(
+            dpi=200,
+            alpha=False,
+            clip=pymupdf.Rect(*bbox),
+        )
+        pixmap.save(destination)
+    finally:
+        document.close()
+
+
 def extract_pdf_figures(
     pdf_url: str,
     output_dir: Path,
@@ -353,6 +382,8 @@ def extract_pdf_figures(
             if match:
                 anchors.append((int(match.group(1)), box_index, _bbox(box)))
 
+        groups: dict[tuple[int, int], list[tuple[int, list[float]]]] = {}
+        unassigned: list[tuple[int, list[float]]] = []
         for picture_index, picture in enumerate(boxes):
             if picture.get("boxclass") != "picture":
                 continue
@@ -374,9 +405,24 @@ def extract_pdf_figures(
             nearby = [
                 (number, anchor_index, anchor_bbox)
                 for number, anchor_index, anchor_bbox in anchors
-                if number not in used_numbers and _adjacent(picture_bbox, anchor_bbox)
+                if _adjacent(picture_bbox, anchor_bbox)
             ]
             if not nearby:
+                unassigned.append((picture_index, picture_bbox))
+                continue
+            number, anchor_index, _ = min(
+                nearby,
+                key=lambda value: sum(_axis_gap(picture_bbox, value[2])),
+            )
+            groups.setdefault((number, anchor_index), []).append((picture_index, picture_bbox))
+
+        for picture_index, picture_bbox in unassigned:
+            nearby_groups = [
+                (key, group)
+                for key, group in groups.items()
+                if _adjacent(picture_bbox, _union_bbox([bbox for _, bbox in group]))
+            ]
+            if not nearby_groups:
                 rejected.append(
                     {
                         "page": page.get("page_number"),
@@ -386,82 +432,134 @@ def extract_pdf_figures(
                     }
                 )
                 continue
-            number, anchor_index, anchor_bbox = min(
-                nearby,
-                key=lambda value: sum(_axis_gap(picture_bbox, value[2])),
-            )
-            if is_no_derivatives_license(article_license):
-                adjacent_pictures = [
-                    index
-                    for index, candidate in enumerate(boxes)
-                    if candidate.get("boxclass") == "picture"
-                    and _adjacent(_bbox(candidate), anchor_bbox)
-                ]
-                if len(adjacent_pictures) != 1:
-                    rejected.append(
-                        {
-                            "page": page.get("page_number"),
-                            "picture_box_index": picture_index,
-                            "picture_bbox": picture_bbox,
-                            "reason": (
-                                "ND figure has multiple picture regions; complete unmodified "
-                                "figure cannot be guaranteed"
-                            ),
-                        }
+            key, _ = min(
+                nearby_groups,
+                key=lambda value: sum(
+                    _axis_gap(
+                        picture_bbox,
+                        _union_bbox([bbox for _, bbox in value[1]]),
                     )
-                    continue
-            caption_indices = _caption_continuations(boxes, anchor_index, picture_index)
-            caption = " ".join(_box_text(boxes[index]) for index in caption_indices).strip()
-            if not FIGURE_NUMBER.match(caption):
-                rejected.append(
+                ),
+            )
+            groups[key].append((picture_index, picture_bbox))
+
+        for (number, anchor_index), group in sorted(
+            groups.items(),
+            key=lambda item: item[1][0][0],
+        ):
+            picture_indices = [picture_index for picture_index, _ in group]
+            picture_bboxes = [picture_bbox for _, picture_bbox in group]
+            if number in used_numbers:
+                rejected.extend(
                     {
                         "page": page.get("page_number"),
                         "picture_box_index": picture_index,
                         "picture_bbox": picture_bbox,
-                        "reason": "caption number mismatch",
+                        "reason": "duplicate Figure number",
                     }
+                    for picture_index, picture_bbox in group
+                )
+                continue
+            if is_no_derivatives_license(article_license) and len(group) != 1:
+                rejected.extend(
+                    {
+                        "page": page.get("page_number"),
+                        "picture_box_index": picture_index,
+                        "picture_bbox": picture_bbox,
+                        "reason": (
+                            "ND figure has multiple picture regions; complete unmodified "
+                            "figure cannot be guaranteed"
+                        ),
+                    }
+                    for picture_index, picture_bbox in group
                 )
                 continue
 
-            raw_path = raw_dir / f"{pdf_path.name}-{int(page['page_number']):04d}-{picture_index:02d}.png"
-            if not raw_path.is_file():
-                rejected.append(
+            picture_index = picture_indices[0]
+            caption_indices = _caption_continuations(boxes, anchor_index, picture_index)
+            caption = " ".join(_box_text(boxes[index]) for index in caption_indices).strip()
+            union_bbox = _union_bbox(picture_bboxes)
+            if not FIGURE_NUMBER.match(caption):
+                rejected.extend(
                     {
                         "page": page.get("page_number"),
-                        "picture_box_index": picture_index,
-                        "picture_bbox": picture_bbox,
-                        "reason": "PyMuPDF4LLM image output missing",
+                        "picture_box_index": current_index,
+                        "picture_bbox": current_bbox,
+                        "reason": "caption number mismatch",
                     }
+                    for current_index, current_bbox in group
                 )
                 continue
+
+            raw_paths = [
+                raw_dir / f"{pdf_path.name}-{int(page['page_number']):04d}-{current_index:02d}.png"
+                for current_index in picture_indices
+            ]
+            missing = [
+                (current_index, current_bbox)
+                for (current_index, current_bbox), raw_path in zip(group, raw_paths)
+                if not raw_path.is_file()
+            ]
+            if missing:
+                rejected.extend(
+                    {
+                        "page": page.get("page_number"),
+                        "picture_box_index": current_index,
+                        "picture_bbox": current_bbox,
+                        "reason": "PyMuPDF4LLM image output missing",
+                    }
+                    for current_index, current_bbox in missing
+                )
+                continue
+
             final_path = output_dir / f"figure-{number:02d}.png"
-            shutil.copyfile(raw_path, final_path)
+            try:
+                if len(group) == 1:
+                    shutil.copyfile(raw_paths[0], final_path)
+                else:
+                    _render_pdf_figure(
+                        pdf_path,
+                        int(page["page_number"]),
+                        union_bbox,
+                        final_path,
+                    )
+            except Exception as exc:
+                rejected.extend(
+                    {
+                        "page": page.get("page_number"),
+                        "picture_box_index": current_index,
+                        "picture_bbox": current_bbox,
+                        "reason": f"complete Figure render failed: {type(exc).__name__}: {exc}",
+                    }
+                    for current_index, current_bbox in group
+                )
+                continue
+
             credit = _credit_from_caption(caption)
-            record = apply_policy(
-                {
-                    "url": f"{pdf_url}#page={page['page_number']}&figure={number}",
-                    "source_url": pdf_url,
-                    "article_url": article_url,
-                    "local_path": str(final_path),
-                    "caption": caption,
-                    "original_caption": caption,
-                    "alt": caption,
-                    "credit": credit,
-                    "license": _canonical_license(article_license),
-                    "license_url": license_url,
-                    "provider": "PDF Figure",
-                    "image_source": "pdf_figure",
-                    "image_role": "figure",
-                    "metadata_title": f"Figure {number}",
-                    "figure_number": number,
-                    "page": int(page["page_number"]),
-                    "picture_bbox": picture_bbox,
-                    "caption_bboxes": [_bbox(boxes[index]) for index in caption_indices],
-                    "caption_boxclasses": [boxes[index].get("boxclass") for index in caption_indices],
-                },
-                allow_no_derivatives=True,
-            )
-            matched.append(record)
+            figure_metadata: dict[str, Any] = {
+                "url": f"{pdf_url}#page={page['page_number']}&figure={number}",
+                "source_url": pdf_url,
+                "article_url": article_url,
+                "local_path": str(final_path),
+                "caption": caption,
+                "original_caption": caption,
+                "alt": caption,
+                "credit": credit,
+                "license": _canonical_license(article_license),
+                "license_url": license_url,
+                "provider": "PDF Figure",
+                "image_source": "pdf_figure",
+                "image_role": "figure",
+                "metadata_title": f"Figure {number}",
+                "figure_number": number,
+                "page": int(page["page_number"]),
+                "picture_bbox": union_bbox,
+                "caption_bboxes": [_bbox(boxes[index]) for index in caption_indices],
+                "caption_boxclasses": [boxes[index].get("boxclass") for index in caption_indices],
+            }
+            if len(group) > 1:
+                figure_metadata["picture_bboxes"] = picture_bboxes
+            matched.append(apply_policy(figure_metadata, allow_no_derivatives=True))
             used_numbers.add(number)
 
     matched.sort(key=lambda image: int(image.get("figure_number") or 0))

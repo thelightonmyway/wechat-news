@@ -3136,6 +3136,22 @@ class NewsPipeline:
             raise LookupError(
                 "未获取到 DOI、论文标题或正文 metadata，无法确认这是论文链接"
             )
+        if (
+            item_override is not None
+            and dossier.get("content_type") == PAPER_CONTENT
+            and not str(dossier.get("title_cn") or "").strip()
+        ):
+            translated, _, title_error = await asyncio.to_thread(
+                translate_paper_titles,
+                [dossier],
+                self.settings,
+            )
+            title_cn = str(translated[0] if translated else "").strip()
+            if not title_cn:
+                raise RuntimeError(
+                    f"未生成中文论文标题{f': {title_error}' if title_error else ''}"
+                )
+            dossier["title_cn"] = title_cn
         output_dir = output_dir or article_output_dir(
             dossier["date"],
             rank,
