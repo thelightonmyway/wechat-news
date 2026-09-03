@@ -494,13 +494,13 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(doi_item["url"], "https://doi.org/10.1029/2025gl120559")
         self.assertIsNone(_direct_paper_item("https://example.com/news/story"))
 
-    def test_direct_paper_url_generates_without_publish(self):
+    def test_direct_paper_url_generates_then_publishes(self):
         class FakePipeline:
             def __init__(self):
                 self.calls = []
 
             async def generate(self, rank, date=None, content_type=None, **kwargs):
-                self.calls.append((rank, date, content_type, kwargs))
+                self.calls.append(("generate", rank, date, content_type, kwargs))
                 return {
                     "dossier": {
                         "id": 123,
@@ -519,24 +519,96 @@ class V1Tests(unittest.TestCase):
             )
             pipeline = FakePipeline()
             handler = CommandHandler(settings, pipeline)
+
+            async def fake_publish(generated, **kwargs):
+                pipeline.calls.append(("publish", generated, kwargs))
+                return "已生成并发布到微信草稿箱"
+
+            handler._publish_generated_paper = fake_publish
             response = await handler.handle(
                 "/paperurl https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
             )
             self.assertIn("识别到论文", response)
-            self.assertIn("PAPER 推文已生成", response)
-            self.assertIn("ID：123", response)
-            self.assertEqual(len(pipeline.calls), 1)
-            call = pipeline.calls[0]
-            self.assertEqual(call[0], 0)
-            self.assertEqual(call[2], PAPER_CONTENT)
-            self.assertEqual(call[3]["item_override"]["doi"], "10.1029/2025gl120559")
-            self.assertFalse(any("publish" in str(value) for value in call[3]))
+            self.assertIn("已生成并发布到微信草稿箱", response)
+            self.assertEqual([call[0] for call in pipeline.calls], ["generate", "publish"])
+            generate_call = pipeline.calls[0]
+            self.assertEqual(generate_call[1], 0)
+            self.assertEqual(generate_call[3], PAPER_CONTENT)
+            self.assertEqual(
+                generate_call[4]["item_override"]["doi"], "10.1029/2025gl120559"
+            )
+            self.assertFalse(any("publish" in str(value) for value in generate_call[4]))
             self.assertIsNone(
                 await handler.handle(
                     "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
                 )
             )
             self.assertIn("/paperurl <论文URL或DOI>", PAPER_USAGE)
+
+        asyncio.run(check())
+
+    def test_paper_publish_generates_before_publish(self):
+        class FakeDB:
+            def get_candidate(self, date, rank, content_type):
+                return {"title": "Candidate", "url": "https://example.com/paper"}
+
+        class FakePipeline:
+            def __init__(self):
+                self.calls = []
+                self.db = FakeDB()
+
+            async def generate(self, rank, date=None, content_type=None):
+                self.calls.append("generate")
+                return {"dossier": {"id": 456}, "markdown_path": Path("/tmp/paper.md")}
+
+        async def check():
+            settings = replace(
+                load_settings(),
+                model_base_url="https://model.example/v1",
+                model_api_key="test-key",
+                model_name="test-model",
+            )
+            pipeline = FakePipeline()
+            handler = CommandHandler(settings, pipeline)
+
+            async def fake_publish(generated, **kwargs):
+                pipeline.calls.append("publish")
+                return "published"
+
+            handler._publish_generated_paper = fake_publish
+            self.assertEqual(await handler.handle("/paper 1 publish"), "published")
+            self.assertEqual(pipeline.calls, ["generate", "publish"])
+
+        asyncio.run(check())
+
+    def test_paper_publish_generate_failure_skips_publish(self):
+        class FakePipeline:
+            def __init__(self):
+                self.calls = []
+                self.db = SimpleNamespace()
+
+            async def generate(self, rank, date=None, content_type=None):
+                self.calls.append("generate")
+                raise RuntimeError("generation failed")
+
+        async def check():
+            settings = replace(
+                load_settings(),
+                model_base_url="https://model.example/v1",
+                model_api_key="test-key",
+                model_name="test-model",
+            )
+            pipeline = FakePipeline()
+            handler = CommandHandler(settings, pipeline)
+
+            async def fake_publish(generated, **kwargs):
+                pipeline.calls.append("publish")
+                return "published"
+
+            handler._publish_generated_paper = fake_publish
+            response = await handler.handle("/paper 1 publish")
+            self.assertIn("PAPER generate 失败，未调用 publish", response)
+            self.assertEqual(pipeline.calls, ["generate"])
 
         asyncio.run(check())
 

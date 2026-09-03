@@ -177,12 +177,78 @@ class CommandHandler:
             or item.get("doi")
             or "未发现"
         )
-        article_id = dossier.get("id") or "未知"
+        try:
+            publish_response = await self._publish_generated_paper(
+                generated,
+                fallback_title=title,
+                source_url=url,
+            )
+        except Exception as exc:
+            publish_response = f"已生成 PAPER，但发布到微信草稿箱失败：{type(exc).__name__}: {exc}"
         return (
             f"识别到论文：\n《{title}》\n期刊：{journal}\nDOI：{doi}\n\n"
             "正在生成 PAPER 推文……\n\n"
-            f"PAPER 推文已生成\nID：{article_id}\n标题：{title}"
+            f"{publish_response}"
         )
+
+    async def _publish_generated_paper(
+        self,
+        generated: dict,
+        *,
+        fallback_title: str = "科研解读",
+        source_url: str = "",
+    ) -> str:
+        dossier = generated.get("dossier") or {}
+        markdown_path = Path(str(generated.get("markdown_path") or ""))
+        try:
+            article_id = int(dossier["id"])
+            result = await asyncio.to_thread(
+                create_draft,
+                markdown_path,
+                self.settings,
+                title=str(
+                    dossier.get("title_cn")
+                    or dossier.get("title")
+                    or fallback_title
+                ),
+                source_url=str(dossier.get("url") or source_url),
+            )
+            self.pipeline.db.save_publish_history(
+                article_id,
+                result["status"],
+                result.get("draft_media_id", ""),
+                result.get("error", ""),
+            )
+            images = self.pipeline.db.get_images(article_id)
+            paper_image_summary = _paper_image_summary(markdown_path, images)
+            word_count = len(markdown_path.read_text(encoding="utf-8"))
+            title = str(
+                dossier.get("title_cn")
+                or dossier.get("title")
+                or fallback_title
+            )
+            if result["status"] == "dry_run":
+                return (
+                    f"PAPER 已生成（微信发布 dry-run）\n标题：{title}\n"
+                    f"字数：{word_count}\n{paper_image_summary}\n"
+                    f"HTML：{result['article_html']}\n"
+                    "Blocker：未配置微信公众号凭据，未创建草稿。"
+                )
+            return (
+                f"已生成并发布到微信草稿箱\n标题：{title}\n"
+                f"字数：{word_count}\n{paper_image_summary}\n"
+                f"草稿 media_id：{result['draft_media_id']}"
+            )
+        except Exception as exc:
+            try:
+                self.pipeline.db.save_publish_history(
+                    int(dossier["id"]),
+                    "failed",
+                    error=f"{type(exc).__name__}: {exc}"[:2000],
+                )
+            except Exception:
+                pass
+            raise
 
     async def _handle_candidate(
         self,
@@ -207,6 +273,31 @@ class CommandHandler:
                 content_type,
             )
             return f"已生成：{generated['markdown_path']}"
+        if action == "publish" and content_type == PAPER_CONTENT:
+            if not self.settings.model_configured:
+                return "未配置 MODEL_BASE_URL / MODEL_API_KEY / MODEL_NAME，未调用模型。"
+            try:
+                generated = await self.pipeline.generate(
+                    rank,
+                    date,
+                    content_type,
+                )
+            except Exception as exc:
+                return f"PAPER generate 失败，未调用 publish：{type(exc).__name__}: {exc}"
+            candidate = self.pipeline.db.get_candidate(date, rank, content_type)
+            fallback_title = str(
+                (candidate or {}).get("title_cn")
+                or (candidate or {}).get("title")
+                or "科研解读"
+            )
+            try:
+                return await self._publish_generated_paper(
+                    generated,
+                    fallback_title=fallback_title,
+                    source_url=str((candidate or {}).get("url") or ""),
+                )
+            except Exception as exc:
+                return f"已生成 PAPER，但发布到微信草稿箱失败：{type(exc).__name__}: {exc}"
 
         candidate = self.pipeline.db.get_candidate(date, rank, content_type)
         list_command = "/papers" if content_type == PAPER_CONTENT else "/news"
