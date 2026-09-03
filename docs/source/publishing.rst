@@ -32,10 +32,12 @@ images for NEWS content.
 PAPER drafts
 ------------
 
-A PAPER draft can use journal metadata in the draft title, removes the first Markdown heading from
+A PAPER draft uses the complete Chinese paper title with a journal prefix and removes the first Markdown heading from
 the formatted body, and can include up to four selected paper images. When a source PDF was
-available and its first page was rendered, the first page is placed at the start of the article
-and its cropped version is preferred as the WeChat cover.
+available and its first page was rendered, the paper first page is placed at the start of the
+article and used as the WeChat cover. The body keeps an independent gray summary/lead box after the
+first page, verified English excerpts, and normal Figure captions. Multi-panel PDF Figures are kept
+as complete Figures rather than reduced to one panel.
 
 Cover fallback
 --------------

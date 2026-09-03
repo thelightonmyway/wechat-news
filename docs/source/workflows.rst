@@ -28,7 +28,7 @@ PAPER workflow
 
 .. code-block:: text
 
-   paper discovery
+   paper discovery or direct URL/DOI
    → DOI and OpenAlex metadata verification
    → publisher or open-access article content
    → paper images, PDF figures, and first page when available
@@ -44,14 +44,16 @@ For content and images, the workflow tries the resolved publisher page first. Wh
 it can try an open-access HTML location from existing metadata, preferring PubMed Central when
 available. If no legally usable HTML image is available, generation can look for a formal or
 reference PDF and use PyMuPDF4LLM to extract numbered figures. A downloaded PDF can also provide
-the rendered first page and WeChat cover crop.
+the rendered first page and a separate cover asset when available.
 
 Manual control
 --------------
 
-Scheduled jobs deliver candidate lists. Users still choose a candidate and explicitly run
-``generate`` and ``publish``. The scheduler does not generate articles, create drafts, or publish
-final posts automatically.
+Scheduled jobs deliver candidate lists. For NEWS, users still run ``generate`` before ``publish``.
+For PAPER, ``/paper N publish`` runs generation and then creates the draft; ``/paper N generate``
+remains available as a standalone generation or debugging entry point. A direct
+``/paperurl <URL或DOI>`` request follows the same generate-then-draft flow. The scheduler does not
+generate articles, create drafts, or publish final posts automatically.
 
 Current limitations
 -------------------

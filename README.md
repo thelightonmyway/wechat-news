@@ -34,6 +34,40 @@ The included default sources and topic filters currently focus on scientific con
 - Scheduled candidate delivery
 - WeChat Official Account draft creation
 
+### PAPER workflow
+
+`/paperurl <URL或DOI>` runs the direct PAPER workflow:
+
+```text
+paper URL or DOI
+→ paper identification
+→ metadata, full text, Figures, and paper first-page retrieval
+→ Chinese PAPER article generation
+→ WeChat Official Account draft creation
+```
+
+It reuses the multi-source PAPER pipeline and is supported for currently handled sources such as
+Wiley/AGU and Nature. It is not hard-coded for a single publisher. For ranked candidates,
+`/paper N publish` follows the same generate-then-draft sequence.
+
+PAPER writing is high-information-density Chinese scientific interpretation. It prioritizes the
+research question, core results, mechanisms, and significance; identifies and separately covers
+multiple modes, mechanisms, or regimes when they form the paper's core structure; and avoids
+literal translation, rigid background-method-result-significance templates, repetitive summaries,
+mechanical transitions, empty conclusions, and formulaic AI phrasing. It does not add mechanisms
+or conclusions that are unsupported by the source paper.
+
+PAPER Figures are allocated with awareness of the full article and its sections, rather than by
+simply taking the first four candidates. Source paragraphs, explicit Figure references, and caption
+semantics guide matching, and Figures are inserted into their corresponding sections. Supplementary
+Figures are kept out of main-Figure mapping. Up to four body Figures are used, including complete
+PDF-extracted multi-panel Figures with their normal captions.
+
+PAPER WeChat drafts use the complete Chinese paper title with the journal prefix, the paper first
+page as the article cover, the existing brand header at the top of the body, and an independent gray
+summary/lead box after the first page. Verified English excerpts, Figure captions, and WeChat HTML
+formatting are handled by the existing pipeline.
+
 ## QQ Commands
 
 | Command | Description |
@@ -46,7 +80,8 @@ The included default sources and topic filters currently focus on scientific con
 | `/papers` | Retrieve or display today's PAPER candidates |
 | `/paper N` | Show paper metadata and image information for candidate `N` |
 | `/paper N generate` | Generate an interpretation article for PAPER candidate `N` |
-| `/paper N publish` | Format the generated PAPER article and create a WeChat draft |
+| `/paper N publish` | Generate PAPER candidate `N`, then create a WeChat draft |
+| `/paperurl <URL或DOI>` | Identify a paper, generate its PAPER article, and create a WeChat draft |
 | `/status` | Show candidate, integration, delivery, and recent-error status |
 | `/history` | Show recent generated, drafted, and failed records |
 

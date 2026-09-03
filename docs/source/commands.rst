@@ -29,7 +29,9 @@ Command overview
    * - ``/paper N generate``
      - Generate an interpretation article for PAPER candidate ``N``.
    * - ``/paper N publish``
-     - Format the already generated PAPER article and create a WeChat draft.
+     - Generate PAPER candidate ``N`` and then create a WeChat draft.
+   * - ``/paperurl <URL或DOI>``
+     - Identify a paper, generate its PAPER article, and create a WeChat draft.
    * - ``/status``
      - Show candidate counts, recent collection state, scheduled delivery state, integration
        configuration, and the most recent error.
@@ -41,11 +43,15 @@ Command rules
 
 * ``N`` is the rank shown in the current candidate list.
 * ``generate`` requires ``MODEL_BASE_URL``, ``MODEL_API_KEY``, and ``MODEL_NAME``.
-* ``publish`` never runs ``generate`` implicitly. Generate the selected article first.
+* For PAPER, ``/paper N publish`` runs ``generate`` first and creates the draft only after generation
+  succeeds. ``/paper N generate`` remains available as a standalone generation/debug entry point.
+* ``/paperurl <URL或DOI>`` performs the same generate-then-draft flow for a direct paper request.
+* NEWS ``publish`` still expects the selected NEWS article to have been generated first.
 * If WeChat credentials are missing, ``publish`` performs a formatting dry-run and returns the
   generated HTML path.
 * A successful ``publish`` command creates a draft only. It does not publish the final post.
-* The current code does not implement a ``next`` command.
+* ``/papers next`` requests another PAPER candidate batch while preserving the current list if the
+  refresh fails.
 
 Examples
 --------
@@ -63,4 +69,5 @@ Examples
    /paper 1
    /paper 1 generate
    /paper 1 publish
+   /paperurl 10.1029/2025GL120559
    /history
