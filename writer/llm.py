@@ -566,26 +566,25 @@ PAPER_STYLE_EXAMPLE = (
 
 
 PAPER_EDITORIAL_GUIDE = (
-    "表达编辑规则（共10条，全部服从Abstract、原文证据和section scope约束）："
-    "1. 以Abstract决定全文科学主线，按已知到新信息推进；每个段落只解决一个主要科学问题。"
-    "2. 把每个section标题当作严格科学边界，把每项核心结果、数字、机制和解释放在唯一的主要归属section。"
-    "3. 不预告或提前带入下一section的核心证据；过渡只能连接主题，不能携带新的数字、相关系数、归因结果或机制。"
-    "4. 原样保护科学事实、数字、百分比、相关系数、趋势方向、时间范围、变量关系和限定条件。"
-    "5. 区分事实、结果、解释和推断，让结论强度与证据强度匹配；不把相关写成因果。"
-    "6. 不把可能、提示、表明或暗示强化成证明、确定或必然，不增加原文没有的机制、分类、案例或意义。"
-    "7. 使用自然、直接、主谓清楚的中文，保留必要术语；避免逐句翻译、英文式长句和刻板的固定模板。"
-    "8. 删除明显AI套话、机械过渡、重复总结和没有信息增益的句子，不为每段强行添加升华或结论。"
-    "9. 保持自然的信息密度和句式节奏，不要求所有section或段落使用相同长度、结构或语气。"
-    "10. 不写营销口号、夸张比喻或个人经历；每句话都必须服务于科学主线、证据或必要解释。"
+    "中文科研表达编辑规则（仅作保守润色，服从Abstract、原文证据和section scope约束）："
+    "1. 保留科学术语、数字、百分比、统计值、趋势方向和限定条件，不为追求自然而改写事实。"
+    "2. 不增加原文没有的信息、机制、分类、案例或意义，优先删除冗余而不是装饰性扩写。"
+    "3. 区分事实、结果、解释和推断，让表述强度与证据强度匹配；correlation不写成causation。"
+    "4. 不把suggest、indicate、可能或表明强化成prove、确定或必然。"
+    "5. 使用自然、克制、直接的中文，保留必要术语，避免逐句翻译和明显英文翻译腔。"
+    "6. 删除模板化连接词、AI套话、空泛意义拔高和重复总结，但不牺牲必要的科学限定。"
+    "7. 减少重复句式和无信息增益的句子，让每句话服务于科学主线、证据或必要解释。"
+    "8. 不使用营销口号、夸张比喻或个人经历，不为了‘人味’改变科学论证。"
+    "9. 保持段落主线和整体连贯性，不把细碎写作清单凌驾于科学内容之上。"
 )
 
 
 PAPER_STYLE_GUIDE = (
     "根据提供的论文metadata、原始abstract和正文材料，写一篇正文主体优先约650到800个中文字符的中文论文解读。"
     "这是硬性篇幅要求：标题、英文摘录、图片图注和文章信息不计入正文主体；返回前必须把正文主体压缩到650到800个中文字以内。"
-    "这是短篇高信息密度解读，不要扩写成长篇综述；通常设置3到4个主要小节，每个小节约110到160个中文字，任何小节不得超过180字。每个小节只写紧凑的核心内容，不要把未来意义、限制和背景重复堆在最后一节。"
+    "这是短篇高信息密度解读，不要扩写成长篇综述；小节数量和长度跟随论文实际科学结构，不规定固定数量或固定段落模板。每个小节只写紧凑的核心内容，不要把未来意义、限制和背景重复堆在最后一节。"
     "摘要和正文导语必须优先忠实翻译输入的原始abstract：短摘要基本完整翻译，长摘要只可删除次要细节，不得增加abstract没有的结论、分类、机制或表述，也不得自行重组科学结论；中文应自然但保持原意。若abstract为空或不可用，才可用paper_text写出有据可查的简短fallback导语。"
-    "先以原始abstract的核心结果结构作为全文最高优先级提纲，正文必须覆盖abstract明确写出的主要发现；Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。"
+    "在写正文前，在本次生成内部静默建立section evidence plan：先以原始abstract的核心结果结构确定全文主线，再从Results、paper_text和source paragraphs为每个section分配主题、核心finding及evidence；每个finding只归属于一个主要section。正文必须覆盖abstract明确写出的主要发现，Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。不要输出这个plan。"
     "只有当abstract明确写出two modes、first mode/second mode、two regimes、two mechanisms或同等清楚的两部分结构时，才分别覆盖对应部分并避免遗漏；如果abstract没有明确这种结构，绝对不要自行创造第一模态、第二模态、第一类、第二类或其他类似分类。"
     "对于abstract明确的每个核心mode、mechanism或regime，使用Results或paper_text补充原文支持的空间或对象特征、主要驱动因子和关键物理机制及数据；材料没有明确支持的内容不要补写。方法性能和归因统计（如重建相关系数、特征贡献或典型相关）必须集中在明确对应的方法或归因section，不要放入只描述现象或物理过程的前一section。不要因篇幅删除与当前section核心结论直接对应的关键数值或相关系数；完整覆盖核心结果优先于机械保持固定section数量，section标题和正文组织应跟随论文实际科学主线，不套固定模板。"
     "优先保留研究问题、核心结果、关键机制和研究意义，主动删去冗余背景、重复解释、低价值细节和不影响结论的过程描述。"
@@ -605,7 +604,7 @@ PAPER_STYLE_GUIDE = (
     "引用可以自然嵌在相关中文段落之间，引用后可以直接继续正常叙述，不强制另写解释句，也不要大段复制论文。"
     "结构采用一段独立的中文导语开场，必须在第一个##小节之前概括全文核心发现；导语不是第一个小节的正文，不能把小节首段当作摘要。"
     "然后围绕关键发现或机制设置3到4个有信息量的小标题。"
-    "Treat each section heading as a strict scientific scope boundary. Before drafting, silently build a section-to-claim map and assign each quantitative result, correlation, attribution result, mechanism, and core conclusion to one primary section, then state it only there. Preserve core quantitative evidence such as reported correlations and percentages, but place each item only in its primary section. Do not preview or import results whose primary role belongs to the following section, even as supporting evidence for an earlier mechanism. Transitional sentences may introduce the next topic, but must not contain new core findings from that topic."
+    "Treat each section heading as a strict scientific scope boundary and follow the section evidence plan: state each assigned finding and its evidence only in its primary section. Preserve core quantitative evidence there, but do not preview or import a following section's result, correlation, attribution, mechanism, or core conclusion into an earlier section. Transitional sentences may introduce the next topic without revealing its core evidence."
     "不要固定写成‘研究背景/研究方法/研究结果/研究意义’，不要在正文重复标题或文章信息。"
     "Markdown首行仍必须以‘# ’加用户数据中的display_title字段原文，之后不得再次重复标题。"
     "不要创建来源、参考文献或文章信息栏目，不要自行插入图片；图片、图注和文章信息由现有pipeline处理。"
