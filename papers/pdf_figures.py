@@ -310,6 +310,21 @@ def _union_bbox(boxes: list[list[float]]) -> list[float]:
     ]
 
 
+def _expanded_crop_rect(bbox: list[float], page_rect: pymupdf.Rect) -> pymupdf.Rect:
+    width = max(0.0, bbox[2] - bbox[0])
+    height = max(0.0, bbox[3] - bbox[1])
+    left = max(10.0, width * 0.03)
+    right = max(10.0, width * 0.03)
+    top = max(24.0, height * 0.10)
+    bottom = max(14.0, height * 0.05)
+    return pymupdf.Rect(
+        max(page_rect.x0, bbox[0] - left),
+        max(page_rect.y0, bbox[1] - top),
+        min(page_rect.x1, bbox[2] + right),
+        min(page_rect.y1, bbox[3] + bottom),
+    )
+
+
 def _render_pdf_figure(
     pdf_path: Path,
     page_number: int,
@@ -319,10 +334,11 @@ def _render_pdf_figure(
     document = pymupdf.open(pdf_path)
     try:
         page = document[page_number - 1]
+        crop_rect = _expanded_crop_rect(bbox, page.rect)
         pixmap = page.get_pixmap(
             dpi=200,
             alpha=False,
-            clip=pymupdf.Rect(*bbox),
+            clip=crop_rect,
         )
         pixmap.save(destination)
     finally:

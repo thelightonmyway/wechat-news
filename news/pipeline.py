@@ -3232,6 +3232,31 @@ class NewsPipeline:
                         f"{type(exc).__name__}: {exc}"[:1000]
                     )
                     self.logger.warning("PDF Figure fallback failed: %s", exc)
+        if dossier.get("content_type") == PAPER_CONTENT:
+            preselection_images = [
+                image
+                for image in dossier.get("images") or []
+                if image.get("publishable")
+                and image.get("local_path")
+                and Path(str(image["local_path"])).is_file()
+            ]
+            preselection_context = " ".join(
+                [
+                    str(dossier.get("title") or ""),
+                    str(dossier.get("summary") or ""),
+                    str((dossier.get("openalex") or {}).get("abstract") or ""),
+                    *[
+                        str(image.get("caption") or image.get("description") or "")
+                        for image in preselection_images
+                    ],
+                ]
+            )
+            _, selected_body_images, _ = _select_article_images(
+                preselection_images,
+                PAPER_CONTENT,
+                preselection_context,
+            )
+            dossier["paper_selected_body_images"] = selected_body_images
         if dossier.get("content_type") == POPULAR_CONTENT:
             try:
                 keywords = await asyncio.to_thread(
@@ -3371,8 +3396,26 @@ class NewsPipeline:
             else ""
         )
         paper_image_allocation: dict[str, Any] = {}
+        allocation_input_images = legal_images
+        if dossier.get("content_type") == PAPER_CONTENT and isinstance(
+            dossier.get("paper_selected_body_images"), list
+        ):
+            selected_labels = {
+                _paper_image_label(image)
+                for image in dossier.get("paper_selected_body_images") or []
+            }
+            selected_urls = {
+                str(image.get("url") or "")
+                for image in dossier.get("paper_selected_body_images") or []
+            }
+            allocation_input_images = [
+                image
+                for image in legal_images
+                if _paper_image_label(image) in selected_labels
+                or str(image.get("url") or "") in selected_urls
+            ]
         cover_image, body_images, redundant_count = _select_article_images(
-            legal_images,
+            allocation_input_images,
             str(dossier.get("content_type") or POPULAR_CONTENT),
             selection_context,
             paper_image_allocation if dossier.get("content_type") == PAPER_CONTENT else None,

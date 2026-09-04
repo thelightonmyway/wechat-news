@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -62,6 +63,7 @@ from papers.openalex import (
 )
 from papers.pdf_figures import (
     _download_pdf,
+    _expanded_crop_rect,
     discover_pdf_source,
     download_pdf_with_wiley_tdm,
     extract_pdf_figures,
@@ -82,6 +84,7 @@ from writer.llm import (
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_figure_evidence_bundles,
     prune_paper_sections_after_allocation,
     _normalize_article_markdown,
     _paper_revision,
@@ -92,6 +95,7 @@ from writer.llm import (
     generate_image_search_keywords,
     select_paper_top_ten,
     select_top_ten,
+    translate_paper_abstract,
     translate_paper_titles,
 )
 
@@ -2015,14 +2019,130 @@ class V1Tests(unittest.TestCase):
         }
         self.assertIn('"role":"attribution"', PAPER_PLANNER_PROMPT)
         self.assertIn("title必须是适合中文成稿的简洁中文小标题", PAPER_PLANNER_PROMPT)
-        self.assertIn("是不同科学问题且各有独立核心证据，必须优先拆开", PAPER_PLANNER_PROMPT)
-        self.assertIn("不要为凑3到4节而合并attribution与future projection", PAPER_PLANNER_PROMPT)
-        self.assertIn("所有R/r相关系数、百分比归因", PAPER_PLANNER_PROMPT)
-        self.assertIn("mechanism section只写物理过程和定性响应", PAPER_PLANNER_PROMPT)
-        self.assertIn("SSP情景、时间段和未来离散度应放入独立projection section", PAPER_PLANNER_PROMPT)
+        self.assertIn("各有独立Figure bundle证据", PAPER_PLANNER_PROMPT)
+        self.assertIn("不要为凑section数量而合并不相关Figure", PAPER_PLANNER_PROMPT)
+        self.assertIn("每个Figure bundle的核心finding只能进入包含该Figure的section", PAPER_PLANNER_PROMPT)
+        self.assertIn("无独立主图的机制内容只能作为最相关Figure section中的2到3句解释", PAPER_PLANNER_PROMPT)
+        self.assertIn("projection", PAPER_PLANNER_PROMPT)
         synthetic_text = json.dumps(synthetic_input, ensure_ascii=False).lower()
         self.assertIn("attribution", synthetic_text)
         self.assertIn("projection", synthetic_text)
+
+    def test_paper_figure_first_writers_receive_only_current_bundles(self):
+        planner = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "机器学习重构",
+                                        "role": "attribution",
+                                        "figure_ids": ["Fig. 2"],
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "figure_ids": ["Fig. 2"], "evidence": "重构", "anchors": ["R = 0.71"]}],
+                                    },
+                                    {
+                                        "id": "section-2",
+                                        "title": "森林相关",
+                                        "role": "attribution",
+                                        "figure_ids": ["Fig. 3"],
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E2", "figure_ids": ["Fig. 3"], "evidence": "森林相关", "anchors": ["R = −0.77"]}],
+                                    },
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        responses = [
+            planner,
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": "摘要翻译"}, ensure_ascii=False))) ]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "机器学习重构R = 0.71。"}, ensure_ascii=False))) ]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "森林相关R = −0.77。"}, ensure_ascii=False))) ]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"status": "pass", "corrections": []}, ensure_ascii=False))) ]),
+        ]
+        images = [
+            {"figure_number": 2, "caption": "Figure 2. XGBoost reconstruction R = 0.71."},
+            {"figure_number": 3, "caption": "Figure 3. Forest correlation R = −0.77."},
+        ]
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        client = MagicMock()
+        client.chat.completions.create.side_effect = responses
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_editorial_rewrite", return_value=["机器学习重构R = 0.71。", "森林相关R = −0.77。"]
+        ):
+            path, _ = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "Results refer to Figure 2 and Figure 3.",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": images,
+                    "paper_selected_body_images": images,
+                },
+                settings,
+                Path(tmp) / "paper",
+            )
+            calls = client.chat.completions.create.call_args_list
+            final_text = path.read_text(encoding="utf-8")
+        first_writer = json.loads(calls[2].kwargs["messages"][1]["content"])
+        second_writer = json.loads(calls[3].kwargs["messages"][1]["content"])
+        self.assertEqual([bundle["figure_id"] for bundle in first_writer["figure_evidence_bundles"]], ["Fig. 2"])
+        self.assertEqual([bundle["figure_id"] for bundle in second_writer["figure_evidence_bundles"]], ["Fig. 3"])
+        self.assertNotIn("R = −0.77", json.dumps(first_writer, ensure_ascii=False))
+        self.assertIn("R = 0.71", final_text)
+
+    def test_paper_figure_evidence_bundle_binds_anchor_to_figure(self):
+        bundles = [
+            {
+                "figure_id": "Fig. 2",
+                "caption": "XGBoost reconstruction, R = 0.71.",
+                "source_paragraphs": [],
+                "quantitative_anchors": ["R = 0.71"],
+            },
+            {
+                "figure_id": "Fig. 3",
+                "caption": "Forest correlation, R = −0.77.",
+                "source_paragraphs": [],
+                "quantitative_anchors": ["R = −0.77"],
+            },
+        ]
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "机器学习重构",
+                    "figure_ids": ["Fig. 2"],
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E1", "figure_ids": ["Fig. 2"], "evidence": "重构", "anchors": []}],
+                },
+                {
+                    "id": "section-2",
+                    "title": "森林相关",
+                    "figure_ids": ["Fig. 3"],
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E2", "figure_ids": ["Fig. 3"], "evidence": "错误串位", "anchors": ["R = 0.71"]}],
+                },
+            ]
+        }
+        markdown = "# 标题\n\n## 机器学习重构\n\n重构结果。\n\n## 森林相关\n\nR = 0.71。"
+        with self.assertRaisesRegex(RuntimeError, "PAPER evidence figure mismatch"):
+            _validate_paper_evidence_plan(plan, markdown, {"source-0"}, bundles)
+
+    def test_paper_figure_bundle_contains_caption_and_source_links(self):
+        images = [{"figure_number": 2, "caption": "Figure 2. XGBoost reconstruction R = 0.71."}]
+        source_paragraphs = [{"id": "source-0", "text": "Results refer to Figure 2 and report R = 0.71."}]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        self.assertEqual(bundles[0]["figure_id"], "Fig. 2")
+        self.assertEqual(bundles[0]["explicit_source_paragraph_ids"], ["source-0"])
+        self.assertIn("R = 0.71", bundles[0]["quantitative_anchors"])
 
     def test_paper_pruning_uses_actual_allocation_and_reviewer_decision(self):
         plan = {
@@ -2230,6 +2350,27 @@ class V1Tests(unittest.TestCase):
             final_text = path.read_text(encoding="utf-8")
         self.assertEqual(editor.call_count, 2)
         self.assertNotIn("并非A而是B", final_text)
+
+    def test_paper_abstract_compression_targets_mobile_length(self):
+        long_translation = "研究问题聚焦中国近地面风速模式差异。" + "结果显示森林覆盖变化是主要驱动因素，并解释不同模式的风速趋势差异。" * 8
+        compressed = (
+            "研究问题聚焦中国近地面风速模式差异。"
+            "结果显示森林覆盖变化是主要驱动因素，并解释不同模式的风速趋势差异。"
+            "森林损失较大的模式风速下降较弱，森林变化约占模式间差异的74%。"
+            "约束森林覆盖变化有助于降低未来风速预测不确定性，并为改进相关预测提供依据。"
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": long_translation}, ensure_ascii=False))) ]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": compressed}, ensure_ascii=False))) ]),
+        ]
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        with patch("writer.llm.OpenAI", return_value=client):
+            result = translate_paper_abstract("Original abstract", settings)
+        self.assertLessEqual(len(result), 180)
+        self.assertGreaterEqual(len(result), 120)
+        self.assertLessEqual(len(re.findall(r"[。！？]", result)), 4)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
 
     def test_paper_scientific_review_triggers_one_structured_revision(self):
         plan = {
@@ -2486,7 +2627,7 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(len(calls), 7)
             self.assertIn("Scientific Planner", calls[0].kwargs["messages"][0]["content"])
             abstract_prompt = calls[1].kwargs["messages"][0]["content"]
-            self.assertIn("约200到300个汉字", abstract_prompt)
+            self.assertIn("120到180个汉字", abstract_prompt)
             reviewer_prompt = calls[5].kwargs["messages"][0]["content"]
             editor_prompt = calls[6].kwargs["messages"][0]["content"]
             section_payloads = [json.loads(calls[index].kwargs["messages"][1]["content"]) for index in (2, 3, 4)]
@@ -3871,6 +4012,14 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(client.get.call_count, 2)
         sleep.assert_called_once_with(1)
 
+    def test_pdf_figure_crop_padding_is_clamped_to_page_bounds(self):
+        rect = _expanded_crop_rect([2.0, 3.0, 120.0, 140.0], pymupdf.Rect(0.0, 0.0, 130.0, 150.0))
+        self.assertGreater(rect.y1 - rect.y0, 137.0)
+        self.assertGreaterEqual(rect.x0, 0.0)
+        self.assertGreaterEqual(rect.y0, 0.0)
+        self.assertLessEqual(rect.x1, 130.0)
+        self.assertLessEqual(rect.y1, 150.0)
+
     def test_pdf_figure_mapping_uses_number_and_adjacent_text_boxes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4053,7 +4202,7 @@ class V1Tests(unittest.TestCase):
             output = pymupdf.open(figures[0]["local_path"])
             try:
                 self.assertGreater(output[0].rect.width, 390)
-                self.assertGreater(output[0].rect.height, 290)
+                self.assertGreater(output[0].rect.height, 320)
             finally:
                 output.close()
             self.assertNotIn("paper-first-page-cover.png", figures[0]["local_path"])

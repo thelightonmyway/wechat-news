@@ -47,6 +47,87 @@ def _paper_source_paragraph_records(source_text: str) -> list[dict[str, Any]]:
     ]
 
 
+def _paper_figure_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d+", text):
+        return f"Fig. {int(text)}"
+    match = re.search(r"(?:Fig(?:ure)?\.?|图)\s*(\d+)", text, re.IGNORECASE)
+    return f"Fig. {int(match.group(1))}" if match else text
+
+
+def _paper_figure_numbers_in_text(text: str) -> set[int]:
+    numbers: set[int] = set()
+    for match in re.finditer(r"(?<!supplementary\s)(?:fig(?:ure)?\.?|图)\s*(\d+)", text, re.IGNORECASE):
+        numbers.add(int(match.group(1)))
+    return numbers
+
+
+def _paper_quantitative_anchors(text: str) -> list[str]:
+    patterns = (
+        r"[Rr]\s*=\s*[−-]?\s*\d+(?:\.\d+)?",
+        r"\d+(?:\.\d+)?\s*%",
+        r"SSP\s*\d+(?:[-‐–]\d+(?:\.\d+)?)?",
+        r"\d{4}\s*[‐–-]\s*\d{4}",
+    )
+    anchors: list[str] = []
+    for pattern in patterns:
+        anchors.extend(match.group(0).strip() for match in re.finditer(pattern, text, re.IGNORECASE))
+    return list(dict.fromkeys(anchors))
+
+
+def _paper_figure_evidence_bundles(
+    selected_images: list[dict[str, Any]],
+    source_paragraphs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    bundles: list[dict[str, Any]] = []
+    for index, image in enumerate(selected_images, start=1):
+        figure_id = _paper_figure_id(image.get("figure_number") or image.get("metadata_title") or index)
+        caption = str(image.get("caption") or image.get("original_caption") or image.get("alt") or "").strip()
+        figure_number_match = re.search(r"(\d+)", figure_id)
+        figure_number = int(figure_number_match.group(1)) if figure_number_match else index
+        caption_ids = [
+            str(record["id"])
+            for record in source_paragraphs
+            if str(record.get("id") or "").startswith("source-figure-")
+            and figure_number in _paper_figure_numbers_in_text(str(record.get("text") or ""))
+        ]
+        explicit_ids = [
+            str(record["id"])
+            for record in source_paragraphs
+            if not str(record.get("id") or "").startswith("source-figure-")
+            and figure_number in _paper_figure_numbers_in_text(str(record.get("text") or ""))
+        ]
+        direct_ids = list(dict.fromkeys([*caption_ids, *explicit_ids]))
+        evidence_items = [
+            str(record.get("text") or "")
+            for record in source_paragraphs
+            if str(record.get("id") or "") in direct_ids
+        ]
+        evidence_text = " ".join([caption, *evidence_items])
+        bundles.append(
+            {
+                "figure_id": figure_id,
+                "caption": caption,
+                "explicit_source_paragraph_ids": explicit_ids,
+                "directly_associated_source_paragraph_ids": direct_ids,
+                "source_paragraphs": [
+                    {"id": str(record.get("id") or ""), "text": str(record.get("text") or "")[:1200]}
+                    for record in source_paragraphs
+                    if str(record.get("id") or "") in direct_ids
+                ],
+                "findings": [
+                    {
+                        "id": f"{figure_id}-caption",
+                        "evidence": caption or figure_id,
+                        "quantitative_anchors": _paper_quantitative_anchors(evidence_text),
+                    }
+                ],
+                "quantitative_anchors": _paper_quantitative_anchors(evidence_text),
+            }
+        )
+    return bundles
+
+
 def _extract_paper_evidence_plan(markdown: str) -> tuple[dict[str, Any], str]:
     match = re.search(
         r"<!--\s*PAPER_EVIDENCE_PLAN\s*(\{.*?\})\s*-->",
@@ -86,11 +167,17 @@ def _validate_paper_evidence_plan(
     plan: dict[str, Any],
     markdown: str,
     valid_source_paragraph_ids: set[str] | None = None,
+    figure_evidence_bundles: list[dict[str, Any]] | None = None,
 ) -> None:
     sections = _paper_body_sections(markdown)
     planned_sections = plan.get("sections") or []
     if not sections or not planned_sections:
         raise RuntimeError("PAPER evidence plan validation failed: no body sections")
+    bundles_by_id = {
+        _paper_figure_id(bundle.get("figure_id")): bundle
+        for bundle in (figure_evidence_bundles or [])
+        if isinstance(bundle, dict) and bundle.get("figure_id")
+    }
     for planned_index, section in enumerate(planned_sections):
         if not isinstance(section, dict):
             raise RuntimeError("PAPER evidence plan validation failed: invalid section")
@@ -108,12 +195,34 @@ def _validate_paper_evidence_plan(
                     "PAPER evidence plan validation failed: unknown source paragraph ids: "
                     + ", ".join(sorted(unknown_ids))
                 )
+        section_figure_ids = [
+            _paper_figure_id(value)
+            for value in (section.get("figure_ids") or section.get("selected_body_figures") or [])
+            if str(value).strip()
+        ]
+        if bundles_by_id and not section_figure_ids:
+            raise RuntimeError("PAPER evidence plan validation failed: section has no figure bundle")
+        unknown_figures = set(section_figure_ids) - set(bundles_by_id)
+        if unknown_figures:
+            raise RuntimeError(
+                "PAPER evidence plan validation failed: unknown figure bundle: "
+                + ", ".join(sorted(unknown_figures))
+            )
         findings = section.get("findings") or []
         if not isinstance(findings, list):
             raise RuntimeError("PAPER evidence plan validation failed: invalid findings")
         for finding in findings:
             if not isinstance(finding, dict):
                 continue
+            finding_figure_ids = [
+                _paper_figure_id(value)
+                for value in (finding.get("figure_ids") or section_figure_ids)
+                if str(value).strip()
+            ]
+            if bundles_by_id and not finding_figure_ids:
+                raise RuntimeError("PAPER evidence plan validation failed: finding has no figure bundle")
+            if bundles_by_id and not set(finding_figure_ids).issubset(set(section_figure_ids)):
+                raise RuntimeError("PAPER evidence plan validation failed: finding figure mismatch")
             anchors = finding.get("anchors") or []
             if not isinstance(anchors, list):
                 continue
@@ -123,6 +232,31 @@ def _validate_paper_evidence_plan(
                     r"[Pp][<>=]\d+(?:\.\d+)?", normalized_anchor
                 ):
                     continue
+                if bundles_by_id:
+                    bundle_text = _normalize_evidence_anchor(
+                        " ".join(
+                            [
+                                str(bundles_by_id[figure_id].get("caption") or "")
+                                for figure_id in finding_figure_ids
+                            ]
+                            + [
+                                str(record.get("text") or "")
+                                for figure_id in finding_figure_ids
+                                for record in bundles_by_id[figure_id].get("source_paragraphs", [])
+                            ]
+                            + [
+                                str(anchor_value)
+                                for figure_id in finding_figure_ids
+                                for anchor_value in bundles_by_id[figure_id].get("quantitative_anchors", [])
+                            ]
+                        )
+                    )
+                    if normalized_anchor not in bundle_text:
+                        raise RuntimeError(
+                            "PAPER evidence figure mismatch: "
+                            f"evidence={anchor!r}; section={section.get('title')!r}; "
+                            f"figures={finding_figure_ids!r}"
+                        )
                 actual_indexes = [
                     index
                     for index, (_, body) in enumerate(sections)
@@ -143,6 +277,7 @@ def _validate_paper_evidence_plan(
 def _validate_paper_plan_structure(
     plan: dict[str, Any],
     valid_source_paragraph_ids: set[str],
+    selected_figure_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     sections = plan.get("sections")
     if not isinstance(sections, list) or not sections:
@@ -163,11 +298,29 @@ def _validate_paper_plan_structure(
             raise RuntimeError("PAPER scientific planner returned invalid source paragraph ids")
         if not all(isinstance(source_id, str) and source_id in valid_source_paragraph_ids for source_id in source_ids):
             raise RuntimeError("PAPER scientific planner returned unknown source paragraph ids")
+        figure_ids = [
+            _paper_figure_id(value)
+            for value in (section.get("figure_ids") or section.get("selected_body_figures") or [])
+            if str(value).strip()
+        ]
+        if selected_figure_ids is not None:
+            if not figure_ids or not set(figure_ids).issubset(selected_figure_ids):
+                raise RuntimeError("PAPER scientific planner returned an invalid figure mapping")
+            section["figure_ids"] = figure_ids
         if not isinstance(findings, list) or not findings:
             raise RuntimeError("PAPER scientific planner returned a section without findings")
         for finding in findings:
             if not isinstance(finding, dict) or not str(finding.get("evidence") or "").strip():
                 raise RuntimeError("PAPER scientific planner returned an invalid finding")
+            finding_figure_ids = [
+                _paper_figure_id(value)
+                for value in (finding.get("figure_ids") or finding.get("figures") or figure_ids)
+                if str(value).strip()
+            ]
+            if selected_figure_ids is not None:
+                if not finding_figure_ids or not set(finding_figure_ids).issubset(set(figure_ids)):
+                    raise RuntimeError("PAPER scientific planner returned an unbound finding")
+                finding["figure_ids"] = finding_figure_ids
             anchors = finding.get(
                 "anchors",
                 finding.get("quantitative_anchors", finding.get("quantitative anchors", [])),
@@ -427,6 +580,8 @@ def _paper_plan(
     paper_text: str,
     source_paragraphs: list[dict[str, Any]],
     metadata: dict[str, Any],
+    selected_figure_ids: list[str] | None = None,
+    figure_evidence_bundles: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return _paper_completion_json(
         client,
@@ -436,6 +591,8 @@ def _paper_plan(
             "paper_text": paper_text,
             "source_paragraphs": source_paragraphs,
             "metadata": metadata,
+            "selected_body_figures": selected_figure_ids or [],
+            "figure_evidence_bundles": figure_evidence_bundles or [],
             "_model": metadata["model"],
             "_temperature": 0.1,
         },
@@ -458,13 +615,24 @@ def _paper_write_section(
     abstract: str,
     section: dict[str, Any],
     source_paragraphs: list[dict[str, Any]],
+    figure_evidence_bundles: list[dict[str, Any]],
     model: str,
 ) -> str:
     source_ids = set(section["source_paragraph_ids"])
     section_sources = [record for record in source_paragraphs if record["id"] in source_ids]
+    section_figure_ids = {
+        _paper_figure_id(value)
+        for value in section.get("figure_ids") or section.get("selected_body_figures") or []
+    }
+    section_bundles = [
+        bundle
+        for bundle in figure_evidence_bundles
+        if _paper_figure_id(bundle.get("figure_id")) in section_figure_ids
+    ]
     payload = {
         "abstract": abstract,
         "section": section,
+        "figure_evidence_bundles": section_bundles,
         "source_paragraphs": section_sources,
     }
     response = _paper_completion_with_retry(
@@ -519,6 +687,7 @@ def _paper_review(
             "abstract": abstract,
             "paper_text": paper_text,
             "source_paragraphs": source_paragraphs,
+            "figure_evidence_bundles": plan.get("figure_evidence_bundles", []),
             "paper_evidence_plan": plan,
             "draft": draft,
             "_model": model,
@@ -947,8 +1116,8 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
                 "role": "system",
                 "content": (
                     "你是中文科技论文摘要翻译编辑。只根据用户提供的原始Abstract做忠实、自然的中文翻译。"
-                    "短Abstract基本完整翻译；长Abstract只能删除次要方法细节、重复背景和低优先级结果，不能增加原文没有的结论、分类、机制或表述，也不能自行重组科学结论。"
-                    "中文结果优先控制在约200到300个汉字，但不得机械截断；若忠实表达需要更长，优先保留研究问题和2到3个核心结论。不要添加小标题、列表或解释，只返回严格JSON："
+                    "短Abstract基本完整翻译；长Abstract只能删除一般背景、方法细节、正文会展开的次要数字和重复机制，不能增加原文没有的结论、分类、机制或表述，也不能改变科学结论顺序。"
+                    "中文结果必须控制在120到180个汉字、最多3到4句；不得机械截断，优先保留研究问题、最核心2到3个结果和主要意义。不要添加小标题、列表或解释，只返回严格JSON："
                     '{"abstract_cn":"..."}'
                 ),
             },
@@ -959,6 +1128,24 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
     translated = re.sub(r"\s+", " ", str(parsed.get("abstract_cn") or "")).strip()
     if not translated:
         raise RuntimeError("model returned empty Chinese Abstract translation")
+    for _ in range(2):
+        if len(translated) <= 180:
+            break
+        compressed = _paper_completion_json(
+            client,
+            "你是中文科研摘要压缩编辑。只压缩给出的中文Abstract，不增加事实，不改变方向、数字、因果强度和限定条件。"
+            "保留研究问题、最核心2到3个结果和主要意义，删除一般背景、方法细节、次要数字和重复机制。"
+            "输出120到180个汉字、最多4句的连续中文摘要，只返回严格JSON：{\"abstract_cn\":\"...\"}",
+            {
+                "abstract_cn": translated,
+                "_model": settings.model_name,
+                "_temperature": 0.1,
+            },
+        )
+        candidate = re.sub(r"\s+", " ", str(compressed.get("abstract_cn") or "")).strip()
+        if not candidate:
+            break
+        translated = candidate
     return translated
 
 
@@ -1236,22 +1423,24 @@ PAPER_STYLE_GUIDE = (
 )
 
 PAPER_PLANNER_PROMPT = (
-    "你是Scientific Planner，不写文章正文。根据原始Abstract、paper_text、source_paragraphs和metadata，"
-    "建立唯一的paper_evidence_plan，并只返回严格JSON对象。Abstract决定全文主线，Results和source paragraphs只补充证据。"
-    "每个section包含id、title、role、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、evidence、quantitative anchors。"
-    "可以记录Figure作为证据来源，但不要让planner预测的figure_ids决定section是否存活；无图section是否保留由后续Scientific Reviewer基于Abstract、evidence plan和前后section判断。"
+    "你是Figure-first Scientific Planner，不写文章正文。根据Abstract、paper_text、source_paragraphs、selected_body_figures和figure_evidence_bundles，"
+    "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；不要自行猜测Figure归属。"
+    "每个section包含id、title、role、figure_ids、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、figure_ids、evidence、anchors。"
+    "每个section至少包含一个selected Figure，每个finding必须明确绑定一个或多个当前section的figure_ids；一个section可以包含多张高度相关Figure。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
-    "是不同科学问题且各有独立核心证据，必须优先拆开；不要为凑3到4节而合并attribution与future projection，也不要固定section数量。"
+    "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
-    "XGBoost、SHAP、CCA、所有R/r相关系数、百分比归因和历史模式离散度等统计/归因证据必须放入attribution或明确的统计结果section；mechanism section只写物理过程和定性响应，不承载R/r或百分比统计anchor。SSP情景、时间段和未来离散度应放入独立projection section。不要在不同role重复同一核心finding或anchor。"
+    "每个Figure bundle的核心finding只能进入包含该Figure的section；Figure 只可通过bundle中的caption、明确引用段落和直接关联Results段落支持正文。不要把Fig.2的R=0.71写入只包含Fig.3的section。"
+    "无独立主图的机制内容只能作为最相关Figure section中的2到3句解释，不要新建无图机制section；只有删除会造成明显科学逻辑断裂时才保留无图短过渡。"
     "role使用贴合论文的简洁自然标签，不要套固定taxonomy。source_paragraph_ids只能使用输入中真实存在的source id。"
-    "每个finding都要有anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
-    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","source_paragraph_ids":["source-0"],"findings":[{"id":"E1","evidence":"...","anchors":["R = 0.71"]}]}]}'
+    "每个finding都要有figure_ids和anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
+    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"source_paragraph_ids":["source-0"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence":"...","anchors":["R = 0.71"]}]}]}'
 )
 
 PAPER_REVIEWER_PROMPT = (
     "你是Scientific Reviewer，只审核科学准确性和section结构，不润色文风，不重写全文。忠实翻译的Abstract导语应保持原始Abstract的结论和因果强度，不要要求改写原文已有表述；只检查导语是否新增或强化了Abstract没有的内容。"
     "只检查：evidence是否错section、数字或统计量是否错误、原文没有的机制、correlation到causation的强化、Abstract核心结果遗漏、attribution/mechanism/projection混用、finding重复或科学关系错误。"
+    "还必须核对Figure对应关系：每个核心claim是否属于当前section包含的Figure bundle，数字/统计量是否来自对应Figure的caption或source evidence，是否把Fig.2的结果写入只包含Fig.3的section，以及section标题与其Figure科学内容是否明显不匹配。"
     "不要因句式、节奏、中文措辞、AI-like phrasing或其他纯文风偏好fail；这些交给Chinese Editorial Rewrite和AI-style lint。"
     "每个问题必须包含section、evidence、issue、correction四个字段；correction只能修复该问题，不能移动无关证据。返回严格JSON："
     '{"status":"pass"|"needs_revision","corrections":[{"section":"section-1","evidence":"...","issue":"...","correction":"..."}]}'
@@ -1370,12 +1559,26 @@ def _generate_paper_article_markdown(
                 {"id": f"source-figure-{index}", "text": caption[:1200]}
             )
     valid_source_ids = {str(record["id"]) for record in source_paragraphs}
+    figure_first = isinstance(dossier.get("paper_selected_body_images"), list)
+    selected_images = (
+        list(dossier.get("paper_selected_body_images") or [])
+        if figure_first
+        else list(dossier.get("images") or [])
+    )
+    figure_evidence_bundles = _paper_figure_evidence_bundles(
+        selected_images,
+        source_paragraphs,
+    )
+    selected_figure_ids = [str(bundle["figure_id"]) for bundle in figure_evidence_bundles]
+    dossier["paper_figure_evidence_bundles"] = figure_evidence_bundles
     metadata = {
         "title": dossier.get("title", ""),
         "display_title": display_title,
         "doi": dossier.get("doi", ""),
         "journal": dossier.get("journal", ""),
         "authors": dossier.get("authors", []),
+        "selected_body_figures": selected_figure_ids,
+        "figure_evidence_bundles": figure_evidence_bundles,
         "figure_captions": [
             {
                 "caption": image.get("caption", ""),
@@ -1392,11 +1595,24 @@ def _generate_paper_article_markdown(
         timeout=180.0,
         max_retries=2,
     )
-    plan = _paper_plan(client, abstract, paper_text, source_paragraphs, metadata)
-    plan["sections"] = _validate_paper_plan_structure(plan, valid_source_ids)
+    plan = _paper_plan(
+        client,
+        abstract,
+        paper_text,
+        source_paragraphs,
+        metadata,
+        selected_figure_ids,
+        figure_evidence_bundles,
+    )
+    plan["sections"] = _validate_paper_plan_structure(
+        plan,
+        valid_source_ids,
+        set(selected_figure_ids) if figure_first else None,
+    )
     for section in plan["sections"]:
         section.pop("necessary_transition", None)
         section.pop("transition_reason", None)
+    plan["figure_evidence_bundles"] = figure_evidence_bundles
     plan["planner_sections"] = [dict(section) for section in plan["sections"]]
     abstract_lead = translate_paper_abstract(abstract, settings) if abstract else ""
 
@@ -1410,6 +1626,7 @@ def _generate_paper_article_markdown(
                     abstract,
                     section,
                     source_paragraphs,
+                    figure_evidence_bundles,
                     settings.model_name,
                 ),
             }
@@ -1501,7 +1718,12 @@ def _generate_paper_article_markdown(
     markdown = _normalize_article_markdown(markdown, display_title)
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
-    _validate_paper_evidence_plan(plan, markdown, valid_source_ids)
+    _validate_paper_evidence_plan(
+        plan,
+        markdown,
+        valid_source_ids,
+        figure_evidence_bundles if figure_first else None,
+    )
     dossier["paper_evidence_plan"] = plan
     return _write_article_files(dossier, settings, output_dir, markdown, plan)
 
