@@ -36,6 +36,7 @@ from writer.llm import (
     generate_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
+    prune_paper_sections_after_allocation,
     select_paper_top_ten,
     select_top_ten,
     translate_paper_titles,
@@ -3389,6 +3390,13 @@ class NewsPipeline:
         dossier["generated_body_image_captions"] = body_image_captions
         if dossier.get("content_type") == PAPER_CONTENT:
             dossier["paper_image_allocation"] = paper_image_allocation
+            await asyncio.to_thread(
+                prune_paper_sections_after_allocation,
+                markdown_path,
+                dossier,
+                paper_image_allocation,
+                self.settings,
+            )
         if dossier.get("content_type") == PAPER_CONTENT and body_images:
             body_image_captions = _insert_paper_figures(
                 markdown_path,

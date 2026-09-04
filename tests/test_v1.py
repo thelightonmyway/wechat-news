@@ -82,7 +82,7 @@ from writer.llm import (
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
-    _paper_prune_plan_sections,
+    prune_paper_sections_after_allocation,
     _normalize_article_markdown,
     _paper_revision,
     _paper_review,
@@ -2024,7 +2024,7 @@ class V1Tests(unittest.TestCase):
         self.assertIn("attribution", synthetic_text)
         self.assertIn("projection", synthetic_text)
 
-    def test_paper_pruning_drops_unfigured_nontransition_sections(self):
+    def test_paper_pruning_uses_actual_allocation_and_reviewer_decision(self):
         plan = {
             "sections": [
                 {
@@ -2043,41 +2043,110 @@ class V1Tests(unittest.TestCase):
                 },
             ]
         }
-        pruned = _paper_prune_plan_sections(
-            plan,
-            [{"image_role": "figure", "figure_number": 1, "publishable": True}],
+        allocation = {
+            "sections": [
+                {"section_index": 0, "section": "主图结果", "selected_figures": ["Fig. 1"]},
+                {"section_index": 1, "section": "悬空补充", "selected_figures": []},
+            ]
+        }
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"decisions": [{"section_id": "section-2", "action": "prune", "reason": "不承载不可替代的核心证据"}]},
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
         )
-        self.assertEqual([section["id"] for section in pruned["sections"]], ["section-1"])
-        self.assertEqual(pruned["pruned_sections"][0]["prune_reason"], "no selected body figure and not a necessary transition")
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=MagicMock()) as openai:
+            client = openai.return_value
+            client.chat.completions.create.return_value = response
+            markdown_path = Path(tmp) / "article.md"
+            markdown_path.write_text("# 标题\n\n摘要。\n\n## 主图结果\n\n结果正文。\n\n## 悬空补充\n\n补充正文。\n", encoding="utf-8")
+            dossier = {"abstract": "摘要。", "text": "source", "images": [], "paper_evidence_plan": plan}
+            prune_paper_sections_after_allocation(markdown_path, dossier, allocation, settings)
+            final_markdown = markdown_path.read_text(encoding="utf-8")
 
-    def test_paper_pruning_keeps_explicit_necessary_transition(self):
+        self.assertEqual([section["id"] for section in plan["sections"]], ["section-1"])
+        self.assertEqual(plan["pruned_sections"][0]["id"], "section-2")
+        self.assertNotIn("## 悬空补充", final_markdown)
+        self.assertEqual(allocation["sections"][0]["selected_figures"], ["Fig. 1"])
+
+    def test_paper_pruning_keeps_reviewer_selected_bridge_without_figure(self):
         plan = {
             "sections": [
                 {
                     "id": "section-1",
-                    "title": "主图结果",
-                    "role": "phenomenon",
-                    "source_paragraph_ids": ["source-figure-1"],
-                    "findings": [{"id": "E1", "evidence": "主图结果", "anchors": []}],
-                },
-                {
-                    "id": "section-2",
                     "title": "必要桥梁",
                     "role": "transition",
                     "source_paragraph_ids": ["source-0"],
-                    "necessary_transition": True,
-                    "transition_reason": "required transition from X to Y",
-                    "findings": [{"id": "E2", "evidence": "桥梁", "anchors": []}],
-                },
+                    "necessary_transition": False,
+                    "findings": [{"id": "E1", "evidence": "桥梁", "anchors": []}],
+                }
             ]
         }
-        pruned = _paper_prune_plan_sections(
-            plan,
-            [{"image_role": "figure", "figure_number": 1, "publishable": True}],
+        allocation = {"sections": [{"section_index": 0, "section": "必要桥梁", "selected_figures": []}]}
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"decisions": [{"section_id": "section-1", "action": "keep", "reason": "连接两个不可替代的科学结果"}]}, ensure_ascii=False)
+                    )
+                )
+            ]
         )
-        self.assertEqual([section["id"] for section in pruned["sections"]], ["section-1", "section-2"])
-        self.assertTrue(pruned["sections"][1]["retained_without_figure"])
-        self.assertEqual(pruned["sections"][1]["retention_reason"], "required transition from X to Y")
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=MagicMock()) as openai:
+            openai.return_value.chat.completions.create.return_value = response
+            markdown_path = Path(tmp) / "article.md"
+            markdown_path.write_text("# 标题\n\n摘要。\n\n## 必要桥梁\n\n桥梁正文。\n", encoding="utf-8")
+            dossier = {"abstract": "摘要。", "text": "source", "images": [], "paper_evidence_plan": plan}
+            prune_paper_sections_after_allocation(markdown_path, dossier, allocation, settings)
+            final_markdown = markdown_path.read_text(encoding="utf-8")
+
+        self.assertTrue(plan["sections"][0]["retained_without_figure"])
+        self.assertEqual(plan["sections"][0]["retention_reason"], "连接两个不可替代的科学结果")
+        self.assertEqual(allocation["sections"][0]["selected_figures"], [])
+
+    def test_paper_pruning_falls_back_when_all_sections_would_be_removed(self):
+        plan = {
+            "sections": [
+                {"id": "section-1", "title": "结果一", "role": "result", "source_paragraph_ids": ["source-0"], "findings": []},
+                {"id": "section-2", "title": "结果二", "role": "result", "source_paragraph_ids": ["source-0"], "findings": []},
+            ]
+        }
+        allocation = {
+            "sections": [
+                {"section_index": 0, "section": "结果一", "selected_figures": []},
+                {"section_index": 1, "section": "结果二", "selected_figures": []},
+            ]
+        }
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"decisions": [{"section_id": "section-1", "action": "prune", "reason": "弱"}, {"section_id": "section-2", "action": "prune", "reason": "弱"}]}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=MagicMock()) as openai:
+            openai.return_value.chat.completions.create.return_value = response
+            markdown_path = Path(tmp) / "article.md"
+            markdown_path.write_text("# 标题\n\n摘要。\n\n## 结果一\n\n正文一。\n\n## 结果二\n\n正文二。\n", encoding="utf-8")
+            dossier = {"abstract": "摘要。", "text": "source", "images": [], "paper_evidence_plan": plan}
+            prune_paper_sections_after_allocation(markdown_path, dossier, allocation, settings)
+            final_markdown = markdown_path.read_text(encoding="utf-8")
+
+        self.assertEqual(plan["pruning_fallback_reason"], "all sections would be removed")
+        self.assertEqual([section["id"] for section in plan["sections"]], ["section-1", "section-2"])
+        self.assertIn("## 结果一", final_markdown)
+        self.assertIn("## 结果二", final_markdown)
 
     def test_paper_ai_style_lint_detects_repeated_connectives(self):
         markdown = "并非A而是B。并非C而是D。进一步表明结果稳定。进一步表明趋势一致。"
@@ -2184,6 +2253,7 @@ class V1Tests(unittest.TestCase):
                                 "corrections": [
                                     {
                                         "section_id": "section-1",
+                                        "evidence": "74%",
                                         "issue": "数字缺少归属",
                                         "instruction": "明确74%是模式间差异的归因比例",
                                     }
@@ -2231,6 +2301,67 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(reviewed["status"], "needs_revision")
         self.assertEqual(bodies, ["森林变化约解释74%的模式差异。"])
         self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    def test_paper_scientific_review_allows_three_bounded_cycles(self):
+        planner = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "归因",
+                                        "role": "attribution",
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "evidence": "结果", "anchors": []}],
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        abstract = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": "摘要翻译"}, ensure_ascii=False)))]
+        )
+        writer = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "初稿正文。"}, ensure_ascii=False)))]
+        )
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [planner, abstract, writer]
+        reviews = [
+            {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题一", "correction": "修正一"}]},
+            {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题二", "correction": "修正二"}]},
+            {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题三", "correction": "修正三"}]},
+            {"status": "pass", "corrections": []},
+        ]
+        revisions = [["第一次修正。"], ["第二次修正。"], ["第三次修正。"]]
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_review", side_effect=reviews
+        ) as review, patch("writer.llm._paper_revision", side_effect=revisions) as revision, patch(
+            "writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]
+        ):
+            path, _ = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "source",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": [],
+                },
+                settings,
+                Path(tmp) / "paper",
+            )
+            final_text = path.read_text(encoding="utf-8")
+        self.assertEqual(review.call_count, 4)
+        self.assertEqual(revision.call_count, 3)
+        self.assertIn("最终正文。", final_text)
 
     def test_paper_staged_pipeline_isolated_and_reviewed(self):
         settings = replace(
@@ -2391,6 +2522,10 @@ class V1Tests(unittest.TestCase):
 
         self.assertIn("只返回严格JSON对象", calls[0].kwargs["messages"][0]["content"])
         self.assertIn("只审核科学准确性和section结构", reviewer_prompt)
+        self.assertIn('"section":"section-1"', reviewer_prompt)
+        self.assertIn('"evidence":"..."', reviewer_prompt)
+        self.assertIn('"correction":"..."', reviewer_prompt)
+        self.assertIn("不要因句式、节奏、中文措辞", reviewer_prompt)
         self.assertIn("只优化中文自然度", editor_prompt)
         self.assertIn("中文科研表达编辑规则（仅作保守润色", editor_prompt)
         self.assertIn("约1000到2000中文字", news_prompt)

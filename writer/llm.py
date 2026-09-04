@@ -186,83 +186,193 @@ def _validate_paper_plan_structure(
     return validated
 
 
-def _paper_prune_plan_sections(
-    plan: dict[str, Any],
-    images: list[dict[str, Any]],
+PAPER_UNFIGURED_REVIEW_PROMPT = (
+    "你是Scientific Section Reviewer，只判断没有selected正文主图的候选section是否必须保留。"
+    "不要评价中文文风，不要重写正文，也不要因为结构完整而保留弱内容。只有删除后会让相邻主图之间科学逻辑跳跃，"
+    "或该section承载不可替代的核心科学结论时才keep，并给出简短reason；否则prune。返回严格JSON："
+    '{"decisions":[{"section_id":"section-1","action":"keep"|"prune","reason":"..."}]}'
+)
+
+
+def _paper_remove_sections(markdown: str, keep_titles: set[str]) -> str:
+    lines = markdown.splitlines()
+    matches = list(
+        enumerate(lines)
+    )
+    heading_positions = [
+        index for index, line in matches if re.match(r"^##\s+", line.strip())
+    ]
+    if not heading_positions:
+        return markdown
+    output = lines[: heading_positions[0]]
+    for position, start in enumerate(heading_positions):
+        end = heading_positions[position + 1] if position + 1 < len(heading_positions) else len(lines)
+        title = re.sub(r"^##\s+", "", lines[start].strip()).strip()
+        if title in keep_titles or title in {"文章信息", "参考文献", "来源"}:
+            output.extend(lines[start:end])
+    return "\n".join(output).strip()
+
+
+def prune_paper_sections_after_allocation(
+    markdown_path: Path,
+    dossier: dict[str, Any],
+    allocation: dict[str, Any],
+    settings: Settings,
 ) -> dict[str, Any]:
-    sections = list(plan.get("sections") or [])
-    if not sections:
-        raise RuntimeError("PAPER scientific planner returned no sections")
-    numbered_images: dict[int, dict[str, Any]] = {}
-    for index, image in enumerate(images, start=1):
-        try:
-            figure_number = int(image.get("figure_number"))
-        except (TypeError, ValueError):
-            continue
-        if figure_number > 0 and image.get("publishable", True) is not False:
-            numbered_images[index] = image
-    referenced_indexes: list[int] = []
-    section_figure_indexes: dict[str, list[int]] = {}
-    for section in sections:
-        section_id = str(section.get("id") or "")
-        indexes: list[int] = []
-        for source_id in section.get("source_paragraph_ids") or []:
-            match = re.fullmatch(r"source-figure-(\d+)", str(source_id))
-            if match is None:
-                continue
-            image_index = int(match.group(1))
-            if image_index in numbered_images and image_index not in indexes:
-                indexes.append(image_index)
-        for figure_label in section.get("figure_ids") or section.get("selected_body_figures") or []:
-            match = re.search(r"(?:Fig(?:ure)?\.?)\s*(\d+)", str(figure_label), re.IGNORECASE)
-            if match is None:
-                continue
-            figure_number = int(match.group(1))
-            image_index = next(
-                (
-                    index
-                    for index, image in numbered_images.items()
-                    if int(image.get("figure_number") or 0) == figure_number
-                ),
-                None,
+    plan = dossier.get("paper_evidence_plan")
+    if not isinstance(plan, dict) or not isinstance(plan.get("sections"), list):
+        return {"pruned": [], "retained_without_figure": []}
+    sections = list(plan["sections"])
+    planner_sections = [dict(section) for section in sections]
+    allocation_sections = allocation.get("sections")
+    if not isinstance(allocation_sections, list) or len(allocation_sections) != len(sections):
+        plan["planner_sections"] = [dict(section) for section in sections]
+        plan["pruning_fallback_reason"] = "allocation section mapping unavailable"
+        dossier["paper_evidence_plan"] = plan
+        return {"pruned": [], "retained_without_figure": []}
+
+    body_sections = _paper_body_sections(markdown_path.read_text(encoding="utf-8"))
+    if len(body_sections) != len(sections):
+        plan["planner_sections"] = planner_sections
+        plan["pruning_fallback_reason"] = "markdown section mapping unavailable"
+        dossier["paper_evidence_plan"] = plan
+        return {"pruned": [], "retained_without_figure": []}
+    unfigured: list[dict[str, Any]] = []
+    selected_by_index: dict[int, list[str]] = {}
+    for index, record in enumerate(allocation_sections):
+        selected = [str(value) for value in record.get("selected_figures") or []]
+        selected_by_index[index] = selected
+        if not selected:
+            previous = (
+                {
+                    "title": sections[index - 1].get("title", ""),
+                    "body": body_sections[index - 1][1],
+                }
+                if index > 0
+                else {}
             )
-            if image_index is not None and image_index not in indexes:
-                indexes.append(image_index)
-        for image_index in indexes:
-            if image_index not in referenced_indexes:
-                referenced_indexes.append(image_index)
-        section_figure_indexes[section_id] = indexes
-    selected_indexes = set(referenced_indexes if len(referenced_indexes) <= 4 else referenced_indexes[:4])
-    retained: list[dict[str, Any]] = []
-    pruned: list[dict[str, Any]] = []
-    for section in sections:
+            following = (
+                {
+                    "title": sections[index + 1].get("title", ""),
+                    "body": body_sections[index + 1][1],
+                }
+                if index + 1 < len(sections)
+                else {}
+            )
+            unfigured.append(
+                {
+                    "section_id": sections[index].get("id", ""),
+                    "title": sections[index].get("title", ""),
+                    "role": sections[index].get("role", ""),
+                    "body": body_sections[index][1],
+                    "previous_section": previous,
+                    "next_section": following,
+                }
+            )
+
+    decisions: dict[str, dict[str, str]] = {}
+    if unfigured:
+        abstract = str(
+            dossier.get("abstract")
+            or (dossier.get("openalex") or {}).get("abstract")
+            or ""
+        ).strip()
+        try:
+            client = OpenAI(
+                api_key=settings.model_api_key,
+                base_url=settings.model_base_url,
+                timeout=180.0,
+                max_retries=2,
+            )
+            response = _paper_completion_json(
+                client,
+                PAPER_UNFIGURED_REVIEW_PROMPT,
+                {
+                    "abstract": abstract,
+                    "paper_evidence_plan": plan,
+                    "candidates": unfigured,
+                    "_model": settings.model_name,
+                    "_temperature": 0.1,
+                },
+            )
+            raw_decisions = response.get("decisions")
+            if isinstance(raw_decisions, list):
+                for decision in raw_decisions:
+                    if not isinstance(decision, dict):
+                        continue
+                    section_id = str(decision.get("section_id") or "")
+                    action = str(decision.get("action") or "").lower()
+                    reason = str(decision.get("reason") or "").strip()
+                    if section_id and action in {"keep", "prune"}:
+                        decisions[section_id] = {"action": action, "reason": reason}
+        except Exception:
+            plan["pruning_fallback_reason"] = "unfigured section review unavailable"
+
+    kept_indices: list[int] = []
+    pruned_sections: list[dict[str, Any]] = []
+    pruned_indices: list[int] = []
+    retained_without_figure: list[str] = []
+    for index, section in enumerate(sections):
         current = dict(section)
         section_id = str(current.get("id") or "")
-        selected_figures = [
-            f"Fig. {int(numbered_images[index].get('figure_number'))}"
-            for index in section_figure_indexes.get(section_id, [])
-            if index in selected_indexes
-        ]
-        if selected_figures:
-            current["selected_body_figures"] = selected_figures
-            retained.append(current)
+        selected = selected_by_index.get(index, [])
+        decision = decisions.get(section_id, {})
+        if selected:
+            current["selected_body_figures"] = selected
+            sections[index] = current
+            kept_indices.append(index)
             continue
-        transition = bool(current.get("necessary_transition"))
-        transition_reason = str(current.get("transition_reason") or "").strip()
-        if transition and transition_reason:
+        if decision.get("action") == "keep":
             current["retained_without_figure"] = True
-            current["retention_reason"] = transition_reason
-            retained.append(current)
+            current["retention_reason"] = decision.get("reason") or "reviewer marked this as a necessary bridge or core section"
+            retained_without_figure.append(section_id)
+            sections[index] = current
+            kept_indices.append(index)
             continue
-        current["pruned"] = True
-        current["prune_reason"] = "no selected body figure and not a necessary transition"
-        pruned.append(current)
-    if not retained:
-        raise RuntimeError("PAPER section pruning removed every section")
-    plan["planner_sections"] = [dict(section) for section in sections]
-    plan["sections"] = retained
-    plan["pruned_sections"] = pruned
-    return plan
+        if decision.get("action") == "prune":
+            current["pruned"] = True
+            current["prune_reason"] = decision.get("reason") or "no selected body figure and not a necessary transition"
+            pruned_sections.append(current)
+            pruned_indices.append(index)
+            continue
+        # A failed or incomplete review is conservative: preserve the section.
+        kept_indices.append(index)
+        current["retained_without_figure"] = True
+        current["retention_reason"] = "pruning reviewer did not authorize removal"
+        retained_without_figure.append(section_id)
+        sections[index] = current
+
+    if not kept_indices:
+        plan["pruning_fallback_reason"] = "all sections would be removed"
+        kept_indices = list(range(len(sections)))
+        pruned_sections = []
+        pruned_indices = []
+        retained_without_figure = []
+    keep_titles = {str(sections[index].get("title") or "") for index in kept_indices}
+    markdown_path.write_text(_paper_remove_sections(markdown_path.read_text(encoding="utf-8"), keep_titles) + "\n", encoding="utf-8")
+    kept_sections = [sections[index] for index in kept_indices]
+    plan["planner_sections"] = planner_sections
+    plan["sections"] = kept_sections
+    plan["pruned_sections"] = pruned_sections
+    plan["retained_without_figure"] = retained_without_figure
+    dossier["paper_evidence_plan"] = plan
+
+    new_allocation_sections: list[dict[str, Any]] = []
+    for new_index, old_index in enumerate(kept_indices):
+        record = dict(allocation_sections[old_index])
+        record["section_index"] = new_index
+        record["section"] = str(kept_sections[new_index].get("title") or record.get("section") or "")
+        new_allocation_sections.append(record)
+    allocation["sections"] = new_allocation_sections
+    allocation["pruned_sections"] = [
+        {
+            "section_id": sections[index].get("id", ""),
+            "section": sections[index].get("title", ""),
+            "reason": pruned_sections[position].get("prune_reason", ""),
+        }
+        for position, index in enumerate(pruned_indices)
+    ]
+    return {"pruned": [section.get("id", "") for section in pruned_sections], "retained_without_figure": retained_without_figure}
 
 
 def _paper_style_exemplar() -> str:
@@ -285,19 +395,30 @@ def _paper_style_exemplar() -> str:
 
 
 def _paper_completion_json(client: OpenAI, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
-    response = _paper_completion_with_retry(
-        client,
-        model=payload.pop("_model"),
-        temperature=payload.pop("_temperature", 0.2),
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-    )
-    parsed = _json_from_text(response.choices[0].message.content or "")
-    if not isinstance(parsed, dict):
-        raise RuntimeError("PAPER model returned a non-object JSON response")
-    return parsed
+    model = payload.pop("_model")
+    temperature = payload.pop("_temperature", 0.2)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    parse_error: Exception | None = None
+    for attempt in range(2):
+        response = _paper_completion_with_retry(
+            client,
+            model=model,
+            temperature=temperature,
+            messages=messages,
+        )
+        try:
+            parsed = _json_from_text(response.choices[0].message.content or "")
+            if not isinstance(parsed, dict):
+                raise RuntimeError("PAPER model returned a non-object JSON response")
+            return parsed
+        except (TypeError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            parse_error = exc
+            if attempt == 0:
+                continue
+    raise RuntimeError(f"PAPER model returned invalid JSON after retry: {parse_error}") from parse_error
 
 
 def _paper_plan(
@@ -410,8 +531,27 @@ def _paper_review(
     corrections = response.get("corrections", [])
     if not isinstance(corrections, list):
         raise RuntimeError("PAPER scientific reviewer returned invalid corrections")
-    if status == "needs_revision" and not corrections:
+    normalized_corrections: list[dict[str, str]] = []
+    for correction in corrections:
+        if not isinstance(correction, dict):
+            raise RuntimeError("PAPER scientific reviewer returned an invalid correction")
+        section = str(correction.get("section") or correction.get("section_id") or "").strip()
+        evidence = str(correction.get("evidence") or "").strip()
+        issue = str(correction.get("issue") or "").strip()
+        instruction = str(correction.get("correction") or correction.get("instruction") or "").strip()
+        if not section or not evidence or not issue or not instruction:
+            raise RuntimeError("PAPER scientific reviewer returned an incomplete correction")
+        normalized_corrections.append(
+            {
+                "section": section,
+                "evidence": evidence,
+                "issue": issue,
+                "correction": instruction,
+            }
+        )
+    if status == "needs_revision" and not normalized_corrections:
         raise RuntimeError("PAPER scientific reviewer requested revision without corrections")
+    response["corrections"] = normalized_corrections
     return response
 
 
@@ -450,15 +590,21 @@ def _paper_revision(
     revised = response.get("sections") if isinstance(response, dict) else None
     if not isinstance(revised, list):
         return _paper_extract_section_bodies(content, plan["sections"])
-    if len(revised) != len(plan["sections"]):
-        raise RuntimeError("PAPER scientific revision returned invalid sections")
+    original_bodies = _paper_extract_section_bodies(draft, plan["sections"])
     by_id = {str(section.get("id") or ""): section for section in revised if isinstance(section, dict)}
     bodies: list[str] = []
-    for planned in plan["sections"]:
+    changed = False
+    for planned, original in zip(plan["sections"], original_bodies):
         item = by_id.get(str(planned["id"]))
-        if item is None or not isinstance(item.get("body"), str) or not item["body"].strip():
-            raise RuntimeError("PAPER scientific revision omitted a planned section")
+        if item is None:
+            bodies.append(original)
+            continue
+        if not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise RuntimeError("PAPER scientific revision returned an empty section")
         bodies.append(_paper_section_body({"body": item["body"]}))
+        changed = True
+    if not changed:
+        raise RuntimeError("PAPER scientific revision returned no recognized sections")
     return bodies
 
 
@@ -1093,7 +1239,7 @@ PAPER_PLANNER_PROMPT = (
     "你是Scientific Planner，不写文章正文。根据原始Abstract、paper_text、source_paragraphs和metadata，"
     "建立唯一的paper_evidence_plan，并只返回严格JSON对象。Abstract决定全文主线，Results和source paragraphs只补充证据。"
     "每个section包含id、title、role、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、evidence、quantitative anchors。"
-    "结合输入图片的Figure编号判断该section是否有正文主图；必要时可提供necessary_transition=true及简短transition_reason，说明无图section为何是理解相邻主图不可缺少的桥梁。"
+    "可以记录Figure作为证据来源，但不要让planner预测的figure_ids决定section是否存活；无图section是否保留由后续Scientific Reviewer基于Abstract、evidence plan和前后section判断。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立核心证据，必须优先拆开；不要为凑3到4节而合并attribution与future projection，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
@@ -1104,10 +1250,11 @@ PAPER_PLANNER_PROMPT = (
 )
 
 PAPER_REVIEWER_PROMPT = (
-    "你是Scientific Reviewer，只审核科学准确性和section结构，不润色文风，不重写全文。忠实翻译的Abstract导语应保持原始Abstract的结论和因果强度，不要要求改写原文已有表述；只检查导语是否新增或强化了Abstract没有的内容。检查Abstract核心结论覆盖、"
-    "证据与plan归属、数字/R/r/百分比/时间段、机制与因果强度、correlation与causation区分、重复finding，以及"
-    "mechanism/attribution/projection是否混在错误section，以及每个计划中的定量anchor是否在对应section实际保留。返回严格JSON："
-    '{"status":"pass"|"needs_revision","corrections":[{"section_id":"section-1","issue":"...","instruction":"..."}]}'
+    "你是Scientific Reviewer，只审核科学准确性和section结构，不润色文风，不重写全文。忠实翻译的Abstract导语应保持原始Abstract的结论和因果强度，不要要求改写原文已有表述；只检查导语是否新增或强化了Abstract没有的内容。"
+    "只检查：evidence是否错section、数字或统计量是否错误、原文没有的机制、correlation到causation的强化、Abstract核心结果遗漏、attribution/mechanism/projection混用、finding重复或科学关系错误。"
+    "不要因句式、节奏、中文措辞、AI-like phrasing或其他纯文风偏好fail；这些交给Chinese Editorial Rewrite和AI-style lint。"
+    "每个问题必须包含section、evidence、issue、correction四个字段；correction只能修复该问题，不能移动无关证据。返回严格JSON："
+    '{"status":"pass"|"needs_revision","corrections":[{"section":"section-1","evidence":"...","issue":"...","correction":"..."}]}'
 )
 
 PAPER_REVISION_PROMPT = (
@@ -1247,7 +1394,10 @@ def _generate_paper_article_markdown(
     )
     plan = _paper_plan(client, abstract, paper_text, source_paragraphs, metadata)
     plan["sections"] = _validate_paper_plan_structure(plan, valid_source_ids)
-    plan = _paper_prune_plan_sections(plan, list(dossier.get("images") or []))
+    for section in plan["sections"]:
+        section.pop("necessary_transition", None)
+        section.pop("transition_reason", None)
+    plan["planner_sections"] = [dict(section) for section in plan["sections"]]
     abstract_lead = translate_paper_abstract(abstract, settings) if abstract else ""
 
     sections: list[dict[str, Any]] = []
@@ -1274,7 +1424,7 @@ def _generate_paper_article_markdown(
         draft,
         settings.model_name,
     )
-    for revision_attempt in range(2):
+    for revision_attempt in range(3):
         if review["status"] == "pass":
             break
         revised_bodies = _paper_revision(
