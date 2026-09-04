@@ -186,6 +186,85 @@ def _validate_paper_plan_structure(
     return validated
 
 
+def _paper_prune_plan_sections(
+    plan: dict[str, Any],
+    images: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sections = list(plan.get("sections") or [])
+    if not sections:
+        raise RuntimeError("PAPER scientific planner returned no sections")
+    numbered_images: dict[int, dict[str, Any]] = {}
+    for index, image in enumerate(images, start=1):
+        try:
+            figure_number = int(image.get("figure_number"))
+        except (TypeError, ValueError):
+            continue
+        if figure_number > 0 and image.get("publishable", True) is not False:
+            numbered_images[index] = image
+    referenced_indexes: list[int] = []
+    section_figure_indexes: dict[str, list[int]] = {}
+    for section in sections:
+        section_id = str(section.get("id") or "")
+        indexes: list[int] = []
+        for source_id in section.get("source_paragraph_ids") or []:
+            match = re.fullmatch(r"source-figure-(\d+)", str(source_id))
+            if match is None:
+                continue
+            image_index = int(match.group(1))
+            if image_index in numbered_images and image_index not in indexes:
+                indexes.append(image_index)
+        for figure_label in section.get("figure_ids") or section.get("selected_body_figures") or []:
+            match = re.search(r"(?:Fig(?:ure)?\.?)\s*(\d+)", str(figure_label), re.IGNORECASE)
+            if match is None:
+                continue
+            figure_number = int(match.group(1))
+            image_index = next(
+                (
+                    index
+                    for index, image in numbered_images.items()
+                    if int(image.get("figure_number") or 0) == figure_number
+                ),
+                None,
+            )
+            if image_index is not None and image_index not in indexes:
+                indexes.append(image_index)
+        for image_index in indexes:
+            if image_index not in referenced_indexes:
+                referenced_indexes.append(image_index)
+        section_figure_indexes[section_id] = indexes
+    selected_indexes = set(referenced_indexes if len(referenced_indexes) <= 4 else referenced_indexes[:4])
+    retained: list[dict[str, Any]] = []
+    pruned: list[dict[str, Any]] = []
+    for section in sections:
+        current = dict(section)
+        section_id = str(current.get("id") or "")
+        selected_figures = [
+            f"Fig. {int(numbered_images[index].get('figure_number'))}"
+            for index in section_figure_indexes.get(section_id, [])
+            if index in selected_indexes
+        ]
+        if selected_figures:
+            current["selected_body_figures"] = selected_figures
+            retained.append(current)
+            continue
+        transition = bool(current.get("necessary_transition"))
+        transition_reason = str(current.get("transition_reason") or "").strip()
+        if transition and transition_reason:
+            current["retained_without_figure"] = True
+            current["retention_reason"] = transition_reason
+            retained.append(current)
+            continue
+        current["pruned"] = True
+        current["prune_reason"] = "no selected body figure and not a necessary transition"
+        pruned.append(current)
+    if not retained:
+        raise RuntimeError("PAPER section pruning removed every section")
+    plan["planner_sections"] = [dict(section) for section in sections]
+    plan["sections"] = retained
+    plan["pruned_sections"] = pruned
+    return plan
+
+
 def _paper_style_exemplar() -> str:
     paths = sorted(
         PROJECT_ROOT.glob("articles/paper/*/article.md"),
@@ -722,8 +801,8 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
                 "role": "system",
                 "content": (
                     "你是中文科技论文摘要翻译编辑。只根据用户提供的原始Abstract做忠实、自然的中文翻译。"
-                    "短Abstract基本完整翻译；长Abstract只能删除次要细节，不能增加原文没有的结论、分类、机制或表述，"
-                    "也不能自行重组科学结论。不要添加小标题、列表或解释，只返回严格JSON："
+                    "短Abstract基本完整翻译；长Abstract只能删除次要方法细节、重复背景和低优先级结果，不能增加原文没有的结论、分类、机制或表述，也不能自行重组科学结论。"
+                    "中文结果优先控制在约200到300个汉字，但不得机械截断；若忠实表达需要更长，优先保留研究问题和2到3个核心结论。不要添加小标题、列表或解释，只返回严格JSON："
                     '{"abstract_cn":"..."}'
                 ),
             },
@@ -1006,7 +1085,7 @@ PAPER_STYLE_GUIDE = (
     "当前section的findings和source_paragraphs写作；不要引入任何未提供的科学事实、数字、机制或下一section内容。"
     "只返回当前section的中文正文，不返回标题、导语、计划、图片、参考文献或文章信息。"
     "保留数字、趋势方向、时间范围、变量关系和因果强度；correlation不写成causation。"
-    "正文应自然、简洁、信息密度高，避免翻译腔、空泛总结和重复连接词。"
+    "正文应自然、简洁、信息密度高，避免翻译腔、空泛总结和重复连接词。若当前section标记为retained_without_figure，只保留理解相邻主图所需的极短桥接内容，不展开次要机制或补充材料。"
     "如果有可核验的paper_text原句，可以保留短Markdown引用块，但不得改写或编造。"
 )
 
@@ -1014,6 +1093,7 @@ PAPER_PLANNER_PROMPT = (
     "你是Scientific Planner，不写文章正文。根据原始Abstract、paper_text、source_paragraphs和metadata，"
     "建立唯一的paper_evidence_plan，并只返回严格JSON对象。Abstract决定全文主线，Results和source paragraphs只补充证据。"
     "每个section包含id、title、role、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、evidence、quantitative anchors。"
+    "结合输入图片的Figure编号判断该section是否有正文主图；必要时可提供necessary_transition=true及简短transition_reason，说明无图section为何是理解相邻主图不可缺少的桥梁。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立核心证据，必须优先拆开；不要为凑3到4节而合并attribution与future projection，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
@@ -1167,6 +1247,7 @@ def _generate_paper_article_markdown(
     )
     plan = _paper_plan(client, abstract, paper_text, source_paragraphs, metadata)
     plan["sections"] = _validate_paper_plan_structure(plan, valid_source_ids)
+    plan = _paper_prune_plan_sections(plan, list(dossier.get("images") or []))
     abstract_lead = translate_paper_abstract(abstract, settings) if abstract else ""
 
     sections: list[dict[str, Any]] = []

@@ -82,6 +82,7 @@ from writer.llm import (
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_prune_plan_sections,
     _normalize_article_markdown,
     _paper_revision,
     _paper_review,
@@ -2023,6 +2024,61 @@ class V1Tests(unittest.TestCase):
         self.assertIn("attribution", synthetic_text)
         self.assertIn("projection", synthetic_text)
 
+    def test_paper_pruning_drops_unfigured_nontransition_sections(self):
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "主图结果",
+                    "role": "phenomenon",
+                    "source_paragraph_ids": ["source-figure-1"],
+                    "findings": [{"id": "E1", "evidence": "主图结果", "anchors": []}],
+                },
+                {
+                    "id": "section-2",
+                    "title": "悬空补充",
+                    "role": "minor mechanism",
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E2", "evidence": "次要机制", "anchors": []}],
+                },
+            ]
+        }
+        pruned = _paper_prune_plan_sections(
+            plan,
+            [{"image_role": "figure", "figure_number": 1, "publishable": True}],
+        )
+        self.assertEqual([section["id"] for section in pruned["sections"]], ["section-1"])
+        self.assertEqual(pruned["pruned_sections"][0]["prune_reason"], "no selected body figure and not a necessary transition")
+
+    def test_paper_pruning_keeps_explicit_necessary_transition(self):
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "主图结果",
+                    "role": "phenomenon",
+                    "source_paragraph_ids": ["source-figure-1"],
+                    "findings": [{"id": "E1", "evidence": "主图结果", "anchors": []}],
+                },
+                {
+                    "id": "section-2",
+                    "title": "必要桥梁",
+                    "role": "transition",
+                    "source_paragraph_ids": ["source-0"],
+                    "necessary_transition": True,
+                    "transition_reason": "required transition from X to Y",
+                    "findings": [{"id": "E2", "evidence": "桥梁", "anchors": []}],
+                },
+            ]
+        }
+        pruned = _paper_prune_plan_sections(
+            plan,
+            [{"image_role": "figure", "figure_number": 1, "publishable": True}],
+        )
+        self.assertEqual([section["id"] for section in pruned["sections"]], ["section-1", "section-2"])
+        self.assertTrue(pruned["sections"][1]["retained_without_figure"])
+        self.assertEqual(pruned["sections"][1]["retention_reason"], "required transition from X to Y")
+
     def test_paper_ai_style_lint_detects_repeated_connectives(self):
         markdown = "并非A而是B。并非C而是D。进一步表明结果稳定。进一步表明趋势一致。"
         counts = _paper_ai_style_lint(markdown)
@@ -2045,7 +2101,7 @@ class V1Tests(unittest.TestCase):
                                             "id": "section-1",
                                             "title": "归因",
                                             "role": "attribution",
-                                            "source_paragraph_ids": ["source-0"],
+                                            "source_paragraph_ids": ["source-figure-1"],
                                             "findings": [{"id": "E1", "evidence": "森林差异", "anchors": []}],
                                         }
                                     ]
@@ -2095,7 +2151,9 @@ class V1Tests(unittest.TestCase):
                     "title_cn": "测试标题",
                     "text": "source",
                     "openalex": {"abstract": "Abstract"},
-                    "images": [],
+                    "images": [
+                        {"image_role": "figure", "figure_number": 1, "caption": "Figure 1", "publishable": True}
+                    ],
                 },
                 replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model"),
                 Path(tmp) / "paper",
@@ -2192,21 +2250,21 @@ class V1Tests(unittest.TestCase):
                                         "id": "section-1",
                                         "title": "历史模式差异",
                                         "role": "phenomenon",
-                                        "source_paragraph_ids": ["source-0"],
+                                        "source_paragraph_ids": ["source-figure-1"],
                                         "findings": [{"id": "E1", "evidence": "历史差异", "anchors": []}],
                                     },
                                     {
                                         "id": "section-2",
                                         "title": "森林归因",
                                         "role": "attribution",
-                                        "source_paragraph_ids": ["source-1"],
+                                        "source_paragraph_ids": ["source-figure-2"],
                                         "findings": [{"id": "E2", "evidence": "74%归因", "anchors": ["74%"]}],
                                     },
                                     {
                                         "id": "section-3",
                                         "title": "未来投影",
                                         "role": "projection",
-                                        "source_paragraph_ids": ["source-2"],
+                                        "source_paragraph_ids": ["source-figure-3"],
                                         "findings": [{"id": "E3", "evidence": "未来情景", "anchors": ["SSP3-7.0"]}],
                                     },
                                 ]
@@ -2284,7 +2342,11 @@ class V1Tests(unittest.TestCase):
                     "title_cn": "测试标题",
                     "text": "historical source\nattribution source\nprojection source",
                     "openalex": {"abstract": "Paper abstract"},
-                    "images": [],
+                    "images": [
+                        {"image_role": "figure", "figure_number": 1, "caption": "Figure 1", "publishable": True},
+                        {"image_role": "figure", "figure_number": 2, "caption": "Figure 2", "publishable": True},
+                        {"image_role": "figure", "figure_number": 3, "caption": "Figure 3", "publishable": True},
+                    ],
                 },
                 settings,
                 root / "paper",
@@ -2292,6 +2354,8 @@ class V1Tests(unittest.TestCase):
             calls = client.chat.completions.create.call_args_list
             self.assertEqual(len(calls), 7)
             self.assertIn("Scientific Planner", calls[0].kwargs["messages"][0]["content"])
+            abstract_prompt = calls[1].kwargs["messages"][0]["content"]
+            self.assertIn("约200到300个汉字", abstract_prompt)
             reviewer_prompt = calls[5].kwargs["messages"][0]["content"]
             editor_prompt = calls[6].kwargs["messages"][0]["content"]
             section_payloads = [json.loads(calls[index].kwargs["messages"][1]["content"]) for index in (2, 3, 4)]
