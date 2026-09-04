@@ -77,6 +77,7 @@ from publisher.wechat import (
 from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
+    PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
     _normalize_article_markdown,
     _validate_paper_evidence_plan,
@@ -634,6 +635,7 @@ class V1Tests(unittest.TestCase):
                     {
                         "id": "section-1",
                         "title": "关键结果",
+                        "role": "attribution",
                         "source_paragraph_ids": ["source-0"],
                         "findings": [],
                     }
@@ -1946,18 +1948,21 @@ class V1Tests(unittest.TestCase):
                 {
                     "id": "section-1",
                     "title": "现象",
+                    "role": "phenomenon",
                     "source_paragraph_ids": ["source-0"],
                     "findings": [],
                 },
                 {
                     "id": "section-2",
                     "title": "机制",
+                    "role": "mechanism",
                     "source_paragraph_ids": ["source-1"],
                     "findings": [],
                 },
                 {
                     "id": "section-3",
                     "title": "归因",
+                    "role": "attribution",
                     "source_paragraph_ids": ["source-2"],
                     "findings": [
                         {
@@ -1991,6 +1996,24 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(plan["sections"][0]["id"], "section-1")
         self.assertNotIn("PAPER_EVIDENCE_PLAN", markdown)
 
+    def test_paper_planner_separates_attribution_and_projection_roles(self):
+        synthetic_input = {
+            "abstract": (
+                "Historical model spread is attributed to forest-cover changes; "
+                "future SSP3-7.0 projections retain a separate uncertainty signal."
+            ),
+            "paper_text": (
+                "Attribution explains the historical spread. Future projection results "
+                "cover 2025-2054 and 2070-2099 under SSP3-7.0."
+            ),
+        }
+        self.assertIn('"role":"phenomenon"', PAPER_STYLE_GUIDE)
+        self.assertIn("不同科学阶段或科学角色只要各自有独立核心evidence，就优先拆成独立section", PAPER_STYLE_GUIDE)
+        self.assertIn("不要因为通常约3到4个section的篇幅习惯而把attribution与projection合并", PAPER_STYLE_GUIDE)
+        synthetic_text = json.dumps(synthetic_input, ensure_ascii=False).lower()
+        self.assertIn("attribution", synthetic_text)
+        self.assertIn("projection", synthetic_text)
+
     def test_paper_prompt_uses_short_natural_style_and_verbatim_quote_rules(self):
         settings = replace(
             load_settings(),
@@ -2003,7 +2026,7 @@ class V1Tests(unittest.TestCase):
                 SimpleNamespace(
                     message=SimpleNamespace(
                         content=(
-                            '<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1","title":"关键结果","source_paragraph_ids":["source-0"],"findings":[]}]} -->\n'
+                            '<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1","title":"关键结果","role":"attribution","source_paragraph_ids":["source-0"],"findings":[]}]} -->\n'
                             "# 测试标题\n\n## 关键结果\n\n简短正文。\n\n"
                             "> “The supplied paper states an exact scientific result.”\n\n"
                             "这句引文支持上述判断。\n\n"
