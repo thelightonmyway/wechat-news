@@ -77,9 +77,14 @@ from publisher.wechat import (
 from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
+    PAPER_PLANNER_PROMPT,
     PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
+    _paper_ai_style_lint,
+    _paper_ai_style_lint_failed,
     _normalize_article_markdown,
+    _paper_revision,
+    _paper_review,
     _validate_paper_evidence_plan,
     generate_article_markdown,
     generate_image_captions,
@@ -2007,89 +2012,303 @@ class V1Tests(unittest.TestCase):
                 "cover 2025-2054 and 2070-2099 under SSP3-7.0."
             ),
         }
-        self.assertIn('"role":"phenomenon"', PAPER_STYLE_GUIDE)
-        self.assertIn("不同科学阶段或科学角色只要各自有独立核心evidence，就优先拆成独立section", PAPER_STYLE_GUIDE)
-        self.assertIn("不要因为通常约3到4个section的篇幅习惯而把attribution与projection合并", PAPER_STYLE_GUIDE)
+        self.assertIn('"role":"attribution"', PAPER_PLANNER_PROMPT)
+        self.assertIn("title必须是适合中文成稿的简洁中文小标题", PAPER_PLANNER_PROMPT)
+        self.assertIn("是不同科学问题且各有独立核心证据，必须优先拆开", PAPER_PLANNER_PROMPT)
+        self.assertIn("不要为凑3到4节而合并attribution与future projection", PAPER_PLANNER_PROMPT)
+        self.assertIn("所有R/r相关系数、百分比归因", PAPER_PLANNER_PROMPT)
+        self.assertIn("mechanism section只写物理过程和定性响应", PAPER_PLANNER_PROMPT)
+        self.assertIn("SSP情景、时间段和未来离散度应放入独立projection section", PAPER_PLANNER_PROMPT)
         synthetic_text = json.dumps(synthetic_input, ensure_ascii=False).lower()
         self.assertIn("attribution", synthetic_text)
         self.assertIn("projection", synthetic_text)
 
-    def test_paper_prompt_uses_short_natural_style_and_verbatim_quote_rules(self):
+    def test_paper_ai_style_lint_detects_repeated_connectives(self):
+        markdown = "并非A而是B。并非C而是D。进一步表明结果稳定。进一步表明趋势一致。"
+        counts = _paper_ai_style_lint(markdown)
+        self.assertEqual(counts["并非而是"], 2)
+        self.assertEqual(counts["进一步表明"], 2)
+        self.assertTrue(_paper_ai_style_lint_failed(counts))
+        clean_counts = _paper_ai_style_lint("森林变化解释了模式差异。未来投影仍有不确定性。")
+        self.assertFalse(_paper_ai_style_lint_failed(clean_counts))
+
+    def test_paper_editorial_lint_allows_one_retry(self):
+        responses = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "sections": [
+                                        {
+                                            "id": "section-1",
+                                            "title": "归因",
+                                            "role": "attribution",
+                                            "source_paragraph_ids": ["source-0"],
+                                            "findings": [{"id": "E1", "evidence": "森林差异", "anchors": []}],
+                                        }
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps({"abstract_cn": "摘要翻译"}, ensure_ascii=False)
+                        )
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=json.dumps({"body": "森林变化解释差异。"}, ensure_ascii=False))
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps({"status": "pass", "corrections": []}, ensure_ascii=False)
+                        )
+                    )
+                ]
+            ),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.side_effect = responses
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_editorial_rewrite",
+            side_effect=[["并非A而是B。并非C而是D。"], ["森林变化解释差异。"]],
+        ) as editor:
+            path, _ = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "source",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": [],
+                },
+                replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model"),
+                Path(tmp) / "paper",
+            )
+            final_text = path.read_text(encoding="utf-8")
+        self.assertEqual(editor.call_count, 2)
+        self.assertNotIn("并非A而是B", final_text)
+
+    def test_paper_scientific_review_triggers_one_structured_revision(self):
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "归因",
+                    "role": "attribution",
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E1", "evidence": "74%", "anchors": ["74%"]}],
+                }
+            ]
+        }
+        review_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "status": "needs_revision",
+                                "corrections": [
+                                    {
+                                        "section_id": "section-1",
+                                        "issue": "数字缺少归属",
+                                        "instruction": "明确74%是模式间差异的归因比例",
+                                    }
+                                ],
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        revision_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"sections": [{"id": "section-1", "body": "森林变化约解释74%的模式差异。"}]},
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [review_response, revision_response]
+        reviewed = _paper_review(
+            client,
+            "Abstract",
+            "paper text",
+            [{"id": "source-0", "text": "source"}],
+            plan,
+            "## 归因\n\n初稿。",
+            "test-model",
+        )
+        bodies = _paper_revision(
+            client,
+            "Abstract",
+            "paper text",
+            [{"id": "source-0", "text": "source"}],
+            plan,
+            "## 归因\n\n初稿。",
+            reviewed["corrections"],
+            "test-model",
+        )
+        self.assertEqual(reviewed["status"], "needs_revision")
+        self.assertEqual(bodies, ["森林变化约解释74%的模式差异。"])
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    def test_paper_staged_pipeline_isolated_and_reviewed(self):
         settings = replace(
             load_settings(),
             model_base_url="https://model.example/v1",
             model_api_key="test-key",
             model_name="test-model",
         )
-        response = SimpleNamespace(
+        planner = SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content=(
-                            '<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1","title":"关键结果","role":"attribution","source_paragraph_ids":["source-0"],"findings":[]}]} -->\n'
-                            "# 测试标题\n\n## 关键结果\n\n简短正文。\n\n"
-                            "> “The supplied paper states an exact scientific result.”\n\n"
-                            "这句引文支持上述判断。\n\n"
-                            "> “The ensemble spread remains stable across the tested regions while forecast errors decline during the validation period and improve seasonal predictability.”\n\n"
-                            "> “This quotation was invented by the model.”\n\n"
-                            "这条引文不应保留。"
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "历史模式差异",
+                                        "role": "phenomenon",
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "evidence": "历史差异", "anchors": []}],
+                                    },
+                                    {
+                                        "id": "section-2",
+                                        "title": "森林归因",
+                                        "role": "attribution",
+                                        "source_paragraph_ids": ["source-1"],
+                                        "findings": [{"id": "E2", "evidence": "74%归因", "anchors": ["74%"]}],
+                                    },
+                                    {
+                                        "id": "section-3",
+                                        "title": "未来投影",
+                                        "role": "projection",
+                                        "source_paragraph_ids": ["source-2"],
+                                        "findings": [{"id": "E3", "evidence": "未来情景", "anchors": ["SSP3-7.0"]}],
+                                    },
+                                ]
+                            },
+                            ensure_ascii=False,
                         )
                     )
                 )
             ]
         )
-        abstract_response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=json.dumps({"abstract_cn": "忠实的中文摘要翻译"}, ensure_ascii=False)
+        section_responses = [
+            {"body": "历史模式差异位于中国北部。"},
+            {"body": "森林覆盖变化约解释74%的模式差异。"},
+            {"body": "SSP3-7.0下的未来投影仍存在不确定性。"},
+        ]
+        responses = [planner]
+        responses.extend(
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(item, ensure_ascii=False)))])
+            for item in section_responses
+        )
+        responses.insert(
+            1,
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps({"abstract_cn": "忠实的中文摘要翻译"}, ensure_ascii=False)
+                        )
                     )
-                )
+                ]
+            ),
+        )
+        responses.extend(
+            [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps({"status": "pass", "corrections": []}, ensure_ascii=False)
+                            )
+                        )
+                    ]
+                ),
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "sections": [
+                                            {"id": "section-1", "body": "历史模式差异位于中国北部。"},
+                                            {"id": "section-2", "body": "森林覆盖变化约解释74%的模式差异。"},
+                                            {"id": "section-3", "body": "SSP3-7.0下的未来投影仍存在不确定性。"},
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        )
+                    ]
+                ),
             ]
         )
         news_response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="# 测试新闻\n\n新闻正文。")
-                )
-            ]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="# 测试新闻\n\n新闻正文。"))]
         )
         client = MagicMock()
-        client.chat.completions.create.side_effect = [response, abstract_response, news_response]
-        with tempfile.TemporaryDirectory() as tmp, patch(
-            "writer.llm.OpenAI",
-            return_value=client,
-        ):
+        client.chat.completions.create.side_effect = responses
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client):
             root = Path(tmp)
             paper_path, paper_metadata_path = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
                     "title": "Test paper",
                     "title_cn": "测试标题",
-                    "text": (
-                        "The supplied paper states an exact scientific result. "
-                        "The ensemble spread remains stable across the tested regions while "
-                        "forecast errors decline during the validation period and improve "
-                        "seasonal predictability."
-                    ),
-                    "summary": "Metadata summary that must not replace abstract",
+                    "text": "historical source\nattribution source\nprojection source",
                     "openalex": {"abstract": "Paper abstract"},
                     "images": [],
                 },
                 settings,
                 root / "paper",
             )
-            paper_call = client.chat.completions.create.call_args_list[0]
-            paper_prompt = paper_call.kwargs["messages"][0]["content"]
-            paper_input = json.loads(paper_call.kwargs["messages"][1]["content"])
-            abstract_call = client.chat.completions.create.call_args_list[1]
-            abstract_prompt = abstract_call.kwargs["messages"][0]["content"]
-            abstract_input = json.loads(abstract_call.kwargs["messages"][1]["content"])
+            calls = client.chat.completions.create.call_args_list
+            self.assertEqual(len(calls), 7)
+            self.assertIn("Scientific Planner", calls[0].kwargs["messages"][0]["content"])
+            reviewer_prompt = calls[5].kwargs["messages"][0]["content"]
+            editor_prompt = calls[6].kwargs["messages"][0]["content"]
+            section_payloads = [json.loads(calls[index].kwargs["messages"][1]["content"]) for index in (2, 3, 4)]
+            self.assertEqual([payload["section"]["id"] for payload in section_payloads], ["section-1", "section-2", "section-3"])
+            self.assertNotIn("74%归因", json.dumps(section_payloads[0], ensure_ascii=False))
+            self.assertNotIn("SSP3-7.0", json.dumps(section_payloads[1], ensure_ascii=False))
             paper_markdown = paper_path.read_text(encoding="utf-8")
             paper_metadata = json.loads(paper_metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(paper_metadata["paper_evidence_plan"]["sections"][0]["id"], "section-1")
+            self.assertEqual(
+                [section["role"] for section in paper_metadata["paper_evidence_plan"]["sections"]],
+                ["phenomenon", "attribution", "projection"],
+            )
             self.assertNotIn("PAPER_EVIDENCE_PLAN", paper_markdown)
+            self.assertLess(paper_markdown.index("历史模式差异位于中国北部"), paper_markdown.index("森林覆盖变化约解释74%"))
+            self.assertLess(paper_markdown.index("森林覆盖变化约解释74%"), paper_markdown.index("SSP3-7.0下"))
             client.chat.completions.create.reset_mock()
+            client.chat.completions.create.side_effect = [news_response]
             generate_article_markdown(
                 {
                     "content_type": POPULAR_CONTENT,
@@ -2102,96 +2321,17 @@ class V1Tests(unittest.TestCase):
                 settings,
                 root / "news",
             )
-            news_prompt = client.chat.completions.create.call_args.kwargs["messages"][0][
-                "content"
-            ]
-            news_input = json.loads(
-                client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
-            )
+            news_call = client.chat.completions.create.call_args
+            news_prompt = news_call.kwargs["messages"][0]["content"]
+            news_input = json.loads(news_call.kwargs["messages"][1]["content"])
 
-        self.assertIn("正文主体优先约650到800个中文字符", paper_prompt)
-        self.assertIn("标题、英文摘录、图片图注和文章信息不计入正文主体", paper_prompt)
-        self.assertIn("必须把正文主体压缩到650到800个中文字以内", paper_prompt)
-        self.assertIn("小节数量和长度跟随论文实际科学结构", paper_prompt)
-        self.assertNotIn("通常设置3到4个主要小节", paper_prompt)
-        self.assertIn("主动删去冗余背景、重复解释、低价值细节", paper_prompt)
-        self.assertIn("不要机械截断句子", paper_prompt)
-        self.assertIn(
-            "像中文科技媒体编辑或科研作者整理一篇刚发表的研究",
-            paper_prompt,
-        )
-        self.assertIn("直接陈述研究发现、数据和作者判断", paper_prompt)
-        self.assertIn("专业准确，但不是论文摘要，也不要扮演老师给读者讲课", paper_prompt)
-        self.assertNotIn("解释这个结果说明什么", paper_prompt)
-        self.assertIn("作者比较了三组模式试验", paper_prompt)
-        self.assertIn("去掉 Z 过程后，Y 的响应明显减弱", paper_prompt)
-        self.assertIn("不同区域的结果也有明显差别", paper_prompt)
-        self.assertIn("句长、段落节奏、信息密度和自然推进方式", paper_prompt)
-        self.assertIn("不把它当作固定模板", paper_prompt)
-        self.assertIn("A、B、X、Y、Z 都只是占位符", paper_prompt)
-        self.assertIn("所有科学事实必须来自输入论文材料", paper_prompt)
-        self.assertIn("禁止逐句翻译英文", paper_prompt)
-        self.assertIn("必须逐字复制自paper_text", paper_prompt)
-        self.assertIn("优先加入2到3组英文短引", paper_prompt)
-        self.assertIn("每组保留1到2个连续且有信息量、语境完整的原文句子", paper_prompt)
-        self.assertIn("不要按固定的全篇英文词数机械截断", paper_prompt)
-        self.assertIn("每组应保持精炼，通常不超过80个英文词", paper_prompt)
-        self.assertNotIn("每处最多25个英文词", paper_prompt)
-        self.assertNotIn("全篇英文引用总量尽量控制在约25个英文词以内", paper_prompt)
-        self.assertIn("引用格式为自然的Markdown引用块", paper_prompt)
-        self.assertIn("找不到合适原文就少引或不引", paper_prompt)
-        self.assertNotIn("> 原文：", paper_prompt)
-        self.assertIn("最重要的2到4个发现", paper_prompt)
-        self.assertIn("独立的中文导语开场", paper_prompt)
-        self.assertIn("在本次生成内部建立section evidence plan", paper_prompt)
-        self.assertIn("source_paragraph_ids只能逐字使用", paper_prompt)
-        self.assertIn("R/r标签", paper_prompt)
-        self.assertIn("每个finding只归属于一个主要section", paper_prompt)
-        self.assertIn("Treat each section heading as a strict scientific scope boundary", paper_prompt)
-        self.assertIn("每个finding只归属于一个主要section", paper_prompt)
-        self.assertIn("do not preview or import a following section's result", paper_prompt)
-        self.assertIn("原始abstract的核心结果结构", paper_prompt)
-        self.assertIn("two modes、first mode/second mode、two regimes、two mechanisms", paper_prompt)
-        self.assertIn("只有当abstract明确写出", paper_prompt)
-        self.assertIn("绝对不要自行创造第一模态、第二模态、第一类、第二类", paper_prompt)
-        self.assertIn("Results或paper_text只用于补充", paper_prompt)
-        self.assertNotIn("必须分别覆盖每一个核心模态或机制", paper_prompt)
-        self.assertIn("空间或对象特征、主要驱动因子和关键物理机制", paper_prompt)
-        self.assertIn("不要因篇幅删除与当前section核心结论直接对应的关键数值或相关系数", paper_prompt)
-        self.assertIn("方法性能和归因统计", paper_prompt)
-        self.assertIn("完整覆盖核心结果优先于机械保持固定section数量", paper_prompt)
-        self.assertIn("中文科研表达编辑规则（仅作保守润色", paper_prompt)
-        self.assertIn("保留科学术语、数字、百分比、统计值", paper_prompt)
-        self.assertIn("correlation不写成causation", paper_prompt)
-        self.assertIn("不把suggest、indicate、可能或表明强化成prove", paper_prompt)
-        self.assertIn("删除模板化连接词、AI套话、空泛意义拔高和重复总结", paper_prompt)
-        self.assertIn("生成最终稿前在内部检查并直接修正", paper_prompt)
-        self.assertIn("是否有section内容串位", paper_prompt)
-        self.assertEqual(paper_input["abstract"], "Paper abstract")
-        self.assertEqual(paper_input["source_paragraphs"][0]["id"], "source-0")
-        self.assertEqual(paper_input["news_summary"], "")
-        self.assertIn("只根据用户提供的原始Abstract", abstract_prompt)
-        self.assertEqual(abstract_input, {"abstract": "Paper abstract"})
-        self.assertNotIn("paper_text", abstract_input)
+        self.assertIn("只返回严格JSON对象", calls[0].kwargs["messages"][0]["content"])
+        self.assertIn("只审核科学准确性和section结构", reviewer_prompt)
+        self.assertIn("只优化中文自然度", editor_prompt)
+        self.assertIn("中文科研表达编辑规则（仅作保守润色", editor_prompt)
+        self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("abstract", news_input)
         self.assertEqual(news_input["news_summary"], "News summary")
-        self.assertIn("忠实的中文摘要翻译", paper_markdown)
-        self.assertIn(
-            "> “The supplied paper states an exact scientific result.”",
-            paper_markdown,
-        )
-        self.assertIn(
-            "> “The ensemble spread remains stable across the tested regions while forecast errors decline during the validation period and improve seasonal predictability.”",
-            paper_markdown,
-        )
-        self.assertNotIn("原文：", paper_markdown)
-        self.assertNotIn("This quotation was invented by the model.", paper_markdown)
-        self.assertIn("约1000到2000中文字", news_prompt)
-        self.assertNotIn("约800到1200个中文字符", news_prompt)
-        self.assertNotIn("正文主体优先约650到800个中文字符", news_prompt)
-        self.assertNotIn("像中文科技媒体编辑或科研作者", news_prompt)
-        self.assertNotIn("作者比较了三组模式试验", news_prompt)
-        self.assertNotIn("A、B、X、Y、Z 都只是占位符", news_prompt)
 
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(

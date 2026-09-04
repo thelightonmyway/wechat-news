@@ -18,10 +18,17 @@ def _json_from_text(text: str) -> Any:
     try:
         return json.loads(stripped)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-        if not match:
+        start = stripped.find("{")
+        if start < 0:
             raise
-        return json.loads(match.group(0))
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(stripped[start:])
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+            if not match:
+                raise
+            return json.loads(match.group(0))
+        return parsed
 
 
 def _normalize_evidence_anchor(value: str) -> str:
@@ -131,6 +138,312 @@ def _validate_paper_evidence_plan(
                         f"evidence={anchor!r}; planned section={planned_title!r}; "
                         f"actual section={actual_titles!r}"
                     )
+
+
+def _validate_paper_plan_structure(
+    plan: dict[str, Any],
+    valid_source_paragraph_ids: set[str],
+) -> list[dict[str, Any]]:
+    sections = plan.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise RuntimeError("PAPER scientific planner returned no sections")
+    seen_ids: set[str] = set()
+    validated: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            raise RuntimeError("PAPER scientific planner returned an invalid section")
+        section_id = str(section.get("id") or "").strip()
+        title = str(section.get("title") or "").strip()
+        role = str(section.get("role") or "").strip()
+        source_ids = section.get("source_paragraph_ids")
+        findings = section.get("findings")
+        if not section_id or section_id in seen_ids or not title or not role:
+            raise RuntimeError("PAPER scientific planner returned invalid section metadata")
+        if not isinstance(source_ids, list) or not source_ids:
+            raise RuntimeError("PAPER scientific planner returned invalid source paragraph ids")
+        if not all(isinstance(source_id, str) and source_id in valid_source_paragraph_ids for source_id in source_ids):
+            raise RuntimeError("PAPER scientific planner returned unknown source paragraph ids")
+        if not isinstance(findings, list) or not findings:
+            raise RuntimeError("PAPER scientific planner returned a section without findings")
+        for finding in findings:
+            if not isinstance(finding, dict) or not str(finding.get("evidence") or "").strip():
+                raise RuntimeError("PAPER scientific planner returned an invalid finding")
+            anchors = finding.get(
+                "anchors",
+                finding.get("quantitative_anchors", finding.get("quantitative anchors", [])),
+            )
+            if anchors is None:
+                anchors = []
+            elif isinstance(anchors, str):
+                anchors = [anchors]
+            if not isinstance(anchors, list):
+                raise RuntimeError("PAPER scientific planner returned invalid quantitative anchors")
+            finding["anchors"] = anchors
+            finding.pop("quantitative_anchors", None)
+            finding.pop("quantitative anchors", None)
+        seen_ids.add(section_id)
+        validated.append(section)
+    return validated
+
+
+def _paper_style_exemplar() -> str:
+    paths = sorted(
+        PROJECT_ROOT.glob("articles/paper/*/article.md"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    excerpts: list[str] = []
+    for path in paths[:2]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        sections = _paper_body_sections(text)
+        excerpt = "\n\n".join(f"## {title}\n{body.strip()}" for title, body in sections[:3])
+        if excerpt:
+            excerpts.append(excerpt[:1800])
+    return "\n\n---\n\n".join(excerpts)
+
+
+def _paper_completion_json(client: OpenAI, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
+    response = _paper_completion_with_retry(
+        client,
+        model=payload.pop("_model"),
+        temperature=payload.pop("_temperature", 0.2),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+    )
+    parsed = _json_from_text(response.choices[0].message.content or "")
+    if not isinstance(parsed, dict):
+        raise RuntimeError("PAPER model returned a non-object JSON response")
+    return parsed
+
+
+def _paper_plan(
+    client: OpenAI,
+    abstract: str,
+    paper_text: str,
+    source_paragraphs: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return _paper_completion_json(
+        client,
+        PAPER_PLANNER_PROMPT,
+        {
+            "abstract": abstract,
+            "paper_text": paper_text,
+            "source_paragraphs": source_paragraphs,
+            "metadata": metadata,
+            "_model": metadata["model"],
+            "_temperature": 0.1,
+        },
+    )
+
+
+def _paper_section_body(response: dict[str, Any]) -> str:
+    body = response.get("body")
+    if not isinstance(body, str):
+        raise RuntimeError("PAPER section writer returned invalid body")
+    body = _remove_generated_terminal_sections(body).strip()
+    body = "\n".join(line for line in body.splitlines() if not re.match(r"^#{1,6}\s+", line.strip()))
+    if not body:
+        raise RuntimeError("PAPER section writer returned empty body")
+    return body.strip()
+
+
+def _paper_write_section(
+    client: OpenAI,
+    abstract: str,
+    section: dict[str, Any],
+    source_paragraphs: list[dict[str, Any]],
+    model: str,
+) -> str:
+    source_ids = set(section["source_paragraph_ids"])
+    section_sources = [record for record in source_paragraphs if record["id"] in source_ids]
+    payload = {
+        "abstract": abstract,
+        "section": section,
+        "source_paragraphs": section_sources,
+    }
+    response = _paper_completion_with_retry(
+        client,
+        model=model,
+        temperature=0.25,
+        messages=[
+            {"role": "system", "content": PAPER_STYLE_GUIDE},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+    )
+    content = (response.choices[0].message.content or "").strip()
+    try:
+        parsed = _json_from_text(content)
+    except (TypeError, json.JSONDecodeError):
+        parsed = {"body": content}
+    if not isinstance(parsed, dict):
+        parsed = {"body": content}
+    return _paper_section_body(parsed)
+
+
+def _paper_assemble_markdown(display_title: str, abstract_lead: str, sections: list[dict[str, Any]]) -> str:
+    chunks = [f"# {display_title}", abstract_lead.strip()]
+    for section in sections:
+        body = str(section.get("body") or "").strip()
+        if not body:
+            raise RuntimeError("PAPER assembly encountered an empty section")
+        chunks.append(f"## {section['title']}\n\n{body}")
+    return "\n\n".join(chunk for chunk in chunks if chunk).strip()
+
+
+def _paper_extract_section_bodies(markdown: str, plan_sections: list[dict[str, Any]]) -> list[str]:
+    actual = _paper_body_sections(markdown)
+    if len(actual) != len(plan_sections):
+        raise RuntimeError("PAPER revised draft changed the planned section count")
+    return [body.strip() for _, body in actual]
+
+
+def _paper_review(
+    client: OpenAI,
+    abstract: str,
+    paper_text: str,
+    source_paragraphs: list[dict[str, Any]],
+    plan: dict[str, Any],
+    draft: str,
+    model: str,
+) -> dict[str, Any]:
+    response = _paper_completion_json(
+        client,
+        PAPER_REVIEWER_PROMPT,
+        {
+            "abstract": abstract,
+            "paper_text": paper_text,
+            "source_paragraphs": source_paragraphs,
+            "paper_evidence_plan": plan,
+            "draft": draft,
+            "_model": model,
+            "_temperature": 0.1,
+        },
+    )
+    status = response.get("status")
+    if status not in {"pass", "needs_revision"}:
+        raise RuntimeError("PAPER scientific reviewer returned invalid status")
+    corrections = response.get("corrections", [])
+    if not isinstance(corrections, list):
+        raise RuntimeError("PAPER scientific reviewer returned invalid corrections")
+    if status == "needs_revision" and not corrections:
+        raise RuntimeError("PAPER scientific reviewer requested revision without corrections")
+    return response
+
+
+def _paper_revision(
+    client: OpenAI,
+    abstract: str,
+    paper_text: str,
+    source_paragraphs: list[dict[str, Any]],
+    plan: dict[str, Any],
+    draft: str,
+    corrections: list[Any],
+    model: str,
+) -> list[str]:
+    payload = {
+        "abstract": abstract,
+        "paper_text": paper_text,
+        "source_paragraphs": source_paragraphs,
+        "paper_evidence_plan": plan,
+        "draft": draft,
+        "corrections": corrections,
+    }
+    response_obj = _paper_completion_with_retry(
+        client,
+        model=model,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": PAPER_REVISION_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+    )
+    content = (response_obj.choices[0].message.content or "").strip()
+    try:
+        response = _json_from_text(content)
+    except (TypeError, json.JSONDecodeError):
+        response = {"markdown": content}
+    revised = response.get("sections") if isinstance(response, dict) else None
+    if not isinstance(revised, list):
+        return _paper_extract_section_bodies(content, plan["sections"])
+    if len(revised) != len(plan["sections"]):
+        raise RuntimeError("PAPER scientific revision returned invalid sections")
+    by_id = {str(section.get("id") or ""): section for section in revised if isinstance(section, dict)}
+    bodies: list[str] = []
+    for planned in plan["sections"]:
+        item = by_id.get(str(planned["id"]))
+        if item is None or not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise RuntimeError("PAPER scientific revision omitted a planned section")
+        bodies.append(_paper_section_body({"body": item["body"]}))
+    return bodies
+
+
+def _paper_editorial_rewrite(
+    client: OpenAI,
+    plan: dict[str, Any],
+    draft: str,
+    model: str,
+    style_exemplar: str,
+    lint_feedback: dict[str, int] | None = None,
+) -> list[str]:
+    payload = {
+        "paper_evidence_plan": plan,
+        "draft": draft,
+        "style_exemplar": style_exemplar,
+        "lint_feedback": lint_feedback or {},
+    }
+    response_obj = _paper_completion_with_retry(
+        client,
+        model=model,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": PAPER_EDITOR_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+    )
+    content = (response_obj.choices[0].message.content or "").strip()
+    try:
+        response = _json_from_text(content)
+    except (TypeError, json.JSONDecodeError):
+        response = {"markdown": content}
+    revised = response.get("sections") if isinstance(response, dict) else None
+    if not isinstance(revised, list):
+        return _paper_extract_section_bodies(content, plan["sections"])
+    if len(revised) != len(plan["sections"]):
+        raise RuntimeError("PAPER Chinese editor returned invalid sections")
+    by_id = {str(section.get("id") or ""): section for section in revised if isinstance(section, dict)}
+    bodies: list[str] = []
+    for planned in plan["sections"]:
+        item = by_id.get(str(planned["id"]))
+        if item is None or not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise RuntimeError("PAPER Chinese editor omitted a planned section")
+        bodies.append(_paper_section_body({"body": item["body"]}))
+    return bodies
+
+
+def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
+    patterns = {
+        "并非而是": r"并非[^。！？\n]{0,50}而是",
+        "其原因在于": r"其原因在于",
+        "也就是说": r"也就是说",
+        "不只是": r"不只是",
+        "不仅": r"不仅",
+        "值得注意的是": r"值得注意的是",
+        "进一步表明": r"进一步表明",
+        "总体而言": r"总体而言",
+        "由此可见": r"由此可见",
+        "这意味着": r"这意味着",
+    }
+    return {name: len(re.findall(pattern, markdown)) for name, pattern in patterns.items()}
+
+
+def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
+    return any(count > 1 for count in counts.values()) or sum(counts.values()) > 4
 
 
 def _is_transient_server_error(exc: Exception) -> bool:
@@ -689,39 +1002,49 @@ PAPER_EDITORIAL_GUIDE = (
 
 
 PAPER_STYLE_GUIDE = (
-    "根据提供的论文metadata、原始abstract和正文材料，写一篇正文主体优先约650到800个中文字符的中文论文解读。"
-    "这是硬性篇幅要求：标题、英文摘录、图片图注和文章信息不计入正文主体；返回前必须把正文主体压缩到650到800个中文字以内。"
-    "这是短篇高信息密度解读，不要扩写成长篇综述；小节数量和长度跟随论文实际科学结构，不规定固定数量或固定段落模板。每个小节只写紧凑的核心内容，不要把未来意义、限制和背景重复堆在最后一节。"
-    "摘要和正文导语必须优先忠实翻译输入的原始abstract：短摘要基本完整翻译，长摘要只可删除次要细节，不得增加abstract没有的结论、分类、机制或表述，也不得自行重组科学结论；中文应自然但保持原意。若abstract为空或不可用，才可用paper_text写出有据可查的简短fallback导语。"
-    '在写正文前，在本次生成内部建立section evidence plan：先以原始abstract的核心结果结构确定全文主线，再从Results、paper_text和source paragraphs为每个section分配主题、核心finding及evidence；每个finding只归属于一个主要section。正文必须覆盖abstract明确写出的主要发现，Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。先输出一个机器可解析的紧凑计划块，格式为<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1","title":"...","role":"phenomenon","source_paragraph_ids":["source-0"],"findings":[{"id":"E1","evidence":"...","anchors":["0.71"]}]}]} -->，然后输出最终Markdown；计划块不得显示在文章正文中。role是帮助保持section科学主题一致的简洁角色标签，使用最贴合论文的自然名称（例如phenomenon、mechanism、attribution、projection或implication），不要为了凑固定数量硬编码角色。source_paragraph_ids只能逐字使用用户输入source_paragraphs中提供的id（例如source-0），不得填写abstract、figure-1或自行发明的标签；摘要或图片信息只能写在evidence中。anchors必须保留原文的指标大小写、R/r标签、负号、数值和百分号，不能把r误写成R，也不能遗漏本section需要保留的高置信定量证据；不要把跨多个section重复出现的通用显著性标记（如P<0.01）当作anchor。不同科学阶段或科学角色只要各自有独立核心evidence，就优先拆成独立section：例如historical/model spread、mechanism、attribution和future projection分别回答不同问题时，不要因为通常约3到4个section的篇幅习惯而把attribution与projection合并。只有当Abstract或Results明确把它们作为同一结果链条且无法合理拆分时，才可放在同一section。'
-    "只有当abstract明确写出two modes、first mode/second mode、two regimes、two mechanisms或同等清楚的两部分结构时，才分别覆盖对应部分并避免遗漏；如果abstract没有明确这种结构，绝对不要自行创造第一模态、第二模态、第一类、第二类或其他类似分类。"
-    "对于abstract明确的每个核心mode、mechanism或regime，使用Results或paper_text补充原文支持的空间或对象特征、主要驱动因子和关键物理机制及数据；材料没有明确支持的内容不要补写。方法性能和归因统计（如重建相关系数、特征贡献或典型相关）必须集中在明确对应的方法或归因section，不要放入只描述现象或物理过程的前一section。不要因篇幅删除与当前section核心结论直接对应的关键数值或相关系数；完整覆盖核心结果优先于机械保持固定section数量，section标题和正文组织应跟随论文实际科学主线，不套固定模板。"
-    "优先保留研究问题、核心结果、关键机制和研究意义，主动删去冗余背景、重复解释、低价值细节和不影响结论的过程描述。"
-    "不要机械截断句子或为了凑字数罗列术语，而要在生成阶段压缩表达、合并重复信息，让每段承担一个明确功能。"
-    "重点呈现论文最重要的2到4个发现，不追求覆盖论文全部背景、方法、结果和讨论。"
-    "文风应像中文科技媒体编辑或科研作者整理一篇刚发表的研究：直接陈述研究发现、数据和作者判断，"
-    "让研究逻辑自然推进；专业准确，但不是论文摘要，也不要扮演老师给读者讲课。"
-    "研究结果、关键数据和作者判断可以自然连续推进，不要求每个结果后另加解释句或总结句。"
-    "不要连续多句只罗列模式名、变量、数值、数据集或术语；先理解论文，再用自然中文重新组织，"
-    "禁止逐句翻译英文摘要或正文。多用短句和中等长度句，避免英文式长定语、多层从句和被动表达。"
-    "所有科学事实必须来自输入论文材料。专业术语、数值、趋势、时间范围、模型、数据集、因果关系、"
-    "机制解释和结论必须忠于材料；材料没有明确支持时，不补充机制，不拔高意义。"
-    "如果paper_text中有适合支撑关键结论的句子，优先加入2到3组英文短引；每组保留1到2个连续且有信息量、语境完整的原文句子，"
-    "不要按固定的全篇英文词数机械截断；每组应保持精炼，通常不超过80个英文词，避免复制整段论文。"
-    "每处引用必须逐字复制自paper_text，绝对不能自行生成、改写或拼接；找不到合适原文就少引或不引。"
-    "引用格式为自然的Markdown引用块：> “……”；不要添加‘原文：’、‘英文原文：’或‘Original text:’标签。"
-    "引用可以自然嵌在相关中文段落之间，引用后可以直接继续正常叙述，不强制另写解释句，也不要大段复制论文。"
-    "结构采用一段独立的中文导语开场，必须在第一个##小节之前概括全文核心发现；导语不是第一个小节的正文，不能把小节首段当作摘要。"
-    "然后围绕关键发现或机制设置3到4个有信息量的小标题。"
-    "Treat each section heading as a strict scientific scope boundary and follow the section evidence plan: state each assigned finding and its evidence only in its primary section. Preserve core quantitative evidence there, but do not preview or import a following section's result, correlation, attribution, mechanism, or core conclusion into an earlier section. Transitional sentences may introduce the next topic without revealing its core evidence."
-    "不要固定写成‘研究背景/研究方法/研究结果/研究意义’，不要在正文重复标题或文章信息。"
-    "Markdown首行仍必须以‘# ’加用户数据中的display_title字段原文，之后不得再次重复标题。"
-    "不要创建来源、参考文献或文章信息栏目，不要自行插入图片；图片、图注和文章信息由现有pipeline处理。"
-    "图片只可依据图注文字理解，不得声称看过或分析过图片。\n\n"
-    + PAPER_EDITORIAL_GUIDE
+    "你是中文科研编辑，负责写一个PAPER section的正文。只依据输入的abstract、当前section的role/title、"
+    "当前section的findings和source_paragraphs写作；不要引入任何未提供的科学事实、数字、机制或下一section内容。"
+    "只返回当前section的中文正文，不返回标题、导语、计划、图片、参考文献或文章信息。"
+    "保留数字、趋势方向、时间范围、变量关系和因果强度；correlation不写成causation。"
+    "正文应自然、简洁、信息密度高，避免翻译腔、空泛总结和重复连接词。"
+    "如果有可核验的paper_text原句，可以保留短Markdown引用块，但不得改写或编造。"
+)
+
+PAPER_PLANNER_PROMPT = (
+    "你是Scientific Planner，不写文章正文。根据原始Abstract、paper_text、source_paragraphs和metadata，"
+    "建立唯一的paper_evidence_plan，并只返回严格JSON对象。Abstract决定全文主线，Results和source paragraphs只补充证据。"
+    "每个section包含id、title、role、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、evidence、quantitative anchors。"
+    "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
+    "是不同科学问题且各有独立核心证据，必须优先拆开；不要为凑3到4节而合并attribution与future projection，也不要固定section数量。"
+    "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
+    "XGBoost、SHAP、CCA、所有R/r相关系数、百分比归因和历史模式离散度等统计/归因证据必须放入attribution或明确的统计结果section；mechanism section只写物理过程和定性响应，不承载R/r或百分比统计anchor。SSP情景、时间段和未来离散度应放入独立projection section。不要在不同role重复同一核心finding或anchor。"
+    "role使用贴合论文的简洁自然标签，不要套固定taxonomy。source_paragraph_ids只能使用输入中真实存在的source id。"
+    "每个finding都要有anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
+    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","source_paragraph_ids":["source-0"],"findings":[{"id":"E1","evidence":"...","anchors":["R = 0.71"]}]}]}'
+)
+
+PAPER_REVIEWER_PROMPT = (
+    "你是Scientific Reviewer，只审核科学准确性和section结构，不润色文风，不重写全文。忠实翻译的Abstract导语应保持原始Abstract的结论和因果强度，不要要求改写原文已有表述；只检查导语是否新增或强化了Abstract没有的内容。检查Abstract核心结论覆盖、"
+    "证据与plan归属、数字/R/r/百分比/时间段、机制与因果强度、correlation与causation区分、重复finding，以及"
+    "mechanism/attribution/projection是否混在错误section，以及每个计划中的定量anchor是否在对应section实际保留。返回严格JSON："
+    '{"status":"pass"|"needs_revision","corrections":[{"section_id":"section-1","issue":"...","instruction":"..."}]}'
+)
+
+PAPER_REVISION_PROMPT = (
+    "你是Scientific Revision Editor。根据reviewer corrections修正科学内容，只返回严格JSON sections数组。"
+    "必须逐条落实corrections，不能原样保留reviewer指出的错误句子或仅添加免责声明；修正应针对具体问题，不得因此削弱Abstract明确支持的结论强度、删除核心finding或遗漏关键数字。"
+    "保留planner的section id和顺序；每个body只能写对应section的finding/evidence，不得把证据移动到别节，不得修改无问题的科学内容，不得润色成营销文案。返回："
+    '{"sections":[{"id":"section-1","body":"..."}]}'
+)
+
+PAPER_EDITOR_PROMPT = (
+    "你是中文科技编辑。输入稿件的科学内容已经锁定，只优化中文自然度、句式、节奏、冗余和AI套话。"
+    "严格保留planner的section id、顺序、role含义、数字、趋势、相关系数、时间段、因果关系和全部核心finding；"
+    "不得新增、删除、合并或移动科学证据，不得重写Abstract导语；保持正文主体约650到800个中文字符，但不要机械截断句子。避免反复使用并非而是、其原因在于、也就是说、"
+    "不只是、不仅、值得注意的是、进一步表明、总体而言、由此可见、这意味着。只返回严格JSON sections数组："
+    '{"sections":[{"id":"section-1","body":"..."}]}'
     + "\n\n"
-    + PAPER_STYLE_EXAMPLE
-    + "\n\n生成最终稿前在内部检查并直接修正：数字和科学结论是否保持原意；是否有section内容串位；是否加入原文不存在的机制；是否过度因果或拔高；是否有明显AI套话；是否连续使用相同句式；是否存在重复总结；是否有英文翻译腔；是否有可直接删除而不损失信息的句子；是否把每个section机械写成同一种模式。不要输出检查过程。"
+    + PAPER_EDITORIAL_GUIDE
 )
 
 
@@ -772,6 +1095,186 @@ def _remove_unverified_paper_quotes(markdown: str, paper_text: str) -> str:
     return "\n".join(output)
 
 
+def _write_article_files(
+    dossier: dict[str, Any],
+    settings: Settings,
+    output_dir: Path,
+    markdown: str,
+    paper_evidence_plan: dict[str, Any] | None = None,
+) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = output_dir / "article.md"
+    metadata_path = output_dir / "metadata.json"
+    markdown_path.write_text(markdown.strip() + "\n", encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "model": settings.model_name,
+                "source": dossier.get("url", ""),
+                "doi": dossier.get("doi", ""),
+                "images": dossier.get("images", []),
+                "paper_evidence_plan": paper_evidence_plan or {},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return markdown_path, metadata_path
+
+
+def _generate_paper_article_markdown(
+    dossier: dict[str, Any],
+    settings: Settings,
+    output_dir: Path,
+    display_title: str,
+) -> tuple[Path, Path]:
+    abstract = str(
+        dossier.get("abstract")
+        or (dossier.get("openalex") or {}).get("abstract")
+        or ""
+    ).strip()[:12000]
+    paper_text = str(dossier.get("text") or "")[:50000]
+    source_paragraphs = _paper_source_paragraph_records(paper_text or abstract)
+    for index, image in enumerate(dossier.get("images", []), start=1):
+        caption = str(image.get("caption") or image.get("description") or "").strip()
+        if caption:
+            source_paragraphs.append(
+                {"id": f"source-figure-{index}", "text": caption[:1200]}
+            )
+    valid_source_ids = {str(record["id"]) for record in source_paragraphs}
+    metadata = {
+        "title": dossier.get("title", ""),
+        "display_title": display_title,
+        "doi": dossier.get("doi", ""),
+        "journal": dossier.get("journal", ""),
+        "authors": dossier.get("authors", []),
+        "figure_captions": [
+            {
+                "caption": image.get("caption", ""),
+                "credit": image.get("credit", ""),
+                "license": image.get("license", ""),
+            }
+            for image in dossier.get("images", [])
+        ],
+        "model": settings.model_name,
+    }
+    client = OpenAI(
+        api_key=settings.model_api_key,
+        base_url=settings.model_base_url,
+        timeout=180.0,
+        max_retries=2,
+    )
+    plan = _paper_plan(client, abstract, paper_text, source_paragraphs, metadata)
+    plan["sections"] = _validate_paper_plan_structure(plan, valid_source_ids)
+    abstract_lead = translate_paper_abstract(abstract, settings) if abstract else ""
+
+    sections: list[dict[str, Any]] = []
+    for section in plan["sections"]:
+        sections.append(
+            {
+                **section,
+                "body": _paper_write_section(
+                    client,
+                    abstract,
+                    section,
+                    source_paragraphs,
+                    settings.model_name,
+                ),
+            }
+        )
+    draft = _paper_assemble_markdown(display_title, abstract_lead, sections)
+    review = _paper_review(
+        client,
+        abstract,
+        paper_text,
+        source_paragraphs,
+        plan,
+        draft,
+        settings.model_name,
+    )
+    for revision_attempt in range(2):
+        if review["status"] == "pass":
+            break
+        revised_bodies = _paper_revision(
+            client,
+            abstract,
+            paper_text,
+            source_paragraphs,
+            plan,
+            draft,
+            review["corrections"],
+            settings.model_name,
+        )
+        draft = _paper_assemble_markdown(
+            display_title,
+            abstract_lead,
+            [
+                {**section, "body": body}
+                for section, body in zip(plan["sections"], revised_bodies)
+            ],
+        )
+        review = _paper_review(
+            client,
+            abstract,
+            paper_text,
+            source_paragraphs,
+            plan,
+            draft,
+            settings.model_name,
+        )
+        if review["status"] == "pass":
+            break
+    else:
+        raise RuntimeError("PAPER scientific review failed after revision")
+
+    style_exemplar = _paper_style_exemplar()
+    editor_bodies = _paper_editorial_rewrite(
+        client,
+        plan,
+        draft,
+        settings.model_name,
+        style_exemplar,
+    )
+    markdown = _paper_assemble_markdown(
+        display_title,
+        abstract_lead,
+        [
+            {**section, "body": body}
+            for section, body in zip(plan["sections"], editor_bodies)
+        ],
+    )
+    lint = _paper_ai_style_lint(markdown)
+    if _paper_ai_style_lint_failed(lint):
+        editor_bodies = _paper_editorial_rewrite(
+            client,
+            plan,
+            markdown,
+            settings.model_name,
+            style_exemplar,
+            lint,
+        )
+        markdown = _paper_assemble_markdown(
+            display_title,
+            abstract_lead,
+            [
+                {**section, "body": body}
+                for section, body in zip(plan["sections"], editor_bodies)
+            ],
+        )
+        lint = _paper_ai_style_lint(markdown)
+        if _paper_ai_style_lint_failed(lint):
+            raise RuntimeError(f"PAPER Chinese editorial lint failed: {lint}")
+
+    markdown = _remove_unverified_paper_quotes(markdown, paper_text)
+    markdown = _normalize_article_markdown(markdown, display_title)
+    if not markdown:
+        raise RuntimeError("PAPER staged pipeline returned empty article")
+    _validate_paper_evidence_plan(plan, markdown, valid_source_ids)
+    dossier["paper_evidence_plan"] = plan
+    return _write_article_files(dossier, settings, output_dir, markdown, plan)
+
+
 def generate_article_markdown(
     dossier: dict[str, Any],
     settings: Settings,
@@ -784,17 +1287,16 @@ def generate_article_markdown(
     display_title = str(
         dossier.get("title_cn") or dossier.get("title") or "科研解读"
     ).strip()
+    if content_type == "paper":
+        return _generate_paper_article_markdown(dossier, settings, output_dir, display_title)
+
     safe_input = {
         "content_type": content_type,
         "display_title": display_title,
         "title": dossier.get("title", ""),
-        "news_summary": dossier.get("summary", "") if content_type == "popular" else "",
-        "news_text": str(
-            dossier.get("news_text")
-            or (dossier.get("text") if content_type == "popular" else "")
-            or ""
-        )[:50000],
-        "paper_text": str(dossier.get("text") if content_type == "paper" else "")[:50000],
+        "news_summary": dossier.get("summary", ""),
+        "news_text": str(dossier.get("news_text") or dossier.get("text") or "")[:50000],
+        "paper_text": "",
         "doi": dossier.get("doi", ""),
         "journal": dossier.get("journal", ""),
         "authors": dossier.get("authors", []),
@@ -808,21 +1310,6 @@ def generate_article_markdown(
             for image in dossier.get("images", [])
         ],
     }
-    paper_abstract = ""
-    source_paragraphs: list[dict[str, Any]] = []
-    if content_type == "paper":
-        paper_abstract = str(
-            dossier.get("abstract")
-            or (dossier.get("openalex") or {}).get("abstract")
-            or ""
-        ).strip()
-        safe_input["abstract"] = paper_abstract[:12000]
-        source_text = str(dossier.get("text") or paper_abstract)
-        source_paragraphs = _paper_source_paragraph_records(source_text)
-        safe_input["source_paragraphs"] = source_paragraphs
-    system_prompt = (
-        PAPER_STYLE_GUIDE if content_type == "paper" else NEWS_ARTICLE_PROMPT
-    )
     client = OpenAI(
         api_key=settings.model_api_key,
         base_url=settings.model_base_url,
@@ -833,56 +1320,17 @@ def generate_article_markdown(
         model=settings.model_name,
         temperature=0.3,
         messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
+            {"role": "system", "content": NEWS_ARTICLE_PROMPT},
             {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
         ],
     )
-    raw_markdown = (response.choices[0].message.content or "").strip()
-    paper_evidence_plan: dict[str, Any] = {}
-    if content_type == "paper":
-        paper_evidence_plan, raw_markdown = _extract_paper_evidence_plan(raw_markdown)
-    markdown = _remove_generated_terminal_sections(raw_markdown)
-    if content_type == "paper":
-        markdown = _remove_unverified_paper_quotes(
-            markdown,
-            str(safe_input["paper_text"]),
-        )
-    markdown = _normalize_article_markdown(markdown, display_title)
+    markdown = _normalize_article_markdown(
+        _remove_generated_terminal_sections((response.choices[0].message.content or "").strip()),
+        display_title,
+    )
     if not markdown:
         raise RuntimeError("model returned empty article")
-    if content_type == "paper" and paper_abstract:
-        abstract_lead = translate_paper_abstract(paper_abstract, settings)
-        markdown = _replace_paper_lead(markdown, abstract_lead)
-    if content_type == "paper":
-        _validate_paper_evidence_plan(
-            paper_evidence_plan,
-            markdown,
-            {str(record["id"]) for record in source_paragraphs},
-        )
-        dossier["paper_evidence_plan"] = paper_evidence_plan
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    markdown_path = output_dir / "article.md"
-    metadata_path = output_dir / "metadata.json"
-    markdown_path.write_text(markdown + "\n", encoding="utf-8")
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "model": settings.model_name,
-                "source": dossier.get("url", ""),
-                "doi": dossier.get("doi", ""),
-                "images": dossier.get("images", []),
-                "paper_evidence_plan": paper_evidence_plan if content_type == "paper" else {},
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return markdown_path, metadata_path
+    return _write_article_files(dossier, settings, output_dir, markdown)
 
 
 def article_output_dir(
