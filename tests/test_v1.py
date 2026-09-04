@@ -77,7 +77,9 @@ from publisher.wechat import (
 from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
+    _extract_paper_evidence_plan,
     _normalize_article_markdown,
+    _validate_paper_evidence_plan,
     generate_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
@@ -627,6 +629,16 @@ class V1Tests(unittest.TestCase):
 
         def fake_markdown(dossier, _settings, output_dir):
             captured["title_cn"] = dossier.get("title_cn")
+            dossier["paper_evidence_plan"] = {
+                "sections": [
+                    {
+                        "id": "section-1",
+                        "title": "关键结果",
+                        "source_paragraph_ids": ["source-0"],
+                        "findings": [],
+                    }
+                ]
+            }
             output_dir.mkdir(parents=True, exist_ok=True)
             markdown_path = output_dir / "article.md"
             metadata_path = output_dir / "metadata.json"
@@ -659,7 +671,7 @@ class V1Tests(unittest.TestCase):
             patch("news.pipeline._prepare_paper_markdown"),
         ):
             with tempfile.TemporaryDirectory() as tmp:
-                asyncio.run(
+                generated = asyncio.run(
                     pipeline.generate(
                         0,
                         "2026-09-03",
@@ -669,7 +681,12 @@ class V1Tests(unittest.TestCase):
                         output_dir=Path(tmp) / "paper",
                     )
                 )
-        self.assertEqual(captured["title_cn"], "中文完整标题")
+                self.assertEqual(captured["title_cn"], "中文完整标题")
+                metadata = json.loads(generated["metadata_path"].read_text(encoding="utf-8"))
+                self.assertEqual(
+                    metadata["paper_evidence_plan"]["sections"][0]["id"],
+                    "section-1",
+                )
 
     def test_papers_stays_frozen_after_current_candidate_is_published(self):
         async def check():
@@ -1923,6 +1940,57 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("简报中的其他科研进展", markdown)
         self.assertNotIn("Dolphin and slavery stories", markdown)
 
+    def test_paper_evidence_validator_rejects_anchor_in_wrong_section(self):
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "现象",
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [],
+                },
+                {
+                    "id": "section-2",
+                    "title": "机制",
+                    "source_paragraph_ids": ["source-1"],
+                    "findings": [],
+                },
+                {
+                    "id": "section-3",
+                    "title": "归因",
+                    "source_paragraph_ids": ["source-2"],
+                    "findings": [
+                        {
+                            "id": "E1",
+                            "evidence": "cross-model attribution",
+                            "anchors": ["-0.77"],
+                        }
+                    ],
+                },
+            ]
+        }
+        markdown = (
+            "# 测试标题\n\n摘要导语。\n\n"
+            "## 现象\n\n现象正文。\n\n"
+            "## 机制\n\n相关系数为−0.77。\n\n"
+            "## 归因\n\n归因正文。"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"evidence='-0.77'.*planned section='归因'.*actual section='机制'",
+        ):
+            _validate_paper_evidence_plan(plan, markdown)
+
+    def test_paper_evidence_plan_is_extracted_from_markdown(self):
+        raw = (
+            '<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1",'
+            '"title":"现象","source_paragraph_ids":["source-0"],"findings":[]}]} -->\n'
+            "# 标题\n\n## 现象\n\n正文。"
+        )
+        plan, markdown = _extract_paper_evidence_plan(raw)
+        self.assertEqual(plan["sections"][0]["id"], "section-1")
+        self.assertNotIn("PAPER_EVIDENCE_PLAN", markdown)
+
     def test_paper_prompt_uses_short_natural_style_and_verbatim_quote_rules(self):
         settings = replace(
             load_settings(),
@@ -1935,6 +2003,7 @@ class V1Tests(unittest.TestCase):
                 SimpleNamespace(
                     message=SimpleNamespace(
                         content=(
+                            '<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1","title":"关键结果","source_paragraph_ids":["source-0"],"findings":[]}]} -->\n'
                             "# 测试标题\n\n## 关键结果\n\n简短正文。\n\n"
                             "> “The supplied paper states an exact scientific result.”\n\n"
                             "这句引文支持上述判断。\n\n"
@@ -1955,14 +2024,21 @@ class V1Tests(unittest.TestCase):
                 )
             ]
         )
+        news_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="# 测试新闻\n\n新闻正文。")
+                )
+            ]
+        )
         client = MagicMock()
-        client.chat.completions.create.side_effect = [response, abstract_response, response]
+        client.chat.completions.create.side_effect = [response, abstract_response, news_response]
         with tempfile.TemporaryDirectory() as tmp, patch(
             "writer.llm.OpenAI",
             return_value=client,
         ):
             root = Path(tmp)
-            paper_path, _ = generate_article_markdown(
+            paper_path, paper_metadata_path = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
                     "title": "Test paper",
@@ -1987,6 +2063,9 @@ class V1Tests(unittest.TestCase):
             abstract_prompt = abstract_call.kwargs["messages"][0]["content"]
             abstract_input = json.loads(abstract_call.kwargs["messages"][1]["content"])
             paper_markdown = paper_path.read_text(encoding="utf-8")
+            paper_metadata = json.loads(paper_metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(paper_metadata["paper_evidence_plan"]["sections"][0]["id"], "section-1")
+            self.assertNotIn("PAPER_EVIDENCE_PLAN", paper_markdown)
             client.chat.completions.create.reset_mock()
             generate_article_markdown(
                 {
@@ -2041,7 +2120,9 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("> 原文：", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
         self.assertIn("独立的中文导语开场", paper_prompt)
-        self.assertIn("在本次生成内部静默建立section evidence plan", paper_prompt)
+        self.assertIn("在本次生成内部建立section evidence plan", paper_prompt)
+        self.assertIn("source_paragraph_ids只能逐字使用", paper_prompt)
+        self.assertIn("R/r标签", paper_prompt)
         self.assertIn("每个finding只归属于一个主要section", paper_prompt)
         self.assertIn("Treat each section heading as a strict scientific scope boundary", paper_prompt)
         self.assertIn("每个finding只归属于一个主要section", paper_prompt)
@@ -2064,6 +2145,7 @@ class V1Tests(unittest.TestCase):
         self.assertIn("生成最终稿前在内部检查并直接修正", paper_prompt)
         self.assertIn("是否有section内容串位", paper_prompt)
         self.assertEqual(paper_input["abstract"], "Paper abstract")
+        self.assertEqual(paper_input["source_paragraphs"][0]["id"], "source-0")
         self.assertEqual(paper_input["news_summary"], "")
         self.assertIn("只根据用户提供的原始Abstract", abstract_prompt)
         self.assertEqual(abstract_input, {"abstract": "Paper abstract"})

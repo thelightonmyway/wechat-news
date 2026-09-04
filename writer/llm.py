@@ -24,6 +24,115 @@ def _json_from_text(text: str) -> Any:
         return json.loads(match.group(0))
 
 
+def _normalize_evidence_anchor(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).replace("−", "-").replace("–", "-")
+
+
+def _paper_source_paragraph_records(source_text: str) -> list[dict[str, Any]]:
+    paragraphs = [
+        re.sub(r"\s+", " ", paragraph).strip()
+        for paragraph in re.split(r"\n+", source_text)
+        if paragraph.strip()
+    ]
+    return [
+        {"id": f"source-{index}", "text": paragraph[:1200]}
+        for index, paragraph in enumerate(paragraphs[:80])
+    ]
+
+
+def _extract_paper_evidence_plan(markdown: str) -> tuple[dict[str, Any], str]:
+    match = re.search(
+        r"<!--\s*PAPER_EVIDENCE_PLAN\s*(\{.*?\})\s*-->",
+        markdown,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        raise RuntimeError("PAPER evidence plan missing")
+    try:
+        plan = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"PAPER evidence plan is invalid JSON: {exc}") from exc
+    if not isinstance(plan, dict) or not isinstance(plan.get("sections"), list):
+        raise RuntimeError("PAPER evidence plan must contain a sections list")
+    return plan, (markdown[: match.start()] + markdown[match.end() :]).strip()
+
+
+def _paper_body_sections(markdown: str) -> list[tuple[str, str]]:
+    matches = list(re.finditer(r"(?m)^##\s+(.+?)\s*$", markdown))
+    sections: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        title = match.group(1).strip()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
+        if title in {"文章信息", "参考文献", "来源"}:
+            continue
+        body = markdown[match.end() : end]
+        body = "\n".join(
+            line
+            for line in body.splitlines()
+            if not line.lstrip().startswith((">", "![", "*Fig.", "*图", "图源：", "Source:"))
+        )
+        sections.append((title, body))
+    return sections
+
+
+def _validate_paper_evidence_plan(
+    plan: dict[str, Any],
+    markdown: str,
+    valid_source_paragraph_ids: set[str] | None = None,
+) -> None:
+    sections = _paper_body_sections(markdown)
+    planned_sections = plan.get("sections") or []
+    if not sections or not planned_sections:
+        raise RuntimeError("PAPER evidence plan validation failed: no body sections")
+    for planned_index, section in enumerate(planned_sections):
+        if not isinstance(section, dict):
+            raise RuntimeError("PAPER evidence plan validation failed: invalid section")
+        source_ids = section.get("source_paragraph_ids")
+        if not isinstance(source_ids, list) or not source_ids or not all(
+            isinstance(source_id, str) and source_id.strip() for source_id in source_ids
+        ):
+            raise RuntimeError(
+                "PAPER evidence plan validation failed: invalid source_paragraph_ids"
+            )
+        if valid_source_paragraph_ids is not None:
+            unknown_ids = set(source_ids) - valid_source_paragraph_ids
+            if unknown_ids:
+                raise RuntimeError(
+                    "PAPER evidence plan validation failed: unknown source paragraph ids: "
+                    + ", ".join(sorted(unknown_ids))
+                )
+        findings = section.get("findings") or []
+        if not isinstance(findings, list):
+            raise RuntimeError("PAPER evidence plan validation failed: invalid findings")
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            anchors = finding.get("anchors") or []
+            if not isinstance(anchors, list):
+                continue
+            for anchor in anchors:
+                normalized_anchor = _normalize_evidence_anchor(str(anchor))
+                if not normalized_anchor or re.fullmatch(
+                    r"[Pp][<>=]\d+(?:\.\d+)?", normalized_anchor
+                ):
+                    continue
+                actual_indexes = [
+                    index
+                    for index, (_, body) in enumerate(sections)
+                    if normalized_anchor in _normalize_evidence_anchor(body)
+                ]
+                if not actual_indexes:
+                    continue
+                if planned_index >= len(sections) or actual_indexes != [planned_index]:
+                    planned_title = str(section.get("title") or section.get("id") or planned_index + 1)
+                    actual_titles = ", ".join(sections[index][0] for index in actual_indexes)
+                    raise RuntimeError(
+                        "PAPER evidence section mismatch: "
+                        f"evidence={anchor!r}; planned section={planned_title!r}; "
+                        f"actual section={actual_titles!r}"
+                    )
+
+
 def _is_transient_server_error(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
@@ -584,7 +693,7 @@ PAPER_STYLE_GUIDE = (
     "这是硬性篇幅要求：标题、英文摘录、图片图注和文章信息不计入正文主体；返回前必须把正文主体压缩到650到800个中文字以内。"
     "这是短篇高信息密度解读，不要扩写成长篇综述；小节数量和长度跟随论文实际科学结构，不规定固定数量或固定段落模板。每个小节只写紧凑的核心内容，不要把未来意义、限制和背景重复堆在最后一节。"
     "摘要和正文导语必须优先忠实翻译输入的原始abstract：短摘要基本完整翻译，长摘要只可删除次要细节，不得增加abstract没有的结论、分类、机制或表述，也不得自行重组科学结论；中文应自然但保持原意。若abstract为空或不可用，才可用paper_text写出有据可查的简短fallback导语。"
-    "在写正文前，在本次生成内部静默建立section evidence plan：先以原始abstract的核心结果结构确定全文主线，再从Results、paper_text和source paragraphs为每个section分配主题、核心finding及evidence；每个finding只归属于一个主要section。正文必须覆盖abstract明确写出的主要发现，Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。不要输出这个plan。"
+    '在写正文前，在本次生成内部建立section evidence plan：先以原始abstract的核心结果结构确定全文主线，再从Results、paper_text和source paragraphs为每个section分配主题、核心finding及evidence；每个finding只归属于一个主要section。正文必须覆盖abstract明确写出的主要发现，Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。先输出一个机器可解析的紧凑计划块，格式为<!-- PAPER_EVIDENCE_PLAN {"sections":[{"id":"section-1","title":"...","source_paragraph_ids":["source-0"],"findings":[{"id":"E1","evidence":"...","anchors":["0.71"]}]}]} -->，然后输出最终Markdown；计划块不得显示在文章正文中。source_paragraph_ids只能逐字使用用户输入source_paragraphs中提供的id（例如source-0），不得填写abstract、figure-1或自行发明的标签；摘要或图片信息只能写在evidence中。anchors必须保留原文的指标大小写、R/r标签、负号、数值和百分号，不能把r误写成R，也不能遗漏本section需要保留的高置信定量证据；不要把跨多个section重复出现的通用显著性标记（如P<0.01）当作anchor。'
     "只有当abstract明确写出two modes、first mode/second mode、two regimes、two mechanisms或同等清楚的两部分结构时，才分别覆盖对应部分并避免遗漏；如果abstract没有明确这种结构，绝对不要自行创造第一模态、第二模态、第一类、第二类或其他类似分类。"
     "对于abstract明确的每个核心mode、mechanism或regime，使用Results或paper_text补充原文支持的空间或对象特征、主要驱动因子和关键物理机制及数据；材料没有明确支持的内容不要补写。方法性能和归因统计（如重建相关系数、特征贡献或典型相关）必须集中在明确对应的方法或归因section，不要放入只描述现象或物理过程的前一section。不要因篇幅删除与当前section核心结论直接对应的关键数值或相关系数；完整覆盖核心结果优先于机械保持固定section数量，section标题和正文组织应跟随论文实际科学主线，不套固定模板。"
     "优先保留研究问题、核心结果、关键机制和研究意义，主动删去冗余背景、重复解释、低价值细节和不影响结论的过程描述。"
@@ -700,6 +809,7 @@ def generate_article_markdown(
         ],
     }
     paper_abstract = ""
+    source_paragraphs: list[dict[str, Any]] = []
     if content_type == "paper":
         paper_abstract = str(
             dossier.get("abstract")
@@ -707,6 +817,9 @@ def generate_article_markdown(
             or ""
         ).strip()
         safe_input["abstract"] = paper_abstract[:12000]
+        source_text = str(dossier.get("text") or paper_abstract)
+        source_paragraphs = _paper_source_paragraph_records(source_text)
+        safe_input["source_paragraphs"] = source_paragraphs
     system_prompt = (
         PAPER_STYLE_GUIDE if content_type == "paper" else NEWS_ARTICLE_PROMPT
     )
@@ -727,9 +840,11 @@ def generate_article_markdown(
             {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
         ],
     )
-    markdown = _remove_generated_terminal_sections(
-        (response.choices[0].message.content or "").strip()
-    )
+    raw_markdown = (response.choices[0].message.content or "").strip()
+    paper_evidence_plan: dict[str, Any] = {}
+    if content_type == "paper":
+        paper_evidence_plan, raw_markdown = _extract_paper_evidence_plan(raw_markdown)
+    markdown = _remove_generated_terminal_sections(raw_markdown)
     if content_type == "paper":
         markdown = _remove_unverified_paper_quotes(
             markdown,
@@ -741,6 +856,13 @@ def generate_article_markdown(
     if content_type == "paper" and paper_abstract:
         abstract_lead = translate_paper_abstract(paper_abstract, settings)
         markdown = _replace_paper_lead(markdown, abstract_lead)
+    if content_type == "paper":
+        _validate_paper_evidence_plan(
+            paper_evidence_plan,
+            markdown,
+            {str(record["id"]) for record in source_paragraphs},
+        )
+        dossier["paper_evidence_plan"] = paper_evidence_plan
 
     output_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = output_dir / "article.md"
@@ -753,6 +875,7 @@ def generate_article_markdown(
                 "source": dossier.get("url", ""),
                 "doi": dossier.get("doi", ""),
                 "images": dossier.get("images", []),
+                "paper_evidence_plan": paper_evidence_plan if content_type == "paper" else {},
             },
             ensure_ascii=False,
             indent=2,
