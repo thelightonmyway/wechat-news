@@ -2042,6 +2042,8 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("> 原文：", paper_prompt)
         self.assertIn("最重要的2到4个发现", paper_prompt)
         self.assertIn("独立的中文导语开场", paper_prompt)
+        self.assertIn("Treat each section heading as a strict scientific scope boundary", paper_prompt)
+        self.assertIn("Do not preview or import quantitative results", paper_prompt)
         self.assertIn("原始abstract的核心结果结构", paper_prompt)
         self.assertIn("two modes、first mode/second mode、two regimes、two mechanisms", paper_prompt)
         self.assertIn("只有当abstract明确写出", paper_prompt)

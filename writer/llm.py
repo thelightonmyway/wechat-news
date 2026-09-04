@@ -590,6 +590,7 @@ PAPER_STYLE_GUIDE = (
     "引用可以自然嵌在相关中文段落之间，引用后可以直接继续正常叙述，不强制另写解释句，也不要大段复制论文。"
     "结构采用一段独立的中文导语开场，必须在第一个##小节之前概括全文核心发现；导语不是第一个小节的正文，不能把小节首段当作摘要。"
     "然后围绕关键发现或机制设置3到4个有信息量的小标题。"
+    "Treat each section heading as a strict scientific scope boundary. Do not preview or import quantitative results, correlations, attribution results, or mechanisms whose primary role belongs to the following section. Transitional sentences may introduce the next topic, but must not contain new core findings from that topic."
     "不要固定写成‘研究背景/研究方法/研究结果/研究意义’，不要在正文重复标题或文章信息。"
     "Markdown首行仍必须以‘# ’加用户数据中的display_title字段原文，之后不得再次重复标题。"
     "不要创建来源、参考文献或文章信息栏目，不要自行插入图片；图片、图注和文章信息由现有pipeline处理。"
