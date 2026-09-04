@@ -565,6 +565,35 @@ PAPER_STYLE_EXAMPLE = (
 )
 
 
+PAPER_EDITORIAL_GUIDE = (
+    "表达编辑规则（全部服从Abstract、原文证据和section scope约束）："
+    "1. 直接说主语和动作，少用空泛引导语；"
+    "2. 按已知信息到新信息推进句子；"
+    "3. 每个段落围绕一个主要科学问题；"
+    "4. 长定语拆成更短的主谓句；"
+    "5. 长短句自然交替；"
+    "6. 交替使用不同句式，避免连续同构句；"
+    "7. 少用‘进行、开展、实现’等空动词；"
+    "8. 少用不必要的名词化表达；"
+    "9. 普通语言保持直接简洁，必要术语保持准确；"
+    "10. 删除没有信息增益的句子；"
+    "11. 不重复Abstract、前句或本节已经说过的结论；"
+    "12. 不用机械的‘值得注意的是、进一步表明、总体而言、由此可见’串联全文；"
+    "13. 区分事实、结果、解释和推断；"
+    "14. 让结论强度与证据强度匹配；"
+    "15. 不把相关、伴随或一致性改写成因果；"
+    "16. 不把可能、提示或表明强化成证明、确定或必然；"
+    "17. 不增加原文没有的机制、分类、案例或意义；"
+    "18. 把关键数字、百分比、相关系数、趋势方向和限定条件原样保留；"
+    "19. 把每个section当作严格科学边界，不提前预告下一节的核心证据；"
+    "20. 不为了过渡把下一节的新数字、机制或结论塞进上一节；"
+    "21. 不强迫所有section使用相同的背景—结果—意义节奏；"
+    "22. 不写营销口号、夸张比喻、个人经历或空泛升华；"
+    "23. 优先使用自然中文主谓结构，减少英文翻译腔；"
+    "24. 每句话都应服务于主线、证据或必要解释。"
+)
+
+
 PAPER_STYLE_GUIDE = (
     "根据提供的论文metadata、原始abstract和正文材料，写一篇正文主体优先约650到800个中文字符的中文论文解读。"
     "这是硬性篇幅要求：标题、英文摘录、图片图注和文章信息不计入正文主体；返回前必须把正文主体压缩到650到800个中文字以内。"
@@ -572,7 +601,7 @@ PAPER_STYLE_GUIDE = (
     "摘要和正文导语必须优先忠实翻译输入的原始abstract：短摘要基本完整翻译，长摘要只可删除次要细节，不得增加abstract没有的结论、分类、机制或表述，也不得自行重组科学结论；中文应自然但保持原意。若abstract为空或不可用，才可用paper_text写出有据可查的简短fallback导语。"
     "先以原始abstract的核心结果结构作为全文最高优先级提纲，正文必须覆盖abstract明确写出的主要发现；Results或paper_text只用于补充这些结论的证据、机制和数据，不能取代abstract决定的文章主线。"
     "只有当abstract明确写出two modes、first mode/second mode、two regimes、two mechanisms或同等清楚的两部分结构时，才分别覆盖对应部分并避免遗漏；如果abstract没有明确这种结构，绝对不要自行创造第一模态、第二模态、第一类、第二类或其他类似分类。"
-    "对于abstract明确的每个核心mode、mechanism或regime，使用Results或paper_text补充原文支持的空间或对象特征、主要驱动因子和关键物理机制及数据；材料没有明确支持的内容不要补写。完整覆盖核心结果优先于机械保持固定section数量，section标题和正文组织应跟随论文实际科学主线，不套固定模板。"
+    "对于abstract明确的每个核心mode、mechanism或regime，使用Results或paper_text补充原文支持的空间或对象特征、主要驱动因子和关键物理机制及数据；材料没有明确支持的内容不要补写。方法性能和归因统计（如重建相关系数、特征贡献或典型相关）必须集中在明确对应的方法或归因section，不要放入只描述现象或物理过程的前一section。不要因篇幅删除与当前section核心结论直接对应的关键数值或相关系数；完整覆盖核心结果优先于机械保持固定section数量，section标题和正文组织应跟随论文实际科学主线，不套固定模板。"
     "优先保留研究问题、核心结果、关键机制和研究意义，主动删去冗余背景、重复解释、低价值细节和不影响结论的过程描述。"
     "不要机械截断句子或为了凑字数罗列术语，而要在生成阶段压缩表达、合并重复信息，让每段承担一个明确功能。"
     "重点呈现论文最重要的2到4个发现，不追求覆盖论文全部背景、方法、结果和讨论。"
@@ -590,12 +619,15 @@ PAPER_STYLE_GUIDE = (
     "引用可以自然嵌在相关中文段落之间，引用后可以直接继续正常叙述，不强制另写解释句，也不要大段复制论文。"
     "结构采用一段独立的中文导语开场，必须在第一个##小节之前概括全文核心发现；导语不是第一个小节的正文，不能把小节首段当作摘要。"
     "然后围绕关键发现或机制设置3到4个有信息量的小标题。"
-    "Treat each section heading as a strict scientific scope boundary. Do not preview or import quantitative results, correlations, attribution results, or mechanisms whose primary role belongs to the following section. Transitional sentences may introduce the next topic, but must not contain new core findings from that topic."
+    "Treat each section heading as a strict scientific scope boundary. Before drafting, silently build a section-to-claim map and assign each quantitative result, correlation, attribution result, mechanism, and core conclusion to one primary section, then state it only there. Preserve core quantitative evidence such as reported correlations and percentages, but place each item only in its primary section. Do not preview or import results whose primary role belongs to the following section, even as supporting evidence for an earlier mechanism. Transitional sentences may introduce the next topic, but must not contain new core findings from that topic."
     "不要固定写成‘研究背景/研究方法/研究结果/研究意义’，不要在正文重复标题或文章信息。"
     "Markdown首行仍必须以‘# ’加用户数据中的display_title字段原文，之后不得再次重复标题。"
     "不要创建来源、参考文献或文章信息栏目，不要自行插入图片；图片、图注和文章信息由现有pipeline处理。"
     "图片只可依据图注文字理解，不得声称看过或分析过图片。\n\n"
+    + PAPER_EDITORIAL_GUIDE
+    + "\n\n"
     + PAPER_STYLE_EXAMPLE
+    + "\n\n生成最终稿前在内部检查并直接修正：数字和科学结论是否保持原意；是否有section内容串位；是否加入原文不存在的机制；是否过度因果或拔高；是否有明显AI套话；是否连续使用相同句式；是否存在重复总结；是否有英文翻译腔；是否有可直接删除而不损失信息的句子；是否把每个section机械写成同一种模式。不要输出检查过程。"
 )
 
 

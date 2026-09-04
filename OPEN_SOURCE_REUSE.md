@@ -23,3 +23,14 @@ wechat-news keeps its current application structure and the existing `vendor/xia
 `vendor/xiaohu-wechat-format` remains ordinary vendored source rather than a Git submodule. The project includes local formatting adaptations and the `qihai` custom theme used by the author's deployment.
 
 The runtime-generated `vendor/xiaohu-wechat-format/config.json` is excluded from Git because it can contain WeChat credentials. Real AppIDs, AppSecrets, API keys, tokens, and OpenIDs must remain in local ignored configuration files.
+
+## Writing principle references
+
+The PAPER editorial guide distills principles from the following public writing-skill projects. Their
+repositories are not vendored and add no runtime dependencies:
+
+- [stop-slop](https://github.com/hardikpandya/stop-slop): directness, rhythm, density, and removal of repetitive AI-style prose.
+- [scientific-writing-skill](https://github.com/haoyu-haoyu/scientific-writing-skill): known-to-new progression, paragraph coherence, evidence-calibrated claims, and precise hedging.
+- [zh-scientific-humanizer](https://github.com/XuanjinZhu/zh-scientific-humanizer): natural Chinese scientific expression, terminology and number protection, and correlation-versus-causation control.
+- [ai-writing-humanizer](https://github.com/ZaynJarvis/ai-writing-humanizer): shorter Chinese sentence structure, fewer empty verbs and nominalizations, and less English translation syntax.
+- [plain-language-editor](https://github.com/marketingskills/plain-language-editor): clear main lines, explicit subjects and predicates, direct wording, and deletion of no-information sentences.
