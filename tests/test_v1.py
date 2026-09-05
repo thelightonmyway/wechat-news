@@ -2136,6 +2136,27 @@ class V1Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PAPER evidence figure mismatch"):
             _validate_paper_evidence_plan(plan, markdown, {"source-0"}, bundles)
 
+    def test_paper_74_percent_anchor_binds_to_fig3(self):
+        images = [
+            {"figure_number": 2, "caption": "Figure 2. XGBoost reconstruction R = 0.71; CCA R = 0.84."},
+            {"figure_number": 3, "caption": "Figure 3. Forest trend relation and percentage reduction in inter-model spread."},
+        ]
+        source_paragraphs = [
+            {"id": "source-0", "text": "XGBoost reconstruction is shown in Figure 2 with R = 0.71."},
+            {"id": "source-1", "text": "The forest relation is shown in Figure 3b with R = −0.77."},
+            {"id": "source-2", "text": "This corresponds to approximately 74% reduction in the inter-model spread."},
+            {"id": "source-3", "text": "(Figure 3d)."},
+        ]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        by_id = {bundle["figure_id"]: bundle for bundle in bundles}
+        self.assertIn("approximately 74%", by_id["Fig. 3"]["quantitative_anchors"])
+        self.assertNotIn("approximately 74%", by_id["Fig. 2"]["quantitative_anchors"])
+        self.assertIn("R = −0.77", by_id["Fig. 3"]["quantitative_anchors"])
+        self.assertNotIn("R = −0.77", by_id["Fig. 2"]["quantitative_anchors"])
+        self.assertIn("R = 0.71", by_id["Fig. 2"]["quantitative_anchors"])
+        self.assertIn("R = 0.84", by_id["Fig. 2"]["quantitative_anchors"])
+        self.assertEqual(by_id["Fig. 3"]["supported_figures_by_anchor"]["approximately 74%"], ["Fig. 3"])
+
     def test_paper_figure_bundle_contains_caption_and_source_links(self):
         images = [{"figure_number": 2, "caption": "Figure 2. XGBoost reconstruction R = 0.71."}]
         source_paragraphs = [{"id": "source-0", "text": "Results refer to Figure 2 and report R = 0.71."}]

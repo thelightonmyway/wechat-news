@@ -32,7 +32,9 @@ def _json_from_text(text: str) -> Any:
 
 
 def _normalize_evidence_anchor(value: str) -> str:
-    return re.sub(r"\s+", "", str(value or "")).replace("−", "-").replace("–", "-")
+    normalized = re.sub(r"\s+", "", str(value or ""))
+    normalized = re.sub(r"^(?:approximately|approx\.?|about|around|roughly|~|约|大约)", "", normalized, flags=re.IGNORECASE)
+    return normalized.replace("−", "-").replace("–", "-").replace("‐", "-")
 
 
 def _paper_source_paragraph_records(source_text: str) -> list[dict[str, Any]]:
@@ -43,7 +45,7 @@ def _paper_source_paragraph_records(source_text: str) -> list[dict[str, Any]]:
     ]
     return [
         {"id": f"source-{index}", "text": paragraph[:1200]}
-        for index, paragraph in enumerate(paragraphs[:80])
+        for index, paragraph in enumerate(paragraphs[:360])
     ]
 
 
@@ -57,7 +59,7 @@ def _paper_figure_id(value: Any) -> str:
 
 def _paper_figure_numbers_in_text(text: str) -> set[int]:
     numbers: set[int] = set()
-    for match in re.finditer(r"(?<!supplementary\s)(?:fig(?:ure)?\.?|图)\s*(\d+)", text, re.IGNORECASE):
+    for match in re.finditer(r"(?<!supplementary\s)(?<!supporting\s)(?:fig(?:ure)?\.?|图)\s*(\d+)", text, re.IGNORECASE):
         numbers.add(int(match.group(1)))
     return numbers
 
@@ -65,7 +67,7 @@ def _paper_figure_numbers_in_text(text: str) -> set[int]:
 def _paper_quantitative_anchors(text: str) -> list[str]:
     patterns = (
         r"[Rr]\s*=\s*[−-]?\s*\d+(?:\.\d+)?",
-        r"\d+(?:\.\d+)?\s*%",
+        r"(?:(?:approximately|approx\.?|about|around|roughly|~|约|大约)\s+)?\d+(?:\.\d+)?\s*%",
         r"SSP\s*\d+(?:[-‐–]\d+(?:\.\d+)?)?",
         r"\d{4}\s*[‐–-]\s*\d{4}",
     )
@@ -75,16 +77,142 @@ def _paper_quantitative_anchors(text: str) -> list[str]:
     return list(dict.fromkeys(anchors))
 
 
+def _paper_anchor_sentences(text: str) -> list[tuple[str, str]]:
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?。！？])\s+|\n+", text)
+        if sentence.strip()
+    ]
+    return [
+        (match.group(0).strip(), sentence)
+        for sentence in sentences
+        for pattern in (
+            r"[Rr]\s*=\s*[−-]?\s*\d+(?:\.\d+)?",
+            r"(?:(?:approximately|approx\.?|about|around|roughly|~|约|大约)\s+)?\d+(?:\.\d+)?\s*%",
+            r"SSP\s*\d+(?:[-‐–]\d+(?:\.\d+)?)?",
+            r"\d{4}\s*[‐–-]\s*\d{4}",
+        )
+        for match in re.finditer(pattern, sentence, re.IGNORECASE)
+    ]
+
+
+def _paper_figure_semantic_score(sentence: str, caption: str) -> int:
+    sentence_lower = sentence.lower()
+    caption_lower = caption.lower()
+    score = len(
+        {
+            token
+            for token in re.findall(r"[a-z0-9]+", sentence_lower)
+            if len(token) >= 4
+        }
+        & {
+            token
+            for token in re.findall(r"[a-z0-9]+", caption_lower)
+            if len(token) >= 4
+        }
+    )
+    if re.search(r"historical|1970|1979|2014", sentence_lower):
+        score += 4 if re.search(r"historical|1970|1979|2014", caption_lower) else 0
+        score -= 3 if re.search(r"future|projection|2025|2070|ssp", caption_lower) else 0
+    if re.search(r"future|projection|2025|2070|ssp", sentence_lower):
+        score += 4 if re.search(r"future|projection|2025|2070|ssp", caption_lower) else 0
+        score -= 3 if re.search(r"historical|1970|1979|2014", caption_lower) else 0
+    elif re.search(r"future|projection|2025|2070|ssp", caption_lower):
+        score -= 2
+    if "forest" in sentence_lower and "forest" in caption_lower:
+        score += 2
+    if re.search(r"inter[-‐– ]model spread", sentence_lower) and re.search(
+        r"inter[-‐– ]model|standard deviation|forest", caption_lower
+    ):
+        score += 2
+    return score
+
+
 def _paper_figure_evidence_bundles(
     selected_images: list[dict[str, Any]],
     source_paragraphs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    bundles: list[dict[str, Any]] = []
+    figure_info: list[tuple[str, int, str]] = []
     for index, image in enumerate(selected_images, start=1):
-        figure_id = _paper_figure_id(image.get("figure_number") or image.get("metadata_title") or index)
-        caption = str(image.get("caption") or image.get("original_caption") or image.get("alt") or "").strip()
-        figure_number_match = re.search(r"(\d+)", figure_id)
-        figure_number = int(figure_number_match.group(1)) if figure_number_match else index
+        figure_id = _paper_figure_id(
+            image.get("figure_number") or image.get("metadata_title") or index
+        )
+        number_match = re.search(r"(\d+)", figure_id)
+        figure_info.append(
+            (figure_id, int(number_match.group(1)) if number_match else index,
+             str(image.get("caption") or image.get("original_caption") or image.get("alt") or "").strip())
+        )
+
+    anchor_mentions: dict[str, list[tuple[str, str, set[int]]]] = {}
+    raw_anchor: dict[str, str] = {}
+    for record_index, record in enumerate(source_paragraphs):
+        record_id = str(record.get("id") or "")
+        record_text = str(record.get("text") or "")
+        for anchor, sentence in _paper_anchor_sentences(record_text):
+            key = _normalize_evidence_anchor(anchor)
+            raw_anchor.setdefault(key, anchor)
+            sentence_figures = _paper_figure_numbers_in_text(sentence)
+            paragraph_figures = _paper_figure_numbers_in_text(record_text)
+            nearby_text = " ".join(
+                [
+                    record_text,
+                    *[
+                        str(source_paragraphs[next_index].get("text") or "")
+                        for next_index in range(record_index + 1, min(len(source_paragraphs), record_index + 3))
+                    ],
+                ]
+            )
+            if (
+                not sentence_figures
+                and not paragraph_figures
+                and not re.search(r"supporting|supplementary|figure\s*s\d", sentence + " " + nearby_text, re.IGNORECASE)
+            ):
+                for previous in range(record_index - 1, max(-1, record_index - 5), -1):
+                    nearby = _paper_figure_numbers_in_text(
+                        str(source_paragraphs[previous].get("text") or "")
+                    )
+                    if nearby:
+                        paragraph_figures = nearby
+                        break
+            anchor_mentions.setdefault(key, []).append(
+                (sentence, record_id, sentence_figures or paragraph_figures)
+            )
+    for figure_id, _, caption in figure_info:
+        for anchor in _paper_quantitative_anchors(caption):
+            key = _normalize_evidence_anchor(anchor)
+            raw_anchor.setdefault(key, anchor)
+            anchor_mentions.setdefault(key, []).append((caption, f"caption:{figure_id}", set()))
+
+    supported_by_anchor: dict[str, set[str]] = {}
+    for key, mentions in anchor_mentions.items():
+        explicit: set[str] = set()
+        semantic_sentences: list[str] = []
+        for sentence, _, references in mentions:
+            if references:
+                explicit.update(
+                    figure_id
+                    for figure_id, figure_number, _ in figure_info
+                    if figure_number in references
+                )
+            else:
+                semantic_sentences.append(sentence)
+        if explicit:
+            supported_by_anchor[key] = explicit
+            continue
+        scores = {
+            figure_id: max(
+                (_paper_figure_semantic_score(sentence, caption) for sentence in semantic_sentences),
+                default=0,
+            )
+            for figure_id, _, caption in figure_info
+        }
+        best = max(scores.values(), default=0)
+        best_figures = [figure_id for figure_id, score in scores.items() if score == best]
+        if best > 0 and len(best_figures) == 1:
+            supported_by_anchor[key] = {best_figures[0]}
+
+    bundles: list[dict[str, Any]] = []
+    for figure_id, figure_number, caption in figure_info:
         caption_ids = [
             str(record["id"])
             for record in source_paragraphs
@@ -98,12 +226,11 @@ def _paper_figure_evidence_bundles(
             and figure_number in _paper_figure_numbers_in_text(str(record.get("text") or ""))
         ]
         direct_ids = list(dict.fromkeys([*caption_ids, *explicit_ids]))
-        evidence_items = [
-            str(record.get("text") or "")
-            for record in source_paragraphs
-            if str(record.get("id") or "") in direct_ids
+        supported_anchors = [
+            raw_anchor[key]
+            for key, supported_figures in supported_by_anchor.items()
+            if figure_id in supported_figures
         ]
-        evidence_text = " ".join([caption, *evidence_items])
         bundles.append(
             {
                 "figure_id": figure_id,
@@ -119,10 +246,15 @@ def _paper_figure_evidence_bundles(
                     {
                         "id": f"{figure_id}-caption",
                         "evidence": caption or figure_id,
-                        "quantitative_anchors": _paper_quantitative_anchors(evidence_text),
+                        "quantitative_anchors": supported_anchors,
                     }
                 ],
-                "quantitative_anchors": _paper_quantitative_anchors(evidence_text),
+                "quantitative_anchors": supported_anchors,
+                "supported_figures_by_anchor": {
+                    raw_anchor[key]: sorted(supported_figures)
+                    for key, supported_figures in supported_by_anchor.items()
+                    if figure_id in supported_figures
+                },
             }
         )
     return bundles
@@ -178,6 +310,16 @@ def _validate_paper_evidence_plan(
         for bundle in (figure_evidence_bundles or [])
         if isinstance(bundle, dict) and bundle.get("figure_id")
     }
+    supported_figures_by_anchor: dict[str, set[str]] = {}
+    for figure_id, bundle in bundles_by_id.items():
+        for anchor in bundle.get("quantitative_anchors", []):
+            supported_figures_by_anchor.setdefault(
+                _normalize_evidence_anchor(str(anchor)), set()
+            ).add(figure_id)
+        for anchor, figures in (bundle.get("supported_figures_by_anchor") or {}).items():
+            supported_figures_by_anchor.setdefault(
+                _normalize_evidence_anchor(str(anchor)), set()
+            ).update(_paper_figure_id(value) for value in figures)
     for planned_index, section in enumerate(planned_sections):
         if not isinstance(section, dict):
             raise RuntimeError("PAPER evidence plan validation failed: invalid section")
@@ -228,35 +370,41 @@ def _validate_paper_evidence_plan(
                 continue
             for anchor in anchors:
                 normalized_anchor = _normalize_evidence_anchor(str(anchor))
-                if not normalized_anchor or re.fullmatch(
-                    r"[Pp][<>=]\d+(?:\.\d+)?", normalized_anchor
+                if (
+                    not normalized_anchor
+                    or re.fullmatch(r"[Pp][<>=]\d+(?:\.\d+)?", normalized_anchor)
+                    or normalized_anchor in {"90%", "95%", "99%"}
                 ):
                     continue
                 if bundles_by_id:
-                    bundle_text = _normalize_evidence_anchor(
-                        " ".join(
-                            [
-                                str(bundles_by_id[figure_id].get("caption") or "")
-                                for figure_id in finding_figure_ids
-                            ]
-                            + [
-                                str(record.get("text") or "")
-                                for figure_id in finding_figure_ids
-                                for record in bundles_by_id[figure_id].get("source_paragraphs", [])
-                            ]
-                            + [
-                                str(anchor_value)
-                                for figure_id in finding_figure_ids
-                                for anchor_value in bundles_by_id[figure_id].get("quantitative_anchors", [])
-                            ]
+                    supported_figures = supported_figures_by_anchor.get(normalized_anchor, set())
+                    if supported_figures:
+                        if not set(finding_figure_ids).intersection(supported_figures):
+                            raise RuntimeError(
+                                "PAPER evidence figure mismatch: "
+                                f"evidence={anchor!r}; section={section.get('title')!r}; "
+                                f"figures={finding_figure_ids!r}; supported_figures={sorted(supported_figures)!r}"
+                            )
+                    else:
+                        bundle_text = _normalize_evidence_anchor(
+                            " ".join(
+                                [
+                                    str(bundles_by_id[figure_id].get("caption") or "")
+                                    for figure_id in finding_figure_ids
+                                ]
+                                + [
+                                    str(record.get("text") or "")
+                                    for figure_id in finding_figure_ids
+                                    for record in bundles_by_id[figure_id].get("source_paragraphs", [])
+                                ]
+                            )
                         )
-                    )
-                    if normalized_anchor not in bundle_text:
-                        raise RuntimeError(
-                            "PAPER evidence figure mismatch: "
-                            f"evidence={anchor!r}; section={section.get('title')!r}; "
-                            f"figures={finding_figure_ids!r}"
-                        )
+                        if normalized_anchor not in bundle_text:
+                            raise RuntimeError(
+                                "PAPER evidence figure mismatch: "
+                                f"evidence={anchor!r}; section={section.get('title')!r}; "
+                                f"figures={finding_figure_ids!r}"
+                            )
                 actual_indexes = [
                     index
                     for index, (_, body) in enumerate(sections)
@@ -1558,6 +1706,8 @@ def _generate_paper_article_markdown(
             source_paragraphs.append(
                 {"id": f"source-figure-{index}", "text": caption[:1200]}
             )
+    if abstract and paper_text:
+        source_paragraphs.insert(0, {"id": "source-abstract", "text": abstract})
     valid_source_ids = {str(record["id"]) for record in source_paragraphs}
     figure_first = isinstance(dossier.get("paper_selected_body_images"), list)
     selected_images = (
