@@ -2165,6 +2165,118 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(bundles[0]["explicit_source_paragraph_ids"], ["source-0"])
         self.assertIn("R = 0.71", bundles[0]["quantitative_anchors"])
 
+    def test_paper_provenance_figure_specific_mismatch_is_rejected(self):
+        images = [
+            {"figure_number": 2, "caption": "Figure 2. Correlation coefficient R = 0.71."},
+            {"figure_number": 3, "caption": "Figure 3. Forest correlation R = −0.77."},
+        ]
+        source_paragraphs = [
+            {"id": "source-0", "text": "The reconstruction reports R = 0.71 in Figure 2."},
+        ]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "森林结果",
+                    "figure_ids": ["Fig. 3"],
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E1", "evidence": "错误归属", "anchors": ["R = 0.71"]}],
+                }
+            ]
+        }
+        markdown = "# 标题\n\n## 森林结果\n\nR = 0.71。"
+        with self.assertRaisesRegex(RuntimeError, "PAPER evidence figure mismatch"):
+            _validate_paper_evidence_plan(plan, markdown, {"source-0"}, bundles)
+
+    def test_paper_provenance_contextual_period_does_not_require_a_figure(self):
+        images = [{"figure_number": 1, "caption": "Figure 1. Historical wind-speed patterns."}]
+        source_paragraphs = [
+            {"id": "source-0", "text": "The full-paper historical period is 1970–2014."},
+        ]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        provenance = [record for bundle in bundles for record in bundle["provenance"]]
+        self.assertEqual(provenance[0]["scope"], "global_context")
+        self.assertEqual(provenance[0]["supported_figures"], [])
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "历史模拟",
+                    "figure_ids": ["Fig. 1"],
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E1", "evidence": "研究时段", "anchors": ["1970–2014"]}],
+                }
+            ]
+        }
+        markdown = "# 标题\n\n## 历史模拟\n\n研究时段为1970—2014。"
+        _validate_paper_evidence_plan(plan, markdown, {"source-0"}, bundles)
+
+    def test_paper_provenance_projection_period_is_section_context(self):
+        images = [{"figure_number": 4, "caption": "Figure 4. Future wind-speed projection spread."}]
+        source_paragraphs = [
+            {"id": "source-0", "text": "The abstract introduces the study."},
+            {"id": "source-1", "text": "The projection periods are 2025–2054 and 2070–2099."},
+        ]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        records = [
+            record
+            for bundle in bundles
+            for record in bundle["provenance"]
+            if record["normalized_value"] == "2025-2054"
+        ]
+        self.assertEqual(records[0]["scope"], "section_context")
+        self.assertEqual(records[0]["supported_figures"], [])
+
+    def test_paper_provenance_same_sentence_keeps_anchor_with_nearest_figure(self):
+        images = [
+            {"figure_number": 2, "caption": "Figure 2. Reconstruction correlation."},
+            {"figure_number": 3, "caption": "Figure 3. Forest correlation."},
+        ]
+        source_paragraphs = [{
+            "id": "source-0",
+            "text": "XGBoost reconstruction reports R = 0.71 (Figure 2a); forest correlation reports R = −0.77 (Figure 3b).",
+        }]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        by_id = {bundle["figure_id"]: bundle for bundle in bundles}
+        self.assertEqual(by_id["Fig. 2"]["supported_figures_by_anchor"]["R = 0.71"], ["Fig. 2"])
+        self.assertEqual(by_id["Fig. 3"]["supported_figures_by_anchor"]["R = −0.77"], ["Fig. 3"])
+        self.assertNotIn("R = 0.71", by_id["Fig. 3"]["quantitative_anchors"])
+
+    def test_paper_provenance_ambiguous_reference_stays_contextual(self):
+        images = [
+            {"figure_number": 2, "caption": "Figure 2. Reconstruction."},
+            {"figure_number": 3, "caption": "Figure 3. Forest result."},
+        ]
+        source_paragraphs = [{
+            "id": "source-0",
+            "text": "The result R = 0.71 is reported across Figure 2 and Figure 3.",
+        }]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        records = [
+            record
+            for bundle in bundles
+            for record in bundle["provenance"]
+            if record["normalized_value"] == "R=0.71"
+        ]
+        self.assertTrue(records)
+        self.assertTrue(all(record["scope"] != "figure_specific" for record in records))
+        self.assertTrue(all(not record["supported_figures"] for record in records))
+
+    def test_paper_provenance_supplementary_reference_is_not_main_figure_support(self):
+        images = [{"figure_number": 1, "caption": "Figure 1. Main result."}]
+        source_paragraphs = [{
+            "id": "source-0",
+            "text": "Supplementary Figure 2 reports R = 0.55.",
+        }]
+        bundles = _paper_figure_evidence_bundles(images, source_paragraphs)
+        self.assertNotIn("R = 0.55", bundles[0]["quantitative_anchors"])
+        self.assertTrue(all(
+            "R=0.55" != record["normalized_value"]
+            or not record["supported_figures"]
+            for record in bundles[0]["provenance"]
+        ))
+
     def test_paper_pruning_uses_actual_allocation_and_reviewer_decision(self):
         plan = {
             "sections": [
