@@ -99,6 +99,7 @@ from writer.llm import (
     _paper_figure_evidence_bundles,
     _paper_readability_audit,
     _paper_stop_slop_audit,
+    _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
     _paper_validate_story_plan,
@@ -150,6 +151,21 @@ def _story_output_for_evidence(count: int, bodies: list[str] | None = None) -> l
         }
         for index in range(1, count + 1)
     ]
+
+
+def _story_block_output(
+    beat_id: str,
+    blocks: list[tuple[str, list[str], str]],
+    title: str = "专业结果",
+) -> list[dict[str, object]]:
+    return [{
+        "id": beat_id,
+        "title": title,
+        "blocks": [
+            {"id": block_id, "evidence_ids": evidence_ids, "text": text}
+            for block_id, evidence_ids, text in blocks
+        ],
+    }]
 
 
 class V1Tests(unittest.TestCase):
@@ -2551,25 +2567,17 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(story_writer.call_count, 2)
         self.assertNotIn("并非A而是B", final_text)
 
-    def test_paper_abstract_compression_targets_mobile_length(self):
-        long_translation = "研究问题聚焦中国近地面风速模式差异。" + "结果显示森林覆盖变化是主要驱动因素，并解释不同模式的风速趋势差异。" * 8
-        compressed = (
-            "不同气候模式对中国风速变化的判断差别很大。"
-            "研究发现，森林变化可解释约74%的差异，森林损失越大，风速下降越不明显。"
-            "更准确地描述森林变化，有助于减少未来风速预测的不确定性，也让预测更可靠。"
-        )
+    def test_paper_abstract_translation_is_not_compressed(self):
+        faithful = "这是完整的中文摘要翻译。研究结果和限定条件全部保留。" + "重要结果继续保留。" * 20
         client = MagicMock()
-        client.chat.completions.create.side_effect = [
-            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": long_translation}, ensure_ascii=False))) ]),
-            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": compressed}, ensure_ascii=False))) ]),
-        ]
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": faithful}, ensure_ascii=False)))]
+        )
         settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
         with patch("writer.llm.OpenAI", return_value=client):
             result = translate_paper_abstract("Original abstract", settings)
-        self.assertLessEqual(_paper_chinese_char_count(result), 120)
-        self.assertGreaterEqual(_paper_chinese_char_count(result), 80)
-        self.assertLessEqual(len(re.findall(r"[。！？]", result)), 3)
-        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(result, faithful)
+        self.assertEqual(client.chat.completions.create.call_count, 1)
 
     def test_paper_body_length_and_readability_audits(self):
         markdown = (
@@ -2637,6 +2645,7 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("Fig. 1", serialized)
         self.assertNotIn("source-figure-1", serialized)
         self.assertNotIn("panel a", serialized)
+        self.assertNotIn("abstract", payload)
 
     def test_paper_plain_language_cleanup_reduces_technical_shorthand(self):
         cleaned = _paper_plain_language_cleanup(
@@ -2678,6 +2687,119 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(sections[0]["figure_ids"], ["Fig. 2", "Fig. 3"])
         self.assertEqual(sections[0]["source_paragraph_ids"], ["source-1", "source-2"])
 
+    def test_paper_title_style_lint_flags_media_headlines(self):
+        markdown = "# 标题\n\n## 同一片中国，模式为何不同\n\n正文。\n\n## 森林变化改写了结果\n\n正文。"
+        lint = _paper_title_style_lint(markdown)
+        self.assertEqual(lint["issue_count"], 3)
+        self.assertTrue(all(item["term"] in {"同一片中国", "为何", "改写"} for item in lint["issues"]))
+
+    def test_paper_story_writer_rejects_mixed_figure_groups_in_block(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "sections": [{
+                    "id": "beat-1",
+                    "title": "专业结果",
+                    "blocks": [{
+                        "id": "block-1",
+                        "evidence_ids": ["evidence-1", "evidence-2"],
+                        "text": "两个结果分别为R = 0.71和R = -0.77。",
+                    }],
+                }]
+            }, ensure_ascii=False)))]
+        )
+        clean_evidence = [
+            {"evidence_id": "evidence-1", "evidence_group": "evidence_group_A", "anchors": ["R = 0.71"]},
+            {"evidence_id": "evidence-2", "evidence_group": "evidence_group_B", "anchors": ["R = -0.77"]},
+        ]
+        story_plan = _story_plan_for_evidence(1)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-1", "evidence-2"]
+        with self.assertRaisesRegex(RuntimeError, "mixed different Figure evidence groups"):
+            _paper_story_writer(client, story_plan, clean_evidence, "", "test-model")
+
+    def test_paper_story_block_validator_rejects_anchor_in_wrong_figure_block(self):
+        bundles = [
+            {"figure_id": "Fig. 2", "quantitative_anchors": ["R = 0.71"]},
+            {"figure_id": "Fig. 3", "quantitative_anchors": ["R = -0.77"]},
+        ]
+        plan = {
+            "sections": [{
+                "id": "beat-1",
+                "title": "专业结果",
+                "figure_ids": ["Fig. 2", "Fig. 3"],
+                "source_paragraph_ids": ["source-0"],
+                "findings": [
+                    {"id": "E1", "figure_ids": ["Fig. 2"], "evidence": "重构", "anchors": ["R = 0.71"]},
+                    {"id": "E2", "figure_ids": ["Fig. 3"], "evidence": "森林", "anchors": ["R = -0.77"]},
+                ],
+                "story_beat": {"evidence_ids": ["evidence-1", "evidence-2"]},
+                "story_evidence": {},
+                "blocks": [
+                    {"id": "block-a", "evidence_ids": ["evidence-1"], "figure_ids": ["Fig. 3"], "text": "R = 0.71。"},
+                    {"id": "block-b", "evidence_ids": ["evidence-2"], "figure_ids": ["Fig. 2"], "text": "R = -0.77。"},
+                ],
+            }],
+            "story_evidence": {
+                "evidence-1": {"figure_ids": ["Fig. 2"], "anchors": ["R = 0.71"]},
+                "evidence-2": {"figure_ids": ["Fig. 3"], "anchors": ["R = -0.77"]},
+            },
+        }
+        markdown = "# 标题\n\n## 专业结果\n\nR = 0.71。\n\nR = -0.77。"
+        with self.assertRaisesRegex(RuntimeError, "PAPER evidence block figure mismatch"):
+            _validate_paper_evidence_plan(plan, markdown, {"source-0"}, bundles)
+
+    def test_paper_story_block_validator_rejects_negative_anchor_in_wrong_figure_block(self):
+        bundles = [
+            {"figure_id": "Fig. 2", "quantitative_anchors": []},
+            {"figure_id": "Fig. 3", "quantitative_anchors": ["R = -0.77"]},
+        ]
+        plan = {
+            "sections": [{
+                "id": "beat-1",
+                "title": "专业结果",
+                "figure_ids": ["Fig. 2", "Fig. 3"],
+                "source_paragraph_ids": ["source-0"],
+                "findings": [{"id": "E1", "figure_ids": ["Fig. 3"], "evidence": "森林", "anchors": ["R = -0.77"]}],
+                "story_beat": {"evidence_ids": ["evidence-1"]},
+                "blocks": [{"id": "block-a", "evidence_ids": ["evidence-1"], "figure_ids": ["Fig. 2"], "text": "R = -0.77。"}],
+            }],
+            "story_evidence": {"evidence-1": {"figure_ids": ["Fig. 3"], "anchors": ["R = -0.77"]}},
+        }
+        markdown = "# 标题\n\n## 专业结果\n\nR = -0.77。"
+        with self.assertRaisesRegex(RuntimeError, "PAPER evidence block figure mismatch"):
+            _validate_paper_evidence_plan(plan, markdown, {"source-0"}, bundles)
+
+    def test_paper_humanizer_payload_is_block_scoped_without_abstract(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "block": {"id": "block-1", "evidence_ids": ["evidence-1"], "text": "R = 0.71。"}
+            }, ensure_ascii=False)))]
+        )
+        story_plan = _story_plan_for_evidence(1)
+        clean_evidence = [{"evidence_id": "evidence-1", "evidence_group": "evidence_group_A", "anchors": ["R = 0.71"]}]
+        from writer.llm import _paper_humanize_story
+        _paper_humanize_story(
+            client,
+            story_plan,
+            clean_evidence,
+            [{"beat_id": "beat-1", "blocks": [{"id": "block-1", "evidence_ids": ["evidence-1"], "text": "R = 0.71。"}]}],
+            "test-model",
+        )
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertIn("current_block", payload)
+        self.assertIn("clean_evidence", payload)
+        self.assertNotIn("draft_blocks_by_beat", payload)
+        self.assertNotIn("abstract", payload)
+        self.assertNotIn("beat-2", json.dumps(payload, ensure_ascii=False))
+
+    def test_paper_plain_language_cleanup_splits_semicolons_and_removes_abstract_term(self):
+        cleaned = _paper_plain_language_cleanup("结果为R = 0.71；陆地—大气通量发生变化。")
+        self.assertNotIn("；", cleaned)
+        self.assertNotIn("陆地—大气通量", cleaned)
+        self.assertIn("陆面与大气之间的交换", cleaned)
+        self.assertNotIn("approximately", _paper_plain_language_cleanup("约approximately 74%的差异。"))
+
     def test_paper_stop_slop_audit_catches_numbered_figure_reportage(self):
         markdown = (
             "# 标题\n\n"
@@ -2699,8 +2821,8 @@ class V1Tests(unittest.TestCase):
     def test_paper_popular_science_editor_prompt_prioritizes_plain_language(self):
         self.assertIn("Popular Science Editor", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
         self.assertIn("普通中文", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
-        self.assertIn("问题—发现—解释/意义", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
-        self.assertIn("70到120个汉字", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("直接的科学陈述", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("350到500个中文字符", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
         self.assertIn("Story Planner", PAPER_STORY_PLANNER_PROMPT)
         self.assertIn("Story Writer", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("350到500个中文字符", PAPER_STORY_WRITER_PROMPT)
@@ -3111,7 +3233,7 @@ class V1Tests(unittest.TestCase):
         ), patch(
             "writer.llm._paper_humanize_story", return_value=_story_output_for_evidence(1, ["重试后仍丢失数字。"])
         ):
-            with self.assertRaisesRegex(RuntimeError, "PAPER evidence anchor missing"):
+            with self.assertRaisesRegex(RuntimeError, "PAPER story block validation failed"):
                 generate_article_markdown(
                     {
                         "content_type": PAPER_CONTENT,
@@ -3271,7 +3393,8 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(len(calls), 6)
             self.assertIn("Scientific Planner", calls[0].kwargs["messages"][0]["content"])
             abstract_prompt = calls[1].kwargs["messages"][0]["content"]
-            self.assertIn("80到120个汉字", abstract_prompt)
+            self.assertIn("完整保留原文的重要背景", abstract_prompt)
+            self.assertNotIn("80到120个汉字", abstract_prompt)
             reviewer_prompt = calls[5].kwargs["messages"][0]["content"]
             section_payloads = [json.loads(calls[index].kwargs["messages"][1]["content"]) for index in (2, 3, 4)]
             self.assertEqual([payload["section"]["id"] for payload in section_payloads], ["section-1", "section-2", "section-3"])
@@ -3316,6 +3439,42 @@ class V1Tests(unittest.TestCase):
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("abstract", news_input)
         self.assertEqual(news_input["news_summary"], "News summary")
+
+    def test_paper_figures_follow_their_evidence_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images_dir = root / "images"
+            images_dir.mkdir()
+            figure_two = images_dir / "figure-02.png"
+            figure_three = images_dir / "figure-03.png"
+            figure_two.write_bytes(b"png")
+            figure_three.write_bytes(b"png")
+            markdown = root / "article.md"
+            markdown.write_text(
+                "## 植被变化\n\n机器学习重构得到R = 0.71。\n\n森林相关结果为R = -0.77。\n",
+                encoding="utf-8",
+            )
+            images = [
+                {"local_path": str(figure_two), "figure_number": 2, "caption": "Figure 2", "image_role": "figure"},
+                {"local_path": str(figure_three), "figure_number": 3, "caption": "Figure 3", "image_role": "figure"},
+            ]
+            dossier = {
+                "content_type": PAPER_CONTENT,
+                "paper_evidence_plan": {
+                    "sections": [{
+                        "title": "植被变化",
+                        "blocks": [
+                            {"figure_ids": ["Fig. 2"], "text": "机器学习重构得到R = 0.71。"},
+                            {"figure_ids": ["Fig. 3"], "text": "森林相关结果为R = -0.77。"},
+                        ],
+                    }],
+                },
+            }
+            _insert_paper_figures(markdown, images, ["图2说明。", "图3说明。"], dossier)
+            text = markdown.read_text(encoding="utf-8")
+            self.assertLess(text.index("R = 0.71"), text.index("![Fig. 2]"))
+            self.assertLess(text.index("![Fig. 2]"), text.index("R = -0.77"))
+            self.assertLess(text.index("R = -0.77"), text.index("![Fig. 3]"))
 
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(

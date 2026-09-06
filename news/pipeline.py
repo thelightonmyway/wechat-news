@@ -2019,6 +2019,47 @@ def _insert_paper_figures(
                         "section": str(section.get("section") or ""),
                     }
                 )
+    block_slots_by_figure: dict[str, list[tuple[int, int, int]]] = {}
+    evidence_plan = dossier.get("paper_evidence_plan")
+    if isinstance(evidence_plan, dict):
+        normalized_slots = [
+            (slot_index, end, section_index, re.sub(r"\s+", "", context))
+            for slot_index, (end, section_index, context) in enumerate(slots)
+        ]
+        for section in evidence_plan.get("sections", []):
+            for block in section.get("blocks", []) if isinstance(section, dict) else []:
+                if not isinstance(block, dict):
+                    continue
+                block_text = re.sub(r"\s+", "", str(block.get("text") or ""))
+                if not block_text:
+                    continue
+                for figure in block.get("figure_ids") or []:
+                    figure_key = str(figure)
+                    matches = []
+                    for slot_index, end, section_index, context in normalized_slots:
+                        if block_text not in context:
+                            continue
+                        major_section = next(
+                            (
+                                major_index
+                                for major_index, major in enumerate(section_slots)
+                                if block_text in re.sub(r"\s+", "", major[3])
+                            ),
+                            section_index,
+                        )
+                        matches.append((slot_index, end, major_section))
+                    if matches:
+                        block_slots_by_figure.setdefault(figure_key, []).append(matches[0])
+        if block_slots_by_figure:
+            ordered_entries.sort(
+                key=lambda entry: (
+                    min(
+                        (target[1] for target in block_slots_by_figure.get(_paper_image_label(entry[0]), [])),
+                        default=10**9,
+                    ),
+                    image_order.index(images.index(entry[0])) if entry[0] in images else 10**9,
+                )
+            )
     used_slots: set[int] = set()
     inserted_image_keys: set[str] = set()
     inserted_section_records: list[dict[str, Any]] = []
@@ -2030,8 +2071,14 @@ def _insert_paper_figures(
             if image_key in inserted_image_keys:
                 continue
             mapped_section = None
+            block_insertion = None
+            block_targets = block_slots_by_figure.get(image_key, [])
+            if block_targets:
+                slot_index, block_insertion, mapped_section = block_targets[0]
             mapped_targets = mapped_sections.get(image_key, [])
             for target in mapped_targets:
+                if mapped_section is not None:
+                    break
                 target_heading = str(target.get("section") or "").strip()
                 matching_sections = [
                     section_index
@@ -2073,7 +2120,10 @@ def _insert_paper_figures(
                     relevance,
                     key=lambda candidate: (relevance[candidate], -candidate),
                 )
-            insertion_index = section_slots[section_index][1]
+            if block_insertion is not None:
+                insertion_index = block_insertion
+            else:
+                insertion_index = section_slots[section_index][1]
             last_numbered_section = section_index
         else:
             eligible = [
