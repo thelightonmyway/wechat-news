@@ -981,7 +981,25 @@ def _paper_style_exemplar() -> str:
         except OSError:
             continue
         sections = _paper_body_sections(text)
-        excerpt = "\n\n".join(f"## {title}\n{body.strip()}" for title, body in sections[:3])
+        lines = text.splitlines()
+        first_section = next(
+            (index for index, line in enumerate(lines) if re.match(r"^##\s+", line.strip())),
+            len(lines),
+        )
+        lead = "\n".join(
+            line.strip()
+            for line in lines[1:first_section]
+            if line.strip() and not line.strip().startswith(("![", "*Fig.", "*图"))
+        ).strip()
+        excerpt_parts = []
+        if lead:
+            excerpt_parts.append(f"导语\n{lead[:700]}")
+        excerpt_parts.extend(f"## {title}\n{body.strip()}" for title, body in sections[:2])
+        if sections:
+            transition = re.split(r"(?<=[。！？.!?])\s*", sections[min(1, len(sections) - 1)][1].strip())[0]
+            if transition:
+                excerpt_parts.append(f"自然过渡样例\n{transition}")
+        excerpt = "\n\n".join(excerpt_parts)
         if excerpt:
             excerpts.append(excerpt[:1800])
     return "\n\n---\n\n".join(excerpts)
