@@ -851,6 +851,8 @@ def _paper_style_exemplar() -> str:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
+    preferred = [path for path in paths if "2026jd046858" in path.parent.name.lower()]
+    paths = preferred + [path for path in paths if path not in preferred]
     excerpts: list[str] = []
     for path in paths[:2]:
         try:
@@ -862,6 +864,337 @@ def _paper_style_exemplar() -> str:
         if excerpt:
             excerpts.append(excerpt[:1800])
     return "\n\n---\n\n".join(excerpts)
+
+
+def _paper_clean_story_text(text: str) -> str:
+    """Remove backend Figure/source labels before handing evidence to story writers."""
+    cleaned = str(text or "")
+    cleaned = re.sub(
+        r"(?i)(?<![A-Za-z])(?:supplementary|supporting)\s+(?:figure|fig)\.?\s*\d+(?:[ \t]*[a-z](?![A-Za-z]))?(?![A-Za-z0-9])",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?i)(?<![A-Za-z])(?:figure|fig)\.?\s*\d+(?:[ \t]*[a-z](?![A-Za-z]))?(?![A-Za-z0-9])", "", cleaned)
+    cleaned = re.sub(r"图\s*\d+[A-Za-z]?\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\bsource-figure-\d+\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\b(?:as shown in|shown in|see)\s*,?", "", cleaned)
+    cleaned = re.sub(r"如图(?:所示)?[，,：:]?", "", cleaned)
+    cleaned = re.sub(r"(?i)\bpanel\s*[a-d]\b", "", cleaned)
+    cleaned = re.sub(r"\(\s*[a-d]\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([，。；：！？,.!?])", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def _paper_plain_language_cleanup(text: str) -> str:
+    """Translate non-essential technical shorthand without touching verified values."""
+    cleaned = str(text or "")
+    replacements = (
+        (r"(?i)(?<![A-Za-z0-9])9[-‐]year high[-‐]pass Butterworth filter(?![A-Za-z])", "九年周期滤波方法"),
+        (r"(?i)(?<![A-Za-z0-9])high[-‐]pass Butterworth filter(?![A-Za-z])", "滤波方法"),
+        (r"(?i)(?<![A-Za-z0-9])standard deviation(?![A-Za-z])", "标准差"),
+        (r"(?i)(?<![A-Za-z0-9])unit:\s*days(?![A-Za-z])", "单位为天"),
+        (r"(?i)(?<![A-Za-z0-9])Equation\s*\d+(?![A-Za-z0-9])", "能量分解"),
+        (r"(?i)(?<![A-Za-z0-9])surface albedo feedback(?![A-Za-z])", "地表反照率反馈"),
+        (r"(?i)(?<![A-Za-z0-9])latent heat flux(?![A-Za-z])", "潜热通量"),
+        (r"(?i)(?<![A-Za-z0-9])sensible heat flux(?![A-Za-z])", "感热通量"),
+        (r"(?i)(?<![A-Za-z0-9])soil moisture(?![A-Za-z])", "土壤水分"),
+        (r"(?i)(?<![A-Za-z0-9])evaporation(?![A-Za-z])", "蒸发"),
+        (r"(?i)\bpositive and negative SNAO phases\b", "北大西洋涛动的正负位相"),
+        (r"(?i)\bpositive Summer North Atlantic Oscillation \(SNAO\)\b", "夏季北大西洋涛动正位相"),
+        (r"(?i)\bnegative SNAO years\b", "北大西洋涛动负位相年份"),
+        (r"(?i)\bSummer North Atlantic Oscillation\b", "夏季北大西洋涛动"),
+        (r"(?i)\bEastern Pacific \(EP\) El Niño\b", "东太平洋型厄尔尼诺"),
+        (r"(?i)\bCentral Pacific \(CP\) El Niño\b", "中太平洋型厄尔尼诺"),
+        (r"(?i)\bEP La Niña\b", "东太平洋型拉尼娜"),
+        (r"(?i)\bCP La Niña\b", "中太平洋型拉尼娜"),
+        (r"(?i)\bEl Niño\b", "厄尔尼诺"),
+        (r"(?i)\bLa Niña\b", "拉尼娜"),
+        (r"(?i)(?<![A-Za-z])ENSO(?![A-Za-z])", "厄尔尼诺—拉尼娜现象"),
+        (r"(?i)(?<![A-Za-z])SNAO(?![A-Za-z])", "夏季北大西洋涛动"),
+        (r"(?i)(?<![A-Za-z])WAF(?![A-Za-z])", "波活动通量"),
+        (r"(?i)(?<![A-Za-z])JJA(?![A-Za-z])", "夏季"),
+        (r"(?i)(?<![A-Za-z])DJF(?![A-Za-z])", "冬季"),
+        (r"(?i)(?<![A-Za-z])SAF(?![A-Za-z])", "地表反照率反馈"),
+        (r"(?i)(?<![A-Za-z])index(?![A-Za-z])", "指数"),
+        (r"(?i)Correlation coefficients", "相关系数"),
+        (r"(?i)regionally averaged heat-day", "区域平均高温日"),
+        (r"(?i)compound hot-dry event", "复合高温干旱事件"),
+        (r"(?i)dry-day", "干旱日"),
+        (r"(?i)m\s*s\s*[−-]\s*1", "米/秒"),
+        (r"(?i)ΔCRFs", "云辐射强迫变化"),
+        (r"\(1\s*[−-]\s*α\s*\)Δ\s*S\s*↓,?\s*clr", "晴空短波辐射项"),
+        (r"Δ\s*F\s*↓,?\s*clr", "晴空长波辐射项"),
+        (r"Δ\s*Q", "热储存项"),
+        (r"Δ\s*\(\s*H\s*\+\s*LE\s*\)", "湍流通量项"),
+        (r"(?i)(?<![A-Za-z])positive(?![A-Za-z])", "正位相"),
+        (r"(?i)(?<![A-Za-z])negative(?![A-Za-z])", "负位相"),
+    )
+    for pattern, replacement in replacements:
+        cleaned = re.sub(pattern, replacement, cleaned)
+    cleaned = re.sub(r"(夏季北大西洋涛动)[-‐](正位相|负位相)", r"\1\2", cleaned)
+    cleaned = cleaned.replace("地表反照率反馈用于表示地表反照率反馈", "地表反照率反馈")
+    cleaned = cleaned.replace("地表反照率反馈反馈", "地表反照率反馈")
+    cleaned = cleaned.replace("图中的", "其中")
+    cleaned = re.sub(r"(?<=[一-鿿])\s+(?=[一-鿿])", "", cleaned)
+    return cleaned
+
+
+def _paper_clean_story_evidence(
+    plan: dict[str, Any],
+    source_paragraphs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, tuple[dict[str, Any], dict[str, Any]]]]:
+    source_by_id = {str(record.get("id") or ""): record for record in source_paragraphs}
+    evidence: list[dict[str, Any]] = []
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    counter = 1
+    for section in plan.get("sections") or []:
+        section_sources = [
+            _paper_clean_story_text(source_by_id[source_id].get("text", ""))
+            for source_id in section.get("source_paragraph_ids") or []
+            if source_id in source_by_id
+        ]
+        for finding in section.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            evidence_id = f"evidence-{counter}"
+            counter += 1
+            source_evidence = list(dict.fromkeys(text for text in section_sources if text))
+            record = {
+                "evidence_id": evidence_id,
+                "role": str(section.get("role") or "").strip(),
+                "core_finding": _paper_clean_story_text(finding.get("evidence", "")),
+                "anchors": [str(anchor) for anchor in finding.get("anchors") or [] if str(anchor).strip()],
+                "source_evidence": source_evidence[:8],
+            }
+            evidence.append(record)
+            evidence_map[evidence_id] = (section, finding)
+    return evidence, evidence_map
+
+
+def _paper_validate_story_plan(
+    story_plan: dict[str, Any],
+    valid_evidence_ids: set[str],
+) -> list[dict[str, Any]]:
+    brief = story_plan.get("editorial_brief")
+    if not isinstance(brief, dict) or not all(
+        isinstance(brief.get(field), str) and brief[field].strip()
+        for field in ("audience", "purpose", "tone", "reader_should_leave_with", "story_question")
+    ):
+        raise RuntimeError("PAPER story planner returned an invalid editorial brief")
+    beats = story_plan.get("story_beats")
+    if not isinstance(beats, list) or not 1 <= len(beats) <= 4:
+        raise RuntimeError("PAPER story planner returned an invalid beat count")
+    seen_ids: set[str] = set()
+    used_evidence: set[str] = set()
+    validated: list[dict[str, Any]] = []
+    for beat_index, beat in enumerate(beats):
+        if not isinstance(beat, dict):
+            raise RuntimeError("PAPER story planner returned an invalid story beat")
+        beat_id = str(beat.get("id") or "").strip()
+        title = _paper_clean_story_text(beat.get("title", ""))
+        reader_question = _paper_clean_story_text(beat.get("reader_question", ""))
+        core_message = _paper_clean_story_text(beat.get("core_message", ""))
+        transition = _paper_clean_story_text(beat.get("transition_to_next", ""))
+        evidence_ids = [str(value).strip() for value in beat.get("evidence_ids") or [] if str(value).strip()]
+        if (
+            not beat_id
+            or beat_id in seen_ids
+            or not title
+            or not reader_question
+            or not core_message
+            or not evidence_ids
+            or (not transition and beat_index != len(beats) - 1)
+            or not set(evidence_ids).issubset(valid_evidence_ids)
+        ):
+            raise RuntimeError("PAPER story planner returned invalid story beat fields")
+        if used_evidence.intersection(evidence_ids):
+            raise RuntimeError("PAPER story planner reused evidence across story beats")
+        seen_ids.add(beat_id)
+        used_evidence.update(evidence_ids)
+        validated.append(
+            {
+                "id": beat_id,
+                "title": title,
+                "reader_question": reader_question,
+                "core_message": core_message,
+                "evidence_ids": list(dict.fromkeys(evidence_ids)),
+                "transition_to_next": transition or "文章收束。",
+            }
+        )
+    if used_evidence != valid_evidence_ids:
+        raise RuntimeError("PAPER story planner omitted or invented evidence")
+    story_plan["editorial_brief"] = {
+        field: _paper_clean_story_text(brief[field])
+        for field in ("audience", "purpose", "tone", "reader_should_leave_with", "story_question")
+    }
+    story_plan["story_beats"] = validated
+    return validated
+
+
+def _paper_story_sections(
+    story_beats: list[dict[str, Any]],
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    for beat in story_beats:
+        source_ids: list[str] = []
+        figure_ids: list[str] = []
+        roles: list[str] = []
+        findings: list[dict[str, Any]] = []
+        seen_findings: set[int] = set()
+        for evidence_id in beat["evidence_ids"]:
+            original_section, finding = evidence_map[evidence_id]
+            role = str(original_section.get("role") or "").strip()
+            if role and role not in roles:
+                roles.append(role)
+            for source_id in original_section.get("source_paragraph_ids") or []:
+                if source_id not in source_ids:
+                    source_ids.append(source_id)
+            for figure_id in original_section.get("figure_ids") or original_section.get("selected_body_figures") or []:
+                normalized = _paper_figure_id(figure_id)
+                if normalized not in figure_ids:
+                    figure_ids.append(normalized)
+            marker = id(finding)
+            if marker not in seen_findings:
+                findings.append(finding)
+                seen_findings.add(marker)
+        sections.append(
+            {
+                "id": beat["id"],
+                "title": beat["title"],
+                "role": roles[0] if len(roles) == 1 else "story",
+                "figure_ids": figure_ids,
+                "source_paragraph_ids": source_ids,
+                "findings": findings,
+                "story_beat": {
+                    "reader_question": beat["reader_question"],
+                    "core_message": beat["core_message"],
+                    "evidence_ids": beat["evidence_ids"],
+                    "transition_to_next": beat["transition_to_next"],
+                },
+            }
+        )
+    return sections
+
+
+def _paper_story_planner(
+    client: OpenAI,
+    clean_evidence: list[dict[str, Any]],
+    style_exemplar: str,
+    model: str,
+    feedback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _paper_completion_json(
+        client,
+        PAPER_STORY_PLANNER_PROMPT,
+        {
+            "editorial_brief_request": {
+                "audience": "跨专业、受过高等教育但非该领域专家的读者",
+                "purpose": "用几分钟讲清论文最值得知道的科学发现",
+                "tone": "清楚、自然、克制、有解释感，不像论文、汇报或营销稿",
+            },
+            "clean_evidence": clean_evidence,
+            "style_exemplar": style_exemplar,
+            "targeted_feedback": feedback or {},
+            "_model": model,
+            "_temperature": 0.15,
+        },
+    )
+
+
+def _paper_story_writer(
+    client: OpenAI,
+    story_plan: dict[str, Any],
+    clean_evidence: list[dict[str, Any]],
+    style_exemplar: str,
+    model: str,
+    feedback: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
+    beat_evidence = [
+        {
+            "beat_id": beat["id"],
+            "evidence": [evidence_by_id[evidence_id] for evidence_id in beat["evidence_ids"]],
+        }
+        for beat in story_plan["story_beats"]
+    ]
+    response = _paper_completion_json(
+        client,
+        PAPER_STORY_WRITER_PROMPT,
+        {
+            "editorial_brief": story_plan["editorial_brief"],
+            "story_beats": story_plan["story_beats"],
+            "clean_evidence_by_beat": beat_evidence,
+            "style_exemplar": style_exemplar,
+            "targeted_feedback": feedback or {},
+            "_model": model,
+            "_temperature": 0.25,
+        },
+    )
+    sections = response.get("sections")
+    if not isinstance(sections, list) or len(sections) != len(story_plan["story_beats"]):
+        raise RuntimeError("PAPER story writer returned invalid sections")
+    by_id = {str(item.get("id") or ""): item for item in sections if isinstance(item, dict)}
+    output: list[dict[str, str]] = []
+    for beat in story_plan["story_beats"]:
+        item = by_id.get(beat["id"])
+        if item is None or not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise RuntimeError("PAPER story writer omitted a story beat")
+        title = _paper_clean_story_text(item.get("title") or beat["title"]) or beat["title"]
+        output.append({
+            "id": beat["id"],
+            "title": _paper_plain_language_cleanup(title),
+            "body": _paper_plain_language_cleanup(_paper_section_body({"body": item["body"]})),
+        })
+    return output
+
+
+def _paper_humanize_story(
+    client: OpenAI,
+    story_plan: dict[str, Any],
+    clean_evidence: list[dict[str, Any]],
+    draft: str,
+    model: str,
+    feedback: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
+    beat_evidence = [
+        {
+            "beat_id": beat["id"],
+            "evidence": [evidence_by_id[evidence_id] for evidence_id in beat["evidence_ids"]],
+        }
+        for beat in story_plan["story_beats"]
+    ]
+    response = _paper_completion_json(
+        client,
+        PAPER_HUMANIZER_PROMPT,
+        {
+            "editorial_brief": story_plan["editorial_brief"],
+            "story_beats": story_plan["story_beats"],
+            "clean_evidence_by_beat": beat_evidence,
+            "draft": _paper_clean_story_text(draft),
+            "targeted_feedback": feedback or {},
+            "_model": model,
+            "_temperature": 0.2,
+        },
+    )
+    sections = response.get("sections")
+    if not isinstance(sections, list) or len(sections) != len(story_plan["story_beats"]):
+        raise RuntimeError("PAPER humanizer returned invalid sections")
+    by_id = {str(item.get("id") or ""): item for item in sections if isinstance(item, dict)}
+    output: list[dict[str, str]] = []
+    for beat in story_plan["story_beats"]:
+        item = by_id.get(beat["id"])
+        if item is None or not isinstance(item.get("body"), str) or not item["body"].strip():
+            raise RuntimeError("PAPER humanizer omitted a story beat")
+        title = _paper_clean_story_text(item.get("title") or beat["title"]) or beat["title"]
+        output.append({
+            "id": beat["id"],
+            "title": _paper_plain_language_cleanup(title),
+            "body": _paper_plain_language_cleanup(_paper_section_body({"body": item["body"]})),
+        })
+    return output
 
 
 def _paper_completion_json(client: OpenAI, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -899,6 +1232,7 @@ def _paper_plan(
     metadata: dict[str, Any],
     selected_figure_ids: list[str] | None = None,
     figure_evidence_bundles: list[dict[str, Any]] | None = None,
+    validation_feedback: str = "",
 ) -> dict[str, Any]:
     return _paper_completion_json(
         client,
@@ -910,6 +1244,7 @@ def _paper_plan(
             "metadata": metadata,
             "selected_body_figures": selected_figure_ids or [],
             "figure_evidence_bundles": figure_evidence_bundles or [],
+            "validation_feedback": validation_feedback,
             "_model": metadata["model"],
             "_temperature": 0.1,
         },
@@ -1141,35 +1476,48 @@ def _paper_editorial_rewrite(
     style_exemplar: str,
     lint_feedback: dict[str, Any] | None = None,
     abstract: str = "",
+    story_context: dict[str, Any] | None = None,
 ) -> list[str]:
-    section_bundles = {
-        str(section.get("id") or ""): [
-            bundle
-            for bundle in plan.get("figure_evidence_bundles") or []
-            if _paper_figure_id(bundle.get("figure_id")) in {
-                _paper_figure_id(value)
-                for value in section.get("figure_ids") or section.get("selected_body_figures") or []
-            }
-        ]
-        for section in plan.get("sections") or []
-    }
-    payload = {
-        "abstract": abstract,
-        "paper_evidence_plan": plan,
-        "verified_key_findings": [
-            {
-                "section_id": section.get("id"),
-                "title": section.get("title"),
-                "role": section.get("role"),
-                "findings": section.get("findings") or [],
-                "figure_bundles": section_bundles.get(str(section.get("id") or ""), []),
-            }
+    if story_context is not None:
+        payload = {
+            "abstract": abstract,
+            "story_first_mode": True,
+            "editorial_brief": story_context["story_plan"]["editorial_brief"],
+            "story_beats": story_context["story_plan"]["story_beats"],
+            "clean_evidence": story_context["clean_evidence"],
+            "draft": _paper_clean_story_text(draft),
+            "style_exemplar": style_exemplar,
+            "audit_feedback": lint_feedback or {},
+        }
+    else:
+        section_bundles = {
+            str(section.get("id") or ""): [
+                bundle
+                for bundle in plan.get("figure_evidence_bundles") or []
+                if _paper_figure_id(bundle.get("figure_id")) in {
+                    _paper_figure_id(value)
+                    for value in section.get("figure_ids") or section.get("selected_body_figures") or []
+                }
+            ]
             for section in plan.get("sections") or []
-        ],
-        "draft": draft,
-        "style_exemplar": style_exemplar,
-        "audit_feedback": lint_feedback or {},
-    }
+        }
+        payload = {
+            "abstract": abstract,
+            "paper_evidence_plan": plan,
+            "verified_key_findings": [
+                {
+                    "section_id": section.get("id"),
+                    "title": section.get("title"),
+                    "role": section.get("role"),
+                    "findings": section.get("findings") or [],
+                    "figure_bundles": section_bundles.get(str(section.get("id") or ""), []),
+                }
+                for section in plan.get("sections") or []
+            ],
+            "draft": draft,
+            "style_exemplar": style_exemplar,
+            "audit_feedback": lint_feedback or {},
+        }
     response_obj = _paper_completion_with_retry(
         client,
         model=model,
@@ -1322,6 +1670,56 @@ def _paper_readability_audit(markdown: str) -> dict[str, Any]:
                 "suggestion": "先用普通中文解释，再保留必要的专业词。",
             })
     return {"issues": issues, "issue_count": len(issues)}
+
+
+def _paper_stop_slop_audit(markdown: str) -> dict[str, Any]:
+    """Audit final story shape without attempting another full rewrite."""
+    sections = _paper_body_sections(markdown)
+    issues: list[dict[str, Any]] = []
+    figure_refs = re.findall(
+        r"(?i)(?:\b(?:figure|fig)\.?\s*\d+\s*[a-z]?\b|图\s*\d+\s*[A-Za-z]?|图中|图表|图示)",
+        markdown,
+    )
+    if figure_refs:
+        issues.append({"type": "figure_reportage", "count": len(figure_refs)})
+    numbered = re.findall(r"(?:第一|第二|第三|第四|首先|其次|再次|最后)", markdown)
+    if numbered:
+        issues.append({"type": "numbered_structure", "terms": list(dict.fromkeys(numbered))})
+    lint = _paper_ai_style_lint(markdown)
+    if _paper_ai_style_lint_failed(lint):
+        issues.append({"type": "ai_connective_template", "counts": lint})
+    first_sentences = []
+    for _, body in sections:
+        sentence = re.split(r"(?<=[。！？.!?])\s*", body.strip(), maxsplit=1)[0]
+        if sentence:
+            first_sentences.append(_normalize_evidence_anchor(sentence))
+    if len(first_sentences) >= 3 and len(set(first_sentences)) < len(first_sentences):
+        issues.append({"type": "repeated_section_opening"})
+    sentence_lengths = [
+        _paper_chinese_char_count(sentence.strip())
+        for _, body in sections
+        for sentence in re.split(r"(?<=[。！？.!?])\s*", body)
+        if sentence.strip()
+    ]
+    if len(sentence_lengths) >= 4 and max(sentence_lengths) - min(sentence_lengths) <= 12:
+        issues.append({"type": "uniform_sentence_rhythm"})
+    readability = _paper_readability_audit(markdown)
+    if readability["issue_count"] >= 3:
+        issues.append({
+            "type": "high_technical_density",
+            "count": readability["issue_count"],
+            "examples": readability["issues"][:5],
+        })
+    section_count = len(sections)
+    substantial_sections = sum(_paper_chinese_char_count(body) >= 35 for _, body in sections)
+    metrics = {
+        "directness": max(0.0, 1.0 - min(1.0, len(figure_refs) / 2)),
+        "rhythm": max(0.0, 1.0 - min(1.0, sum(item["type"] == "uniform_sentence_rhythm" for item in issues))),
+        "naturalness": max(0.0, 1.0 - min(1.0, len(numbered) / 4)),
+        "information_density": round(substantial_sections / section_count, 2) if section_count else 0.0,
+        "template_risk": round(min(1.0, len(issues) / 5), 2),
+    }
+    return {"metrics": metrics, "issues": issues, "issue_count": len(issues)}
 
 
 def _paper_editor_anchor_audit(
@@ -1957,6 +2355,54 @@ PAPER_STYLE_GUIDE = (
     "如果有可核验的paper_text原句，可以保留短Markdown引用块，但不得改写或编造。"
 )
 
+PAPER_FIDELITY_CONTRACT = (
+    "保真约束：原始事实、数字及其修饰对象、主体和来源不变；correlation不能写成causation；"
+    "uncertainty、suggest、indicate、可能、表明等限定不能强化；不新增原文没有的机制、原因或意义。"
+    "能用普通中文解释术语就解释，但不能为追求自然而牺牲科学准确性。"
+)
+
+PAPER_STORY_PLANNER_PROMPT = (
+    "你是Story Planner，先读懂房间，再为已经通过Figure-first科学验证的证据设计自然的公众号故事线。"
+    "读者是跨专业、受过高等教育但非该领域专家的人；目的不是逐项汇报结果，而是用几分钟讲清论文最值得知道的发现。"
+    "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
+    "再把clean_evidence组织成2到4个story beats，通常约3个但不要硬凑。每个beat包含id、title、reader_question、core_message、"
+    "evidence_ids和transition_to_next。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
+    "允许多个证据共同进入一个beat；标题要推进新信息，不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
+    "只学习style_exemplar的中文节奏、句长、信息密度和推进方式，不复制其中的科学事实、数字、地点、机制或句子。"
+    "返回严格JSON："
+    '{"editorial_brief":{"audience":"...","purpose":"...","tone":"...","reader_should_leave_with":"...","story_question":"..."},'
+    '"story_beats":[{"id":"beat-1","title":"...","reader_question":"...","core_message":"...","evidence_ids":["evidence-1"],"transition_to_next":"..."}]}'
+)
+
+PAPER_STORY_WRITER_PROMPT = (
+    "你是Story Writer，为跨专业读者写一篇自然的中文科学公众号正文。你只能看到按beat分组的clean evidence和story beats，"
+    "绝不能提及或猜测图号、Figure、panel、source id，也不要按证据编号或资料顺序逐项汇报。"
+    "每个beat只能使用其对应的clean evidence，先回答读者问题，再给最重要的发现，随后解释如何理解及为什么值得关注；相邻beat之间要有自然推进。"
+    "不要写成论文Results、摘要扩写、图注翻译或四个平行结果清单。避免第一/第二/第三/第四、首先/其次/最后和模板化排比。"
+    "方法名只有在帮助读者判断证据可靠时才保留；结果留下，方法降噪。每句话只承担一个主要意思，句长和段落节奏要有变化。"
+    "clean_evidence中的每个anchor都必须在对应beat正文中原样保留；可以减少解释性数字，但不能删除或改写已验证anchor。"
+    "正文总量以约350到500个中文字符为目标；按故事需要分配篇幅，不要把每个beat机械写成等长小节。"
+    "不要连续罗列变量、通量、符号、资料名或方法名；除非它们是必须保留的anchor，否则用‘辐射、土壤水分和陆面—大气交换等过程’概括即可。"
+    + PAPER_FIDELITY_CONTRACT
+    + "返回严格JSON：{\"sections\":[{\"id\":\"beat-1\",\"title\":\"...\",\"body\":\"...\"}]}。"
+)
+
+PAPER_HUMANIZER_PROMPT = (
+    "你是中文母语科学编辑，依据ai-zixun/humanizer-zh的原则，对Story Writer成稿做一次保守的人文化编辑。"
+    "按beat分组的clean evidence是硬边界，只能在对应beat保留对应证据。"
+    "去掉翻译腔、空泛总结、机械连接和重复段式，调整中文节奏，让文章像真实作者在给人解释一个发现。"
+    "保留story beats的逻辑、每个证据的归属、所有真正有解释价值的数字、主体和限定条件；不新增事实，不要移动finding，不要把相关写成因果。"
+    "每个beat对应的anchor必须在该beat正文中原样保留，不能因改得口语化而删除或改写。"
+    "正文总量以约350到500个中文字符为目标，按故事需要分配篇幅，不追求各beat等长。"
+    "不要连续罗列变量、通量、符号、资料名或方法名；非anchor的细节用普通中文概括，优先保留读者需要理解的机制。"
+    "同一句中若出现两项以上公式、英文术语、资料名或变量名，必须删去清单，改写为‘辐射、土壤水分和陆面交换等过程’这类概括。"
+    "同一句中若出现两项以上公式、英文术语、资料名或变量名，必须删去清单，改写为‘辐射、土壤水分和陆面交换等过程’这类概括。"
+    "不要提及图号、Figure、panel、source id，不要使用第一/第二/第三/第四、首先/其次/最后式流水账。"
+    "若targeted_feedback指出技术密度或模板风险，优先删除清单式方法、变量和公式，只保留读者理解结论所需的最少信息。"
+    + PAPER_FIDELITY_CONTRACT
+    + "只返回严格JSON：{\"sections\":[{\"id\":\"beat-1\",\"title\":\"...\",\"body\":\"...\"}]}。"
+)
+
 PAPER_PLANNER_PROMPT = (
     "你是Figure-first Scientific Planner，不写文章正文。根据Abstract、paper_text、source_paragraphs、selected_body_figures和figure_evidence_bundles，"
     "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；不要自行猜测Figure归属。"
@@ -1969,6 +2415,7 @@ PAPER_PLANNER_PROMPT = (
     "无独立主图的机制内容只能作为最相关Figure section中的2到3句解释，不要新建无图机制section；只有删除会造成明显科学逻辑断裂时才保留无图短过渡。"
     "role使用贴合论文的简洁自然标签，不要套固定taxonomy。source_paragraph_ids只能使用输入中真实存在的source id。"
     "每个finding都要有figure_ids和anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
+    "如果输入包含validation_feedback，必须优先修复其中指出的Figure、source或anchor归属，不能重复提交同一错误计划。"
     '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"source_paragraph_ids":["source-0"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence":"...","anchors":["R = 0.71"]}]}]}'
 )
 
@@ -2159,11 +2606,12 @@ def _generate_paper_article_markdown(
         section.pop("transition_reason", None)
     plan["figure_evidence_bundles"] = figure_evidence_bundles
     plan["planner_sections"] = [dict(section) for section in plan["sections"]]
-    abstract_lead = translate_paper_abstract(abstract, settings) if abstract else ""
+    abstract_lead = _paper_plain_language_cleanup(
+        translate_paper_abstract(abstract, settings) if abstract else ""
+    )
 
-    sections: list[dict[str, Any]] = []
-    for section in plan["sections"]:
-        sections.append(
+    def write_figure_plan_draft(current_plan: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+        current_sections = [
             {
                 **section,
                 "body": _paper_write_section(
@@ -2175,14 +2623,56 @@ def _generate_paper_article_markdown(
                     settings.model_name,
                 ),
             }
+            for section in current_plan["sections"]
+        ]
+        return current_sections, _paper_assemble_markdown(display_title, abstract_lead, current_sections)
+
+    sections, draft = write_figure_plan_draft(plan)
+    try:
+        _validate_paper_evidence_plan(
+            plan,
+            draft,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
         )
-    draft = _paper_assemble_markdown(display_title, abstract_lead, sections)
-    _validate_paper_evidence_plan(
-        plan,
-        draft,
-        valid_source_ids,
-        figure_evidence_bundles if figure_first else None,
-    )
+    except RuntimeError as exc:
+        if not any(
+            marker in str(exc)
+            for marker in (
+                "PAPER evidence anchor missing",
+                "PAPER evidence figure mismatch",
+                "PAPER evidence source mismatch",
+            )
+        ):
+            raise
+        logger.warning("PAPER planner deterministic check failed; retrying once: %s", exc)
+        plan = _paper_plan(
+            client,
+            abstract,
+            paper_text,
+            source_paragraphs,
+            metadata,
+            selected_figure_ids,
+            figure_evidence_bundles,
+            str(exc),
+        )
+        plan["sections"] = _validate_paper_plan_structure(
+            plan,
+            valid_source_ids,
+            set(selected_figure_ids) if figure_first else None,
+        )
+        for section in plan["sections"]:
+            section.pop("necessary_transition", None)
+            section.pop("transition_reason", None)
+        plan["figure_evidence_bundles"] = figure_evidence_bundles
+        plan["planner_sections"] = [dict(section) for section in plan["sections"]]
+        sections, draft = write_figure_plan_draft(plan)
+        _validate_paper_evidence_plan(
+            plan,
+            draft,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+        )
     logger.info("PAPER deterministic evidence validation passed")
     scientific_review: dict[str, Any] = {
         "status": "pass",
@@ -2232,7 +2722,7 @@ def _generate_paper_article_markdown(
         )
         revised_abstract = str(plan.pop("_revised_abstract", "")).strip()
         if revised_abstract:
-            abstract_lead = revised_abstract
+            abstract_lead = _paper_plain_language_cleanup(revised_abstract)
         draft = _paper_assemble_markdown(
             display_title,
             abstract_lead,
@@ -2251,81 +2741,257 @@ def _generate_paper_article_markdown(
 
     plan["scientific_review"] = scientific_review
 
-    style_exemplar = _paper_style_exemplar()
-    editor_baseline = draft
-    editor_bodies = _paper_editorial_rewrite(
+    style_exemplar = _paper_clean_story_text(_paper_style_exemplar())
+    clean_evidence, evidence_map = _paper_clean_story_evidence(plan, source_paragraphs)
+    story_plan = _paper_story_planner(
         client,
-        plan,
-        draft,
-        settings.model_name,
+        clean_evidence,
         style_exemplar,
-        abstract=abstract,
+        settings.model_name,
     )
-    markdown = _paper_assemble_markdown(
-        display_title,
-        abstract_lead,
-        [
-            {**section, "body": body}
-            for section, body in zip(plan["sections"], editor_bodies)
-        ],
+    valid_evidence_ids = {record["evidence_id"] for record in clean_evidence}
+    try:
+        story_beats = _paper_validate_story_plan(story_plan, valid_evidence_ids)
+    except RuntimeError as exc:
+        logger.warning("PAPER story planner returned an invalid beat plan; retrying once: %s", exc)
+        story_plan = _paper_story_planner(
+            client,
+            clean_evidence,
+            style_exemplar,
+            settings.model_name,
+            {"validation": "Use every evidence_id exactly once across the beats; keep each anchor in its assigned beat."},
+        )
+        story_beats = _paper_validate_story_plan(story_plan, valid_evidence_ids)
+    story_sections = _paper_story_sections(story_beats, evidence_map)
+    plan["story_plan"] = story_plan
+    plan["sections"] = story_sections
+    story_context = {"story_plan": story_plan, "clean_evidence": clean_evidence}
+    story_writer_retry_count = 0
+    story_output = _paper_story_writer(
+        client,
+        story_plan,
+        clean_evidence,
+        style_exemplar,
+        settings.model_name,
     )
+    for section, generated in zip(plan["sections"], story_output):
+        section["title"] = generated["title"]
+        section["body"] = generated["body"]
+    draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+    try:
+        _validate_paper_evidence_plan(
+            plan,
+            draft,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+        )
+    except RuntimeError as exc:
+        if not any(
+            marker in str(exc)
+            for marker in (
+                "PAPER evidence anchor missing",
+                "PAPER evidence figure mismatch",
+                "PAPER evidence source mismatch",
+            )
+        ):
+            raise
+        story_writer_retry_count = 1
+        logger.warning("PAPER story writer deterministic check failed; retrying once: %s", exc)
+        story_output = _paper_story_writer(
+            client,
+            story_plan,
+            clean_evidence,
+            style_exemplar,
+            settings.model_name,
+            {
+                "deterministic_validation": "A deterministic evidence check found an anchor placement issue. Preserve every supplied anchor exactly and keep it with its evidence."
+            },
+        )
+        for section, generated in zip(plan["sections"], story_output):
+            section["title"] = generated["title"]
+            section["body"] = generated["body"]
+        draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+        _validate_paper_evidence_plan(
+            plan,
+            draft,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+        )
+    logger.info("PAPER deterministic evidence validation passed")
+    plan["story_writer_retry_count"] = story_writer_retry_count
+
+    markdown = draft
     lint = _paper_ai_style_lint(markdown)
     popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
     popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
-        editor_baseline,
+        draft,
         markdown,
         plan,
     )
+
     def popular_audit_failed() -> bool:
         return bool(
             _paper_ai_style_lint_failed(lint)
             or popular_feedback["abstract_overlong"]
-            or popular_feedback["body_lengths"]["overlong_sections"]
             or popular_feedback["body_lengths"]["total_overlong"]
             or popular_feedback["readability"]["issue_count"]
             or popular_feedback["anchor_preservation"]["issue_count"]
         )
 
-    retry_count = 0
+    popular_retry_count = 0
     if popular_audit_failed():
-        retry_count = 1
-        editor_bodies = _paper_editorial_rewrite(
+        popular_retry_count = 1
+        story_output = _paper_story_writer(
             client,
+            story_plan,
+            clean_evidence,
+            style_exemplar,
+            settings.model_name,
+            {"style_lint": lint, **popular_feedback},
+        )
+        for section, generated in zip(plan["sections"], story_output):
+            section["title"] = generated["title"]
+            section["body"] = generated["body"]
+        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+        _validate_paper_evidence_plan(
             plan,
             markdown,
-            settings.model_name,
-            style_exemplar,
-            {"style_lint": lint, **popular_feedback},
-            abstract=abstract,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
         )
-        markdown = _paper_assemble_markdown(
-            display_title,
-            abstract_lead,
-            [
-                {**section, "body": body}
-                for section, body in zip(plan["sections"], editor_bodies)
-            ],
-        )
+        logger.info("PAPER deterministic evidence validation passed")
         lint = _paper_ai_style_lint(markdown)
         popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
         popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
-            editor_baseline,
+            draft,
             markdown,
             plan,
         )
 
     popular_science_audit = {
         "status": "warning" if popular_audit_failed() else "pass",
-        "retry_count": retry_count,
+        "retry_count": popular_retry_count,
         "unresolved_issues": {
             "style_lint": lint if _paper_ai_style_lint_failed(lint) else {},
             "feedback": popular_feedback if popular_audit_failed() else {},
         },
     }
     if popular_science_audit["status"] == "warning":
-        logger.warning(
-            "PAPER popular science audit unresolved after retry; continuing with warning"
+        logger.warning("PAPER popular science audit unresolved after retry; continuing with warning")
+
+    humanizer_baseline = markdown
+    humanized_output = _paper_humanize_story(
+        client,
+        story_plan,
+        clean_evidence,
+        markdown,
+        settings.model_name,
+    )
+    for section, generated in zip(plan["sections"], humanized_output):
+        section["title"] = generated["title"]
+        section["body"] = generated["body"]
+    markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+    _validate_paper_evidence_plan(
+        plan,
+        markdown,
+        valid_source_ids,
+        figure_evidence_bundles if figure_first else None,
+    )
+    logger.info("PAPER deterministic evidence validation passed")
+
+    final_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
+    final_humanizer_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
+        humanizer_baseline,
+        markdown,
+        plan,
+    )
+    humanizer_retry_count = 0
+    if (
+        _paper_ai_style_lint_failed(_paper_ai_style_lint(markdown))
+        or final_humanizer_feedback["abstract_overlong"]
+        or final_humanizer_feedback["body_lengths"]["total_overlong"]
+        or final_humanizer_feedback["readability"]["issue_count"]
+        or final_humanizer_feedback["anchor_preservation"]["issue_count"]
+    ):
+        humanizer_retry_count = 1
+        targeted_output = _paper_humanize_story(
+            client,
+            story_plan,
+            clean_evidence,
+            markdown,
+            settings.model_name,
+            {"readability": final_humanizer_feedback},
         )
+        for section, generated in zip(plan["sections"], targeted_output):
+            section["title"] = generated["title"]
+            section["body"] = generated["body"]
+        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+        _validate_paper_evidence_plan(
+            plan,
+            markdown,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+        )
+        logger.info("PAPER deterministic evidence validation passed")
+        final_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
+        final_humanizer_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
+            humanizer_baseline,
+            markdown,
+            plan,
+        )
+
+    plan["humanizer_retry_count"] = humanizer_retry_count
+    stop_slop_feedback = _paper_stop_slop_audit(markdown)
+    stop_slop_retry_count = 0
+    if stop_slop_feedback["issue_count"]:
+        stop_slop_retry_count = 1
+        targeted_output = _paper_humanize_story(
+            client,
+            story_plan,
+            clean_evidence,
+            markdown,
+            settings.model_name,
+            {"stop_slop": stop_slop_feedback},
+        )
+        for section, generated in zip(plan["sections"], targeted_output):
+            section["title"] = generated["title"]
+            section["body"] = generated["body"]
+        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+        _validate_paper_evidence_plan(
+            plan,
+            markdown,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+        )
+        logger.info("PAPER deterministic evidence validation passed")
+        stop_slop_feedback = _paper_stop_slop_audit(markdown)
+    plan["stop_slop_audit"] = {
+        **stop_slop_feedback,
+        "retry_count": stop_slop_retry_count,
+    }
+    if stop_slop_feedback["issue_count"]:
+        logger.warning("PAPER stop-slop style audit unresolved after retry; continuing with warning")
+
+    lint = _paper_ai_style_lint(markdown)
+    popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
+    popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
+        humanizer_baseline,
+        markdown,
+        plan,
+    )
+    final_popular_issue = bool(
+        _paper_ai_style_lint_failed(lint)
+        or popular_feedback["abstract_overlong"]
+        or popular_feedback["body_lengths"]["total_overlong"]
+        or popular_feedback["readability"]["issue_count"]
+        or popular_feedback["anchor_preservation"]["issue_count"]
+    )
+    if final_popular_issue:
+        popular_science_audit["status"] = "warning"
+        popular_science_audit["unresolved_issues"] = {
+            "style_lint": lint if _paper_ai_style_lint_failed(lint) else {},
+            "feedback": popular_feedback,
+        }
 
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)

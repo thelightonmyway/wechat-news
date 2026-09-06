@@ -82,16 +82,26 @@ from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
     PAPER_PLANNER_PROMPT,
     PAPER_POPULAR_SCIENCE_EDITOR_PROMPT,
+    PAPER_STORY_PLANNER_PROMPT,
+    PAPER_STORY_WRITER_PROMPT,
+    PAPER_HUMANIZER_PROMPT,
     PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
     _paper_body_length_audit,
     _paper_chinese_char_count,
+    _paper_clean_story_evidence,
+    _paper_clean_story_text,
+    _paper_plain_language_cleanup,
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
     _paper_figure_evidence_bundles,
     _paper_readability_audit,
+    _paper_stop_slop_audit,
+    _paper_story_sections,
+    _paper_story_writer,
+    _paper_validate_story_plan,
     prune_paper_sections_after_allocation,
     _normalize_article_markdown,
     _paper_revision,
@@ -105,6 +115,41 @@ from writer.llm import (
     translate_paper_abstract,
     translate_paper_titles,
 )
+
+
+def _story_plan_for_evidence(count: int) -> dict[str, object]:
+    beats = [
+        {
+            "id": f"beat-{index}",
+            "title": f"发现{index}",
+            "reader_question": f"读者问题{index}",
+            "core_message": f"核心发现{index}",
+            "evidence_ids": [f"evidence-{index}"],
+            "transition_to_next": "继续解释这一发现。",
+        }
+        for index in range(1, count + 1)
+    ]
+    return {
+        "editorial_brief": {
+            "audience": "跨专业读者",
+            "purpose": "解释核心科学发现",
+            "tone": "清楚自然",
+            "reader_should_leave_with": "记住核心发现及其意义",
+            "story_question": "这项研究回答了什么问题？",
+        },
+        "story_beats": beats,
+    }
+
+
+def _story_output_for_evidence(count: int, bodies: list[str] | None = None) -> list[dict[str, str]]:
+    return [
+        {
+            "id": f"beat-{index}",
+            "title": f"发现{index}",
+            "body": (bodies or [f"核心发现{item}。" for item in range(1, count + 1)])[index - 1],
+        }
+        for index in range(1, count + 1)
+    ]
 
 
 class V1Tests(unittest.TestCase):
@@ -2082,7 +2127,15 @@ class V1Tests(unittest.TestCase):
         client = MagicMock()
         client.chat.completions.create.side_effect = responses
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(2)
+        ), patch(
+            "writer.llm._paper_story_writer",
+            return_value=_story_output_for_evidence(2, ["机器学习重构R = 0.71。", "森林相关R = −0.77。"]),
+        ), patch(
             "writer.llm._paper_editorial_rewrite", return_value=["机器学习重构R = 0.71。", "森林相关R = −0.77。"]
+        ), patch(
+            "writer.llm._paper_humanize_story",
+            return_value=_story_output_for_evidence(2, ["机器学习重构R = 0.71。", "森林相关R = −0.77。"]),
         ):
             path, _ = generate_article_markdown(
                 {
@@ -2417,7 +2470,7 @@ class V1Tests(unittest.TestCase):
         clean_counts = _paper_ai_style_lint("森林变化解释了模式差异。未来投影仍有不确定性。")
         self.assertFalse(_paper_ai_style_lint_failed(clean_counts))
 
-    def test_paper_editorial_lint_allows_one_retry(self):
+    def test_paper_story_writer_audit_allows_one_retry(self):
         responses = [
             SimpleNamespace(
                 choices=[
@@ -2470,9 +2523,16 @@ class V1Tests(unittest.TestCase):
         client = MagicMock()
         client.chat.completions.create.side_effect = responses
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
-            "writer.llm._paper_editorial_rewrite",
-            side_effect=[["并非A而是B。并非C而是D。"], ["森林变化解释差异。"]],
-        ) as editor:
+            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)
+        ), patch(
+            "writer.llm._paper_story_writer",
+            side_effect=[
+                _story_output_for_evidence(1, ["并非A而是B。并非C而是D。"]),
+                _story_output_for_evidence(1, ["森林变化解释差异。"]),
+            ],
+        ) as story_writer, patch(
+            "writer.llm._paper_humanize_story", return_value=_story_output_for_evidence(1, ["森林变化解释差异。"])
+        ):
             path, _ = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
@@ -2488,7 +2548,7 @@ class V1Tests(unittest.TestCase):
                 Path(tmp) / "paper",
             )
             final_text = path.read_text(encoding="utf-8")
-        self.assertEqual(editor.call_count, 2)
+        self.assertEqual(story_writer.call_count, 2)
         self.assertNotIn("并非A而是B", final_text)
 
     def test_paper_abstract_compression_targets_mobile_length(self):
@@ -2524,11 +2584,126 @@ class V1Tests(unittest.TestCase):
         self.assertGreater(audit["issue_count"], 0)
         self.assertTrue(any(issue["type"] == "unexplained_acronym" for issue in audit["issues"]))
 
+    def test_paper_clean_story_evidence_hides_backend_figure_labels(self):
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "role": "attribution",
+                    "figure_ids": ["Fig. 3"],
+                    "source_paragraph_ids": ["source-0"],
+                    "findings": [{"id": "E1", "evidence": "森林变化见Figure 3b", "anchors": ["R = −0.77"]}],
+                }
+            ]
+        }
+        evidence, _ = _paper_clean_story_evidence(
+            plan,
+            [{"id": "source-0", "text": "As shown in Figure 3b, forest trend is negatively correlated."}],
+        )
+        serialized = json.dumps(evidence, ensure_ascii=False)
+        self.assertNotIn("Figure 3", serialized)
+        self.assertNotIn("Fig. 3", serialized)
+        self.assertNotIn("source-figure", serialized)
+        self.assertIn("R = −0.77", serialized)
+
+    def test_paper_story_writer_payload_contains_no_figure_identifiers(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"sections": [{"id": "beat-1", "title": "森林变化提供线索", "body": "森林变化与风速差异相关。"}]},
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        story_plan = _story_plan_for_evidence(1)
+        clean_evidence = [
+            {
+                "evidence_id": "evidence-1",
+                "role": "attribution",
+                "core_finding": "森林变化提供线索。",
+                "anchors": ["R = −0.77"],
+                "source_evidence": ["Forest trend is negatively correlated."],
+            }
+        ]
+        _paper_story_writer(client, story_plan, clean_evidence, "## 发现\n自然节奏。", "test-model")
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("Figure 1", serialized)
+        self.assertNotIn("Fig. 1", serialized)
+        self.assertNotIn("source-figure-1", serialized)
+        self.assertNotIn("panel a", serialized)
+
+    def test_paper_plain_language_cleanup_reduces_technical_shorthand(self):
+        cleaned = _paper_plain_language_cleanup(
+            "ENSO驱动，DJF海温与JJA降水相关；Equation 4和standard deviation用于分析。"
+        )
+        self.assertNotIn("Equation", cleaned)
+        self.assertNotIn("standard deviation", cleaned)
+        self.assertIn("厄尔尼诺—拉尼娜现象", cleaned)
+        self.assertIn("冬季海温", cleaned)
+        self.assertIn("夏季降水", cleaned)
+
+    def test_paper_story_sections_can_merge_related_figures(self):
+        section_one = {
+            "id": "section-1",
+            "role": "attribution",
+            "figure_ids": ["Fig. 2"],
+            "source_paragraph_ids": ["source-1"],
+        }
+        section_two = {
+            "id": "section-2",
+            "role": "attribution",
+            "figure_ids": ["Fig. 3"],
+            "source_paragraph_ids": ["source-2"],
+        }
+        evidence_map = {
+            "evidence-1": (section_one, {"id": "E1", "figure_ids": ["Fig. 2"], "anchors": ["R = 0.71"]}),
+            "evidence-2": (section_two, {"id": "E2", "figure_ids": ["Fig. 3"], "anchors": ["R = −0.77"]}),
+        }
+        beats = [{
+            "id": "beat-1",
+            "title": "森林变化提供关键线索",
+            "reader_question": "为什么模式会不同？",
+            "core_message": "森林变化连接两组结果。",
+            "evidence_ids": ["evidence-1", "evidence-2"],
+            "transition_to_next": "再看未来影响。",
+        }]
+        sections = _paper_story_sections(beats, evidence_map)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0]["figure_ids"], ["Fig. 2", "Fig. 3"])
+        self.assertEqual(sections[0]["source_paragraph_ids"], ["source-1", "source-2"])
+
+    def test_paper_stop_slop_audit_catches_numbered_figure_reportage(self):
+        markdown = (
+            "# 标题\n\n"
+            "## 第一部分\n\n首先，图1显示变化。\n\n"
+            "## 第二部分\n\n其次，图2显示差异。\n\n"
+            "## 第三部分\n\n最后，图3显示未来。"
+        )
+        audit = _paper_stop_slop_audit(markdown)
+        issue_types = {issue["type"] for issue in audit["issues"]}
+        self.assertIn("figure_reportage", issue_types)
+        self.assertIn("numbered_structure", issue_types)
+        self.assertGreater(audit["metrics"]["template_risk"], 0)
+
+    def test_paper_humanizer_prompt_preserves_fidelity_contract(self):
+        self.assertIn("数字及其修饰对象", PAPER_HUMANIZER_PROMPT)
+        self.assertIn("correlation不能写成causation", PAPER_HUMANIZER_PROMPT)
+        self.assertIn("不新增事实", PAPER_HUMANIZER_PROMPT)
+
     def test_paper_popular_science_editor_prompt_prioritizes_plain_language(self):
         self.assertIn("Popular Science Editor", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
         self.assertIn("普通中文", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
         self.assertIn("问题—发现—解释/意义", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
         self.assertIn("70到120个汉字", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("Story Planner", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("Story Writer", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("350到500个中文字符", PAPER_STORY_WRITER_PROMPT)
 
     def test_paper_popular_editor_anchor_audit_preserves_section_mapping(self):
         plan = {
@@ -2662,7 +2837,11 @@ class V1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
             "writer.llm._paper_review", side_effect=reviews
         ) as review, patch("writer.llm._paper_revision", side_effect=revisions) as revision, patch(
-            "writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]
+            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)
+        ), patch(
+            "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["最终正文。"])
+        ), patch("writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]), patch(
+            "writer.llm._paper_humanize_story", return_value=_story_output_for_evidence(1, ["最终正文。"])
         ):
             path, metadata_path = generate_article_markdown(
                 {
@@ -2731,8 +2910,12 @@ class V1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
             "writer.llm._paper_review", side_effect=reviews
         ) as review, patch("writer.llm._paper_revision", return_value=["修订正文。"]), patch(
-            "writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]
-        ) as editor:
+            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)
+        ), patch(
+            "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["最终正文。"])
+        ), patch("writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]) as editor, patch(
+            "writer.llm._paper_humanize_story", return_value=_story_output_for_evidence(1, ["最终正文。"])
+        ):
             _, metadata_path = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
@@ -2747,7 +2930,7 @@ class V1Tests(unittest.TestCase):
             )
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         self.assertEqual(review.call_count, 2)
-        self.assertEqual(editor.call_count, 1)
+        self.assertEqual(editor.call_count, 0)
         self.assertEqual(metadata["paper_evidence_plan"]["scientific_review"]["status"], "pass")
         self.assertEqual(metadata["paper_evidence_plan"]["scientific_review"]["cycles"], 2)
 
@@ -2851,7 +3034,17 @@ class V1Tests(unittest.TestCase):
         unreadable = "模式间离散度显示显著性水平与典型相关。"
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
             "writer.llm._paper_review", return_value={"status": "pass", "corrections": []}
-        ), patch("writer.llm._paper_editorial_rewrite", side_effect=[[unreadable], [unreadable]]) as editor:
+        ), patch("writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)), patch(
+            "writer.llm._paper_story_writer",
+            side_effect=[_story_output_for_evidence(1, [unreadable]), _story_output_for_evidence(1, [unreadable])],
+        ) as story_writer, patch(
+            "writer.llm._paper_humanize_story",
+            side_effect=[
+                _story_output_for_evidence(1, [unreadable]),
+                _story_output_for_evidence(1, [unreadable]),
+                _story_output_for_evidence(1, [unreadable]),
+            ],
+        ):
             _, metadata_path = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
@@ -2866,7 +3059,7 @@ class V1Tests(unittest.TestCase):
             )
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         audit = metadata["paper_evidence_plan"]["popular_science_audit"]
-        self.assertEqual(editor.call_count, 2)
+        self.assertEqual(story_writer.call_count, 2)
         self.assertEqual(audit["status"], "warning")
         self.assertEqual(audit["retry_count"], 1)
         self.assertTrue(audit["unresolved_issues"]["feedback"]["readability"]["issue_count"])
@@ -2911,8 +3104,12 @@ class V1Tests(unittest.TestCase):
         client.chat.completions.create.side_effect = [planner, abstract, writer]
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
             "writer.llm._paper_review", return_value={"status": "pass", "corrections": []}
+        ), patch("writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)), patch(
+            "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["相关结果为R = 0.71。"])
         ), patch(
             "writer.llm._paper_editorial_rewrite", side_effect=[["编辑后丢失数字。"], ["重试后仍丢失数字。"]]
+        ), patch(
+            "writer.llm._paper_humanize_story", return_value=_story_output_for_evidence(1, ["重试后仍丢失数字。"])
         ):
             with self.assertRaisesRegex(RuntimeError, "PAPER evidence anchor missing"):
                 generate_article_markdown(
@@ -3012,9 +3209,9 @@ class V1Tests(unittest.TestCase):
                                 content=json.dumps(
                                     {
                                         "sections": [
-                                            {"id": "section-1", "body": "历史模式差异位于中国北部。"},
-                                            {"id": "section-2", "body": "森林覆盖变化约解释74%的模式差异。"},
-                                            {"id": "section-3", "body": "SSP3-7.0（未来排放情景）下的未来投影仍存在不确定性。"},
+                                            {"id": "beat-1", "body": "历史模式差异位于中国北部。"},
+                                            {"id": "beat-2", "body": "森林覆盖变化约解释74%的模式差异。"},
+                                            {"id": "beat-3", "body": "SSP3-7.0（未来排放情景）下的未来投影仍存在不确定性。"},
                                         ]
                                     },
                                     ensure_ascii=False,
@@ -3030,7 +3227,29 @@ class V1Tests(unittest.TestCase):
         )
         client = MagicMock()
         client.chat.completions.create.side_effect = responses
-        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client):
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(3)
+        ), patch(
+            "writer.llm._paper_story_writer",
+            return_value=_story_output_for_evidence(
+                3,
+                [
+                    "历史模式差异位于中国北部。",
+                    "森林覆盖变化约解释74%的模式差异。",
+                    "SSP3-7.0（未来排放情景）下的未来投影仍存在不确定性。",
+                ],
+            ),
+        ), patch(
+            "writer.llm._paper_humanize_story",
+            return_value=_story_output_for_evidence(
+                3,
+                [
+                    "历史模式差异位于中国北部。",
+                    "森林覆盖变化约解释74%的模式差异。",
+                    "SSP3-7.0（未来排放情景）下的未来投影仍存在不确定性。",
+                ],
+            ),
+        ):
             root = Path(tmp)
             paper_path, paper_metadata_path = generate_article_markdown(
                 {
@@ -3049,12 +3268,11 @@ class V1Tests(unittest.TestCase):
                 root / "paper",
             )
             calls = client.chat.completions.create.call_args_list
-            self.assertEqual(len(calls), 7)
+            self.assertEqual(len(calls), 6)
             self.assertIn("Scientific Planner", calls[0].kwargs["messages"][0]["content"])
             abstract_prompt = calls[1].kwargs["messages"][0]["content"]
             self.assertIn("80到120个汉字", abstract_prompt)
             reviewer_prompt = calls[5].kwargs["messages"][0]["content"]
-            editor_prompt = calls[6].kwargs["messages"][0]["content"]
             section_payloads = [json.loads(calls[index].kwargs["messages"][1]["content"]) for index in (2, 3, 4)]
             self.assertEqual([payload["section"]["id"] for payload in section_payloads], ["section-1", "section-2", "section-3"])
             self.assertNotIn("74%归因", json.dumps(section_payloads[0], ensure_ascii=False))
@@ -3092,9 +3310,9 @@ class V1Tests(unittest.TestCase):
         self.assertIn('"evidence":"..."', reviewer_prompt)
         self.assertIn('"correction":"..."', reviewer_prompt)
         self.assertIn("不要因句式、节奏、中文措辞", reviewer_prompt)
-        self.assertIn("Popular Science Editor", editor_prompt)
-        self.assertIn("问题—发现—解释/意义", editor_prompt)
-        self.assertIn("中文科研表达编辑规则（仅作保守润色", editor_prompt)
+        self.assertIn("Story Writer", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("问题—发现—为什么—意义/未来", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("中文母语科学编辑", PAPER_HUMANIZER_PROMPT)
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("abstract", news_input)
         self.assertEqual(news_input["news_summary"], "News summary")
