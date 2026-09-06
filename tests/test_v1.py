@@ -64,6 +64,7 @@ from papers.openalex import (
 from papers.pdf_figures import (
     _download_pdf,
     _expanded_crop_rect,
+    _refine_figure_crop_bounds,
     discover_pdf_source,
     download_pdf_with_wiley_tdm,
     extract_pdf_figures,
@@ -80,11 +81,17 @@ from scheduler import should_run_startup_catchup
 from settings import bind_qq_target_openid, load_settings
 from writer.llm import (
     PAPER_PLANNER_PROMPT,
+    PAPER_POPULAR_SCIENCE_EDITOR_PROMPT,
     PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_body_length_audit,
+    _paper_chinese_char_count,
+    _paper_editor_anchor_audit,
+    _paper_editor_feedback,
     _paper_figure_evidence_bundles,
+    _paper_readability_audit,
     prune_paper_sections_after_allocation,
     _normalize_article_markdown,
     _paper_revision,
@@ -2487,10 +2494,9 @@ class V1Tests(unittest.TestCase):
     def test_paper_abstract_compression_targets_mobile_length(self):
         long_translation = "研究问题聚焦中国近地面风速模式差异。" + "结果显示森林覆盖变化是主要驱动因素，并解释不同模式的风速趋势差异。" * 8
         compressed = (
-            "研究问题聚焦中国近地面风速模式差异。"
-            "结果显示森林覆盖变化是主要驱动因素，并解释不同模式的风速趋势差异。"
-            "森林损失较大的模式风速下降较弱，森林变化约占模式间差异的74%。"
-            "约束森林覆盖变化有助于降低未来风速预测不确定性，并为改进相关预测提供依据。"
+            "不同气候模式对中国风速变化的判断差别很大。"
+            "研究发现，森林变化可解释约74%的差异，森林损失越大，风速下降越不明显。"
+            "更准确地描述森林变化，有助于减少未来风速预测的不确定性，也让预测更可靠。"
         )
         client = MagicMock()
         client.chat.completions.create.side_effect = [
@@ -2500,10 +2506,49 @@ class V1Tests(unittest.TestCase):
         settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
         with patch("writer.llm.OpenAI", return_value=client):
             result = translate_paper_abstract("Original abstract", settings)
-        self.assertLessEqual(len(result), 180)
-        self.assertGreaterEqual(len(result), 120)
-        self.assertLessEqual(len(re.findall(r"[。！？]", result)), 4)
+        self.assertLessEqual(_paper_chinese_char_count(result), 120)
+        self.assertGreaterEqual(_paper_chinese_char_count(result), 80)
+        self.assertLessEqual(len(re.findall(r"[。！？]", result)), 3)
         self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    def test_paper_body_length_and_readability_audits(self):
+        markdown = (
+            "# 标题\n\n"
+            "## 结果\n\n"
+            "CMIP6模式间离散度由XGBoost、SHAP和CCA共同分析，R=0.71，结果显示森林变化是主要因素。"
+        )
+        lengths = _paper_body_length_audit(markdown)
+        self.assertEqual(lengths["sections"][0]["title"], "结果")
+        self.assertGreater(lengths["total_characters"], 0)
+        audit = _paper_readability_audit(markdown)
+        self.assertGreater(audit["issue_count"], 0)
+        self.assertTrue(any(issue["type"] == "unexplained_acronym" for issue in audit["issues"]))
+
+    def test_paper_popular_science_editor_prompt_prioritizes_plain_language(self):
+        self.assertIn("Popular Science Editor", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("普通中文", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("问题—发现—解释/意义", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("70到120个汉字", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+
+    def test_paper_popular_editor_anchor_audit_preserves_section_mapping(self):
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "归因",
+                    "findings": [{"anchors": ["R = 0.71"]}],
+                },
+                {
+                    "id": "section-2",
+                    "title": "投影",
+                    "findings": [{"anchors": ["74%"]}],
+                },
+            ]
+        }
+        before = "# 标题\n\n## 归因\n\n相关达到R = 0.71。\n\n## 投影\n\n森林变化解释74%。"
+        after = "# 标题\n\n## 归因\n\n相关达到R=0.71。\n\n## 投影\n\n森林变化解释约74%。"
+        result = _paper_editor_anchor_audit(before, after, plan)
+        self.assertEqual(result["issue_count"], 0)
 
     def test_paper_scientific_review_triggers_one_structured_revision(self):
         plan = {
@@ -2683,7 +2728,7 @@ class V1Tests(unittest.TestCase):
         section_responses = [
             {"body": "历史模式差异位于中国北部。"},
             {"body": "森林覆盖变化约解释74%的模式差异。"},
-            {"body": "SSP3-7.0下的未来投影仍存在不确定性。"},
+            {"body": "SSP3-7.0（未来排放情景）下的未来投影仍存在不确定性。"},
         ]
         responses = [planner]
         responses.extend(
@@ -2722,7 +2767,7 @@ class V1Tests(unittest.TestCase):
                                         "sections": [
                                             {"id": "section-1", "body": "历史模式差异位于中国北部。"},
                                             {"id": "section-2", "body": "森林覆盖变化约解释74%的模式差异。"},
-                                            {"id": "section-3", "body": "SSP3-7.0下的未来投影仍存在不确定性。"},
+                                            {"id": "section-3", "body": "SSP3-7.0（未来排放情景）下的未来投影仍存在不确定性。"},
                                         ]
                                     },
                                     ensure_ascii=False,
@@ -2760,7 +2805,7 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(len(calls), 7)
             self.assertIn("Scientific Planner", calls[0].kwargs["messages"][0]["content"])
             abstract_prompt = calls[1].kwargs["messages"][0]["content"]
-            self.assertIn("120到180个汉字", abstract_prompt)
+            self.assertIn("80到120个汉字", abstract_prompt)
             reviewer_prompt = calls[5].kwargs["messages"][0]["content"]
             editor_prompt = calls[6].kwargs["messages"][0]["content"]
             section_payloads = [json.loads(calls[index].kwargs["messages"][1]["content"]) for index in (2, 3, 4)]
@@ -2775,7 +2820,7 @@ class V1Tests(unittest.TestCase):
             )
             self.assertNotIn("PAPER_EVIDENCE_PLAN", paper_markdown)
             self.assertLess(paper_markdown.index("历史模式差异位于中国北部"), paper_markdown.index("森林覆盖变化约解释74%"))
-            self.assertLess(paper_markdown.index("森林覆盖变化约解释74%"), paper_markdown.index("SSP3-7.0下"))
+            self.assertLess(paper_markdown.index("森林覆盖变化约解释74%"), paper_markdown.index("SSP3-7.0"))
             client.chat.completions.create.reset_mock()
             client.chat.completions.create.side_effect = [news_response]
             generate_article_markdown(
@@ -2800,7 +2845,8 @@ class V1Tests(unittest.TestCase):
         self.assertIn('"evidence":"..."', reviewer_prompt)
         self.assertIn('"correction":"..."', reviewer_prompt)
         self.assertIn("不要因句式、节奏、中文措辞", reviewer_prompt)
-        self.assertIn("只优化中文自然度", editor_prompt)
+        self.assertIn("Popular Science Editor", editor_prompt)
+        self.assertIn("问题—发现—解释/意义", editor_prompt)
         self.assertIn("中文科研表达编辑规则（仅作保守润色", editor_prompt)
         self.assertIn("约1000到2000中文字", news_prompt)
         self.assertNotIn("abstract", news_input)
@@ -4153,6 +4199,32 @@ class V1Tests(unittest.TestCase):
         self.assertLessEqual(rect.x1, 130.0)
         self.assertLessEqual(rect.y1, 150.0)
 
+    def test_pdf_figure_crop_refines_native_content_without_page_text(self):
+        class FakePage:
+            rect = pymupdf.Rect(0.0, 0.0, 600.0, 800.0)
+
+            def get_text(self, _kind):
+                return [
+                    (20.0, 15.0, 580.0, 28.0, "Journal of Climate 2026", 0, 0, 0),
+                    (180.0, 82.0, 230.0, 96.0, "(a)", 0, 0, 0),
+                    (100.0, 330.0, 500.0, 390.0, "A long unrelated body paragraph", 0, 0, 0),
+                    (100.0, 310.0, 500.0, 325.0, "Figure caption text", 0, 0, 0),
+                ]
+
+            def get_drawings(self):
+                return [{"rect": pymupdf.Rect(110.0, 95.0, 490.0, 300.0)}]
+
+        refined = _refine_figure_crop_bounds(
+            FakePage(),
+            [110.0, 100.0, 490.0, 300.0],
+            [[100.0, 310.0, 500.0, 325.0]],
+        )
+        self.assertLessEqual(refined.y0, 82.0)
+        self.assertGreater(refined.y0, 28.0)
+        self.assertLessEqual(refined.y1, 305.0)
+        self.assertGreaterEqual(refined.x0, 105.0)
+        self.assertLessEqual(refined.x1, 495.0)
+
     def test_pdf_figure_mapping_uses_number_and_adjacent_text_boxes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4335,7 +4407,7 @@ class V1Tests(unittest.TestCase):
             output = pymupdf.open(figures[0]["local_path"])
             try:
                 self.assertGreater(output[0].rect.width, 390)
-                self.assertGreater(output[0].rect.height, 320)
+                self.assertGreater(output[0].rect.height, 300)
             finally:
                 output.close()
             self.assertNotIn("paper-first-page-cover.png", figures[0]["local_path"])

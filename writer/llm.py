@@ -1125,20 +1125,43 @@ def _paper_editorial_rewrite(
     draft: str,
     model: str,
     style_exemplar: str,
-    lint_feedback: dict[str, int] | None = None,
+    lint_feedback: dict[str, Any] | None = None,
+    abstract: str = "",
 ) -> list[str]:
+    section_bundles = {
+        str(section.get("id") or ""): [
+            bundle
+            for bundle in plan.get("figure_evidence_bundles") or []
+            if _paper_figure_id(bundle.get("figure_id")) in {
+                _paper_figure_id(value)
+                for value in section.get("figure_ids") or section.get("selected_body_figures") or []
+            }
+        ]
+        for section in plan.get("sections") or []
+    }
     payload = {
+        "abstract": abstract,
         "paper_evidence_plan": plan,
+        "verified_key_findings": [
+            {
+                "section_id": section.get("id"),
+                "title": section.get("title"),
+                "role": section.get("role"),
+                "findings": section.get("findings") or [],
+                "figure_bundles": section_bundles.get(str(section.get("id") or ""), []),
+            }
+            for section in plan.get("sections") or []
+        ],
         "draft": draft,
         "style_exemplar": style_exemplar,
-        "lint_feedback": lint_feedback or {},
+        "audit_feedback": lint_feedback or {},
     }
     response_obj = _paper_completion_with_retry(
         client,
         model=model,
         temperature=0.2,
         messages=[
-            {"role": "system", "content": PAPER_EDITOR_PROMPT},
+            {"role": "system", "content": PAPER_POPULAR_SCIENCE_EDITOR_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
     )
@@ -1158,6 +1181,9 @@ def _paper_editorial_rewrite(
         item = by_id.get(str(planned["id"]))
         if item is None or not isinstance(item.get("body"), str) or not item["body"].strip():
             raise RuntimeError("PAPER Chinese editor omitted a planned section")
+        revised_title = str(item.get("title") or "").strip()
+        if revised_title:
+            planned["title"] = revised_title
         bodies.append(_paper_section_body({"body": item["body"]}))
     return bodies
 
@@ -1180,6 +1206,156 @@ def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
 
 def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
     return any(count > 1 for count in counts.values()) or sum(counts.values()) > 4
+
+
+def _paper_chinese_char_count(text: str) -> int:
+    return len(re.findall(r"[㐀-鿿]", str(text or "")))
+
+
+def _paper_body_length_audit(markdown: str) -> dict[str, Any]:
+    sections = _paper_body_sections(markdown)
+    section_records = [
+        {
+            "title": title,
+            "characters": _paper_chinese_char_count(body),
+        }
+        for title, body in sections
+    ]
+    return {
+        "sections": section_records,
+        "total_characters": sum(item["characters"] for item in section_records),
+        "overlong_sections": [
+            item["title"] for item in section_records if item["characters"] > 135
+        ],
+        "total_overlong": sum(item["characters"] for item in section_records) > 500,
+    }
+
+
+_READABILITY_FOREIGN_TERMS = (
+    "spread", "model", "models", "future", "projection", "correlation", "scenario",
+    "result", "results", "trend", "trends", "pattern", "patterns",
+)
+
+
+_READABILITY_JARGON = (
+    "NSWS", "AMIP", "CMIP6", "XGBoost", "SHAP", "CCA", "EOF", "PC1", "PC2",
+    "NAO", "ENSO", "SSP", "模式间离散度", "模式间离散", "模式间标准差", "趋势标准差",
+    "显著性水平", "典型相关", "主成分", "回归系数", "相关系数", "地表能量收支",
+    "地表静稳化",
+)
+
+
+def _paper_readability_audit(markdown: str) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    for title, body in _paper_body_sections(markdown):
+        normalized_body = str(body or "")
+        for term in _READABILITY_FOREIGN_TERMS:
+            if re.search(rf"\b{re.escape(term)}\b", f"{title} {normalized_body}", re.IGNORECASE):
+                issues.append({
+                    "section": title,
+                    "type": "english_prose_term",
+                    "term": term,
+                    "suggestion": "改写成普通中文，只有必要的已验证anchor或方法名可以保留。",
+                })
+        for acronym in re.findall(r"(?<![A-Za-z])[A-Z]{2,}\d*(?![A-Za-z])", normalized_body):
+            if acronym in {"Fig", "DOI"} or re.fullmatch(r"SSP\d+", acronym):
+                continue
+            explained = re.search(
+                rf"(?:[（(][^）)]*\b{re.escape(acronym)}\b[^）)]*[）)]|"
+                rf"\b{re.escape(acronym)}\b[^。！？\n]{0,12}[（(：:])",
+                normalized_body,
+            )
+            scenario_explained = re.search(
+                rf"\b{re.escape(acronym)}(?:[-‐–]\d+(?:\.\d+)?)?[^。！？\n]{{0,16}}(?:情景|排放情景)",
+                normalized_body,
+            )
+            if not explained and not scenario_explained and not re.search(rf"\b{re.escape(acronym)}(?:[-‐–]\d+(?:\.\d+)?)?\s*[（(]", normalized_body):
+                issues.append({"section": title, "type": "unexplained_acronym", "term": acronym})
+        for sentence in re.split(r"(?<=[。！？.!?])\s*", normalized_body):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            jargon_hits = [term for term in _READABILITY_JARGON if term in sentence]
+            number_hits = re.findall(r"(?:R\s*=|\d+(?:\.\d+)?%|\d{4})", sentence)
+            if _paper_chinese_char_count(sentence) > 72:
+                issues.append({"section": title, "type": "long_sentence", "text": sentence[:120]})
+            if len(jargon_hits) >= 3 or (len(jargon_hits) >= 2 and len(number_hits) >= 2):
+                issues.append({
+                    "section": title,
+                    "type": "dense_technical_sentence",
+                    "terms": jargon_hits,
+                    "text": sentence[:120],
+                })
+        plain_term_hits = [
+            term for term in (
+                "模式间离散度", "模式间离散", "模式间标准差", "趋势标准差",
+                "显著性水平", "典型相关", "主成分", "地表能量收支", "地表静稳化",
+            )
+            if term in normalized_body
+            and not any(
+                other != term and term in other and other in normalized_body
+                for other in (
+                    "模式间离散度", "模式间标准差", "趋势标准差", "显著性水平",
+                    "典型相关", "主成分", "地表能量收支", "地表静稳化",
+                )
+            )
+        ]
+        for term in plain_term_hits:
+            issues.append({
+                "section": title,
+                "type": "technical_term_needs_explanation",
+                "term": term,
+                "suggestion": "先用普通中文解释，再保留必要的专业词。",
+            })
+    return {"issues": issues, "issue_count": len(issues)}
+
+
+def _paper_editor_anchor_audit(
+    before: str,
+    after: str,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    before_sections = _paper_body_sections(before)
+    after_sections = _paper_body_sections(after)
+    issues: list[dict[str, Any]] = []
+    anchors: set[str] = set()
+    for section in plan.get("sections") or []:
+        for finding in section.get("findings") or []:
+            for anchor in finding.get("anchors") or []:
+                normalized = _normalize_evidence_anchor(str(anchor))
+                if normalized:
+                    anchors.add(normalized)
+    for anchor in sorted(anchors):
+        before_indexes = [
+            index for index, (_, body) in enumerate(before_sections)
+            if anchor in _normalize_evidence_anchor(body)
+        ]
+        after_indexes = [
+            index for index, (_, body) in enumerate(after_sections)
+            if anchor in _normalize_evidence_anchor(body)
+        ]
+        if before_indexes and not after_indexes:
+            issues.append({"type": "missing_anchor", "anchor": anchor})
+        elif before_indexes and before_indexes != after_indexes:
+            issues.append({
+                "type": "anchor_section_moved",
+                "anchor": anchor,
+                "before_sections": before_indexes,
+                "after_sections": after_indexes,
+            })
+    return {"issues": issues, "issue_count": len(issues)}
+
+
+def _paper_editor_feedback(abstract: str, markdown: str) -> dict[str, Any]:
+    body_lengths = _paper_body_length_audit(markdown)
+    readability = _paper_readability_audit(markdown)
+    abstract_length = _paper_chinese_char_count(abstract)
+    return {
+        "abstract_characters": abstract_length,
+        "abstract_overlong": abstract_length > 120,
+        "body_lengths": body_lengths,
+        "readability": readability,
+    }
 
 
 def _is_transient_server_error(exc: Exception) -> bool:
@@ -1459,7 +1635,7 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
                 "content": (
                     "你是中文科技论文摘要翻译编辑。只根据用户提供的原始Abstract做忠实、自然的中文翻译。"
                     "短Abstract基本完整翻译；长Abstract只能删除一般背景、方法细节、正文会展开的次要数字和重复机制，不能增加原文没有的结论、分类、机制或表述，也不能改变科学结论顺序。"
-                    "中文结果必须控制在120到180个汉字、最多3到4句；不得机械截断，优先保留研究问题、最核心2到3个结果和主要意义。不要添加小标题、列表或解释，只返回严格JSON："
+                    "中文结果必须控制在80到120个汉字、最多2到3句；不得机械截断，优先保留研究问题、最核心发现和为什么值得关注。不要添加小标题、列表或解释，只返回严格JSON："
                     '{"abstract_cn":"..."}'
                 ),
             },
@@ -1470,14 +1646,14 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
     translated = re.sub(r"\s+", " ", str(parsed.get("abstract_cn") or "")).strip()
     if not translated:
         raise RuntimeError("model returned empty Chinese Abstract translation")
-    for _ in range(2):
-        if len(translated) <= 180:
+    for _ in range(3):
+        if _paper_chinese_char_count(translated) <= 120:
             break
         compressed = _paper_completion_json(
             client,
             "你是中文科研摘要压缩编辑。只压缩给出的中文Abstract，不增加事实，不改变方向、数字、因果强度和限定条件。"
             "保留研究问题、最核心2到3个结果和主要意义，删除一般背景、方法细节、次要数字和重复机制。"
-            "输出120到180个汉字、最多4句的连续中文摘要，只返回严格JSON：{\"abstract_cn\":\"...\"}",
+            "输出80到120个汉字、最多3句的连续中文摘要，只返回严格JSON：{\"abstract_cn\":\"...\"}",
             {
                 "abstract_cn": translated,
                 "_model": settings.model_name,
@@ -1488,6 +1664,8 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
         if not candidate:
             break
         translated = candidate
+    if _paper_chinese_char_count(translated) > 120:
+        raise RuntimeError("PAPER Abstract remains above the 80–120 Chinese-character target")
     return translated
 
 
@@ -1761,7 +1939,7 @@ PAPER_STYLE_GUIDE = (
     "只返回当前section的中文正文，不返回标题、导语、计划、图片、参考文献或文章信息。"
     "Abstract结构和导语已经锁定；正文只能使用当前section findings、Figure bundles和source_paragraphs中的证据，不得从abstract_context引入当前bundle未支持的其他结果。"
     "保留数字、趋势方向、时间范围、变量关系和因果强度；correlation不写成causation。"
-    "正文应自然、简洁、信息密度高，避免翻译腔、空泛总结和重复连接词。若当前section标记为retained_without_figure，只保留理解相邻主图所需的极短桥接内容，不展开次要机制或补充材料。"
+    "正文应自然、简洁、信息密度高，当前section正文目标约70到120个汉字；避免翻译腔、空泛总结和重复连接词。若当前section标记为retained_without_figure，只保留理解相邻主图所需的极短桥接内容，不展开次要机制或补充材料。"
     "如果有可核验的paper_text原句，可以保留短Markdown引用块，但不得改写或编造。"
 )
 
@@ -1798,15 +1976,21 @@ PAPER_REVISION_PROMPT = (
     '{"abstract_cn":"可选","sections":[{"id":"section-1","title":"仅在需要修正标题时返回","body":"..."}]}'
 )
 
-PAPER_EDITOR_PROMPT = (
-    "你是中文科技编辑。输入稿件的科学内容已经锁定，只优化中文自然度、句式、节奏、冗余和AI套话。"
-    "严格保留planner的section id、顺序、role含义、数字、趋势、相关系数、时间段、因果关系和全部核心finding；"
-    "不得新增、删除、合并或移动科学证据，不得重写Abstract导语；保持正文主体约650到800个中文字符，但不要机械截断句子。避免反复使用并非而是、其原因在于、也就是说、"
-    "不只是、不仅、值得注意的是、进一步表明、总体而言、由此可见、这意味着。只返回严格JSON sections数组："
-    '{"sections":[{"id":"section-1","body":"..."}]}'
+PAPER_POPULAR_SCIENCE_EDITOR_PROMPT = (
+    "你是Popular Science Editor，负责把已经通过Scientific Reviewer的论文正文改写成面向跨专业普通读者的高质量science news/explainer。"
+    "科学结构、section顺序、Figure归属、证据范围、数字、anchor、趋势方向、因果强度和限定条件已经锁定，绝不能新增、删除、合并或移动科学结论。"
+    "每个section围绕当前Figure回答一个读者问题：先说这张图最重要的发现，再用一两句解释为什么重要或可能如何发生；不要把Figure caption逐句翻译成结果清单。"
+    "优先使用普通中文：第一次出现的缩写和专业词必须用极短中文解释，能不用缩写就不用；不要堆叠方法名、统计量或模型术语。保留SSP3-7.0这类已验证anchor时，必须写成‘SSP3-7.0这一未来排放情景’或在紧邻括号中解释，不能只留下裸缩写。"
+    "使用短段落和短句，一句话只表达一个主要意思；采用‘问题—发现—解释/意义’推进，让读者第一遍就能理解。"
+    "不要写成论文摘要或Results中文翻译，不要为了学术感保留不必要的术语密度。XGBoost、SHAP、CCA等方法只有在解释证据为何可信时才保留。"
+    "Abstract只用于核对主线和限定条件，不能把当前Figure bundle未支持的次要结果重新塞回正文。"
+    "返回严格JSON sections数组，保持每个section的id和顺序；若小标题仍含英文或难懂术语，可以只改title但不得改变其Figure范围和科学含义。每节正文目标约70到120个汉字，四张图时正文主体约350到500个汉字，不得机械截断句子。"
+    '{"sections":[{"id":"section-1","title":"可选的通俗小标题","body":"..."}]}'
     + "\n\n"
     + PAPER_EDITORIAL_GUIDE
 )
+# Compatibility name for callers/tests that still refer to the old stage.
+PAPER_EDITOR_PROMPT = PAPER_POPULAR_SCIENCE_EDITOR_PROMPT
 
 
 def _remove_unverified_paper_quotes(markdown: str, paper_text: str) -> str:
@@ -2027,12 +2211,14 @@ def _generate_paper_article_markdown(
         raise RuntimeError("PAPER scientific review failed after revision")
 
     style_exemplar = _paper_style_exemplar()
+    editor_baseline = draft
     editor_bodies = _paper_editorial_rewrite(
         client,
         plan,
         draft,
         settings.model_name,
         style_exemplar,
+        abstract=abstract,
     )
     markdown = _paper_assemble_markdown(
         display_title,
@@ -2043,14 +2229,29 @@ def _generate_paper_article_markdown(
         ],
     )
     lint = _paper_ai_style_lint(markdown)
-    if _paper_ai_style_lint_failed(lint):
+    popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
+    popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
+        editor_baseline,
+        markdown,
+        plan,
+    )
+    needs_popular_retry = (
+        _paper_ai_style_lint_failed(lint)
+        or popular_feedback["abstract_overlong"]
+        or popular_feedback["body_lengths"]["overlong_sections"]
+        or popular_feedback["body_lengths"]["total_overlong"]
+        or popular_feedback["readability"]["issue_count"]
+        or popular_feedback["anchor_preservation"]["issue_count"]
+    )
+    if needs_popular_retry:
         editor_bodies = _paper_editorial_rewrite(
             client,
             plan,
             markdown,
             settings.model_name,
             style_exemplar,
-            lint,
+            {"style_lint": lint, **popular_feedback},
+            abstract=abstract,
         )
         markdown = _paper_assemble_markdown(
             display_title,
@@ -2061,8 +2262,23 @@ def _generate_paper_article_markdown(
             ],
         )
         lint = _paper_ai_style_lint(markdown)
-        if _paper_ai_style_lint_failed(lint):
-            raise RuntimeError(f"PAPER Chinese editorial lint failed: {lint}")
+        popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
+        popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
+            editor_baseline,
+            markdown,
+            plan,
+        )
+        if (
+            _paper_ai_style_lint_failed(lint)
+            or popular_feedback["abstract_overlong"]
+            or popular_feedback["body_lengths"]["overlong_sections"]
+            or popular_feedback["body_lengths"]["total_overlong"]
+            or popular_feedback["readability"]["issue_count"]
+            or popular_feedback["anchor_preservation"]["issue_count"]
+        ):
+            raise RuntimeError(
+                f"PAPER popular-science audit failed: {json.dumps(popular_feedback, ensure_ascii=False)}"
+            )
 
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)

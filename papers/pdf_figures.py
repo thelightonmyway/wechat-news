@@ -325,16 +325,106 @@ def _expanded_crop_rect(bbox: list[float], page_rect: pymupdf.Rect) -> pymupdf.R
     )
 
 
+def _rect_gap(first: pymupdf.Rect, second: pymupdf.Rect) -> tuple[float, float]:
+    horizontal = max(first.x0 - second.x1, second.x0 - first.x1, 0.0)
+    vertical = max(first.y0 - second.y1, second.y0 - first.y1, 0.0)
+    return horizontal, vertical
+
+
+def _rect_overlaps_any(rect: pymupdf.Rect, candidates: list[pymupdf.Rect]) -> bool:
+    return any(rect.intersects(candidate) for candidate in candidates)
+
+
+def _refine_figure_crop_bounds(
+    page: pymupdf.Page,
+    initial_bbox: list[float],
+    caption_bboxes: list[list[float]] | None = None,
+) -> pymupdf.Rect:
+    """Use native PDF content to recover labels without swallowing page text."""
+    page_rect = page.rect
+    fallback = _expanded_crop_rect(initial_bbox, page_rect)
+    initial = pymupdf.Rect(*initial_bbox)
+    caption_rects = [pymupdf.Rect(*bbox) for bbox in caption_bboxes or []]
+    content_rect = pymupdf.Rect(initial)
+    try:
+        for block in page.get_text("blocks"):
+            if len(block) < 5:
+                continue
+            rect = pymupdf.Rect(*block[:4])
+            text = re.sub(r"\s+", " ", str(block[4] or "")).strip()
+            if not text or _rect_overlaps_any(rect, caption_rects):
+                continue
+            horizontal_overlap = max(0.0, min(initial.x1, rect.x1) - max(initial.x0, rect.x0))
+            vertical_overlap = max(0.0, min(initial.y1, rect.y1) - max(initial.y0, rect.y0))
+            horizontal_gap, vertical_gap = _rect_gap(initial, rect)
+            short_label = len(text) <= 120 and text.count("\n") <= 3
+            touches_figure = (
+                (horizontal_overlap > 8.0 and vertical_gap <= 22.0)
+                or (vertical_overlap > 8.0 and horizontal_gap <= 22.0)
+                or (horizontal_overlap > 0.0 and vertical_overlap > 0.0)
+            )
+            if short_label and touches_figure:
+                content_rect |= rect
+
+        for drawing in page.get_drawings():
+            rect = drawing.get("rect")
+            if rect is None:
+                continue
+            drawing_rect = pymupdf.Rect(rect)
+            if _rect_overlaps_any(drawing_rect, caption_rects):
+                continue
+            horizontal_gap, vertical_gap = _rect_gap(initial, drawing_rect)
+            horizontal_overlap = max(0.0, min(initial.x1, drawing_rect.x1) - max(initial.x0, drawing_rect.x0))
+            vertical_overlap = max(0.0, min(initial.y1, drawing_rect.y1) - max(initial.y0, drawing_rect.y0))
+            overlaps = drawing_rect.intersects(initial)
+            above_figure = drawing_rect.y1 <= initial.y0
+            vertical_limit = 30.0 if above_figure else 42.0
+            horizontal_threshold = 8.0 if above_figure else 0.0
+            nearby = (
+                (vertical_gap <= vertical_limit and horizontal_overlap > horizontal_threshold)
+                or (horizontal_gap <= 30.0 and vertical_overlap > 8.0)
+            )
+            if not (overlaps or nearby):
+                continue
+            # Ignore page-sized rules/backgrounds that happen to sit beside the Figure.
+            if not overlaps and drawing_rect.width > initial.width * 1.10:
+                continue
+            if drawing_rect.get_area() > max(initial.get_area() * 4.0, 25000.0):
+                continue
+            content_rect |= drawing_rect
+    except Exception:
+        return fallback
+
+    if content_rect.is_empty or content_rect.get_area() <= 0:
+        return fallback
+    margin = max(3.0, min(8.0, min(content_rect.width, content_rect.height) * 0.02))
+    refined = pymupdf.Rect(
+        max(page_rect.x0, content_rect.x0 - margin),
+        max(page_rect.y0, content_rect.y0 - margin),
+        min(page_rect.x1, content_rect.x1 + margin),
+        min(page_rect.y1, content_rect.y1 + margin),
+    )
+    if (
+        refined.is_empty
+        or refined.width < initial.width * 0.5
+        or refined.height < initial.height * 0.5
+        or refined.get_area() > fallback.get_area() * 1.35
+    ):
+        return fallback
+    return refined
+
+
 def _render_pdf_figure(
     pdf_path: Path,
     page_number: int,
     bbox: list[float],
     destination: Path,
+    caption_bboxes: list[list[float]] | None = None,
 ) -> None:
     document = pymupdf.open(pdf_path)
     try:
         page = document[page_number - 1]
-        crop_rect = _expanded_crop_rect(bbox, page.rect)
+        crop_rect = _refine_figure_crop_bounds(page, bbox, caption_bboxes)
         pixmap = page.get_pixmap(
             dpi=200,
             alpha=False,
@@ -530,26 +620,39 @@ def extract_pdf_figures(
 
             final_path = output_dir / f"figure-{number:02d}.png"
             try:
-                if len(group) == 1:
-                    shutil.copyfile(raw_paths[0], final_path)
-                else:
-                    _render_pdf_figure(
-                        pdf_path,
-                        int(page["page_number"]),
-                        union_bbox,
-                        final_path,
-                    )
-            except Exception as exc:
-                rejected.extend(
-                    {
-                        "page": page.get("page_number"),
-                        "picture_box_index": current_index,
-                        "picture_bbox": current_bbox,
-                        "reason": f"complete Figure render failed: {type(exc).__name__}: {exc}",
-                    }
-                    for current_index, current_bbox in group
+                _render_pdf_figure(
+                    pdf_path,
+                    int(page["page_number"]),
+                    union_bbox,
+                    final_path,
+                    [_bbox(boxes[index]) for index in caption_indices],
                 )
-                continue
+            except Exception as exc:
+                if len(group) == 1:
+                    try:
+                        shutil.copyfile(raw_paths[0], final_path)
+                    except Exception:
+                        rejected.extend(
+                            {
+                                "page": page.get("page_number"),
+                                "picture_box_index": current_index,
+                                "picture_bbox": current_bbox,
+                                "reason": f"complete Figure render failed: {type(exc).__name__}: {exc}",
+                            }
+                            for current_index, current_bbox in group
+                        )
+                        continue
+                else:
+                    rejected.extend(
+                        {
+                            "page": page.get("page_number"),
+                            "picture_box_index": current_index,
+                            "picture_bbox": current_bbox,
+                            "reason": f"complete Figure render failed: {type(exc).__name__}: {exc}",
+                        }
+                        for current_index, current_bbox in group
+                    )
+                    continue
 
             credit = _credit_from_caption(caption)
             figure_metadata: dict[str, Any] = {
