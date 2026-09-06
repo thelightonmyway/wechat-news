@@ -2657,15 +2657,14 @@ class V1Tests(unittest.TestCase):
             {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题一", "correction": "修正一"}]},
             {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题二", "correction": "修正二"}]},
             {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题三", "correction": "修正三"}]},
-            {"status": "pass", "corrections": []},
         ]
-        revisions = [["第一次修正。"], ["第二次修正。"], ["第三次修正。"]]
+        revisions = [["第一次修正。"], ["第二次修正。"]]
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
             "writer.llm._paper_review", side_effect=reviews
         ) as review, patch("writer.llm._paper_revision", side_effect=revisions) as revision, patch(
             "writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]
         ):
-            path, _ = generate_article_markdown(
+            path, metadata_path = generate_article_markdown(
                 {
                     "content_type": PAPER_CONTENT,
                     "title": "Test paper",
@@ -2678,9 +2677,257 @@ class V1Tests(unittest.TestCase):
                 Path(tmp) / "paper",
             )
             final_text = path.read_text(encoding="utf-8")
-        self.assertEqual(review.call_count, 4)
-        self.assertEqual(revision.call_count, 3)
+            paper_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(review.call_count, 3)
+        self.assertEqual(revision.call_count, 2)
         self.assertIn("最终正文。", final_text)
+        self.assertEqual(
+            paper_metadata["paper_evidence_plan"]["scientific_review"]["status"],
+            "unresolved_after_max_cycles",
+        )
+        self.assertEqual(paper_metadata["paper_evidence_plan"]["scientific_review"]["cycles"], 3)
+
+    def test_paper_scientific_review_passes_on_second_cycle(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        planner = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "归因",
+                                        "role": "attribution",
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "evidence": "结果", "anchors": []}],
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        abstract = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": "摘要"}, ensure_ascii=False)))]
+        )
+        writer = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "初稿正文。"}, ensure_ascii=False)))]
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [planner, abstract, writer]
+        reviews = [
+            {"status": "needs_revision", "corrections": [{"section": "section-1", "evidence": "结果", "issue": "问题", "correction": "修正"}]},
+            {"status": "pass", "corrections": []},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_review", side_effect=reviews
+        ) as review, patch("writer.llm._paper_revision", return_value=["修订正文。"]), patch(
+            "writer.llm._paper_editorial_rewrite", return_value=["最终正文。"]
+        ) as editor:
+            _, metadata_path = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "source",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": [],
+                },
+                settings,
+                Path(tmp) / "paper",
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(review.call_count, 2)
+        self.assertEqual(editor.call_count, 1)
+        self.assertEqual(metadata["paper_evidence_plan"]["scientific_review"]["status"], "pass")
+        self.assertEqual(metadata["paper_evidence_plan"]["scientific_review"]["cycles"], 2)
+
+    def test_paper_revision_deterministic_anchor_mismatch_still_fails(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        planner = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "归因",
+                                        "role": "attribution",
+                                        "figure_ids": ["Fig. 2"],
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "figure_ids": ["Fig. 2"], "evidence": "相关", "anchors": ["R = 0.71"]}],
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        abstract = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": "摘要"}, ensure_ascii=False)))]
+        )
+        writer = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "相关结果为R = 0.71。"}, ensure_ascii=False)))]
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [planner, abstract, writer]
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_review",
+            return_value={
+                "status": "needs_revision",
+                "corrections": [{"section": "section-1", "evidence": "R = 0.71", "issue": "问题", "correction": "修正"}],
+            },
+        ), patch("writer.llm._paper_revision", return_value=["修订后未保留数字。"]):
+            with self.assertRaisesRegex(RuntimeError, "PAPER evidence anchor missing"):
+                generate_article_markdown(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "title": "Test paper",
+                        "title_cn": "测试标题",
+                        "text": "source",
+                        "openalex": {"abstract": "Abstract"},
+                        "images": [{"figure_number": 2, "caption": "Figure 2. Correlation R = 0.71."}],
+                        "paper_selected_body_images": [{"figure_number": 2, "caption": "Figure 2. Correlation R = 0.71."}],
+                    },
+                    settings,
+                    Path(tmp) / "paper",
+                )
+
+    def test_paper_popular_science_warning_does_not_fail_generation(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        planner = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "归因",
+                                        "role": "attribution",
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "evidence": "结果", "anchors": []}],
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        abstract = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": "摘要"}, ensure_ascii=False)))]
+        )
+        writer = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "初稿正文。"}, ensure_ascii=False)))]
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [planner, abstract, writer]
+        unreadable = "模式间离散度显示显著性水平与典型相关。"
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_review", return_value={"status": "pass", "corrections": []}
+        ), patch("writer.llm._paper_editorial_rewrite", side_effect=[[unreadable], [unreadable]]) as editor:
+            _, metadata_path = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "source",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": [],
+                },
+                settings,
+                Path(tmp) / "paper",
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        audit = metadata["paper_evidence_plan"]["popular_science_audit"]
+        self.assertEqual(editor.call_count, 2)
+        self.assertEqual(audit["status"], "warning")
+        self.assertEqual(audit["retry_count"], 1)
+        self.assertTrue(audit["unresolved_issues"]["feedback"]["readability"]["issue_count"])
+
+    def test_paper_popular_science_anchor_break_still_fails(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        planner = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "sections": [
+                                    {
+                                        "id": "section-1",
+                                        "title": "归因",
+                                        "role": "attribution",
+                                        "figure_ids": ["Fig. 2"],
+                                        "source_paragraph_ids": ["source-0"],
+                                        "findings": [{"id": "E1", "figure_ids": ["Fig. 2"], "evidence": "相关", "anchors": ["R = 0.71"]}],
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                )
+            ]
+        )
+        abstract = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"abstract_cn": "摘要"}, ensure_ascii=False)))]
+        )
+        writer = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"body": "相关结果为R = 0.71。"}, ensure_ascii=False)))]
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [planner, abstract, writer]
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_review", return_value={"status": "pass", "corrections": []}
+        ), patch(
+            "writer.llm._paper_editorial_rewrite", side_effect=[["编辑后丢失数字。"], ["重试后仍丢失数字。"]]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PAPER evidence anchor missing"):
+                generate_article_markdown(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "title": "Test paper",
+                        "title_cn": "测试标题",
+                        "text": "source",
+                        "openalex": {"abstract": "Abstract"},
+                        "images": [{"figure_number": 2, "caption": "Figure 2. Correlation R = 0.71."}],
+                        "paper_selected_body_images": [{"figure_number": 2, "caption": "Figure 2. Correlation R = 0.71."}],
+                    },
+                    settings,
+                    Path(tmp) / "paper",
+                )
 
     def test_paper_staged_pipeline_isolated_and_reviewed(self):
         settings = replace(

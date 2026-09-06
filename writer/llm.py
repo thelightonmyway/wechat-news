@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Any
 from openai import OpenAI
 
 from settings import PROJECT_ROOT, Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def _json_from_text(text: str) -> Any:
@@ -536,17 +540,27 @@ def _validate_paper_evidence_plan(
                                     f"evidence={anchor!r}; section={section.get('title')!r}; "
                                     f"source_paragraph_ids={sorted(provenance_ids)!r}"
                                 )
-                anchor_records = provenance_by_anchor.get(normalized_anchor, [])
-                if not anchor_records and not supported_figures_by_anchor.get(normalized_anchor):
-                    # Unclassified textual anchors are not enough to assert a
-                    # unique section location; provenance remains conservative.
-                    continue
                 actual_indexes = [
                     index
                     for index, (_, body) in enumerate(sections)
                     if normalized_anchor in _normalize_evidence_anchor(body)
                 ]
+                anchor_records = provenance_by_anchor.get(normalized_anchor, [])
                 if not actual_indexes:
+                    is_figure_specific = bool(supported_figures_by_anchor.get(normalized_anchor)) or any(
+                        record.get("scope") == "figure_specific" for record in anchor_records
+                    )
+                    if is_figure_specific:
+                        raise RuntimeError(
+                            "PAPER evidence anchor missing: "
+                            f"evidence={anchor!r}; planned section={section.get('title')!r}"
+                        )
+                    # Contextual periods, scenarios, and other anchors without
+                    # Figure-specific support may be omitted from a section.
+                    continue
+                if not anchor_records and not supported_figures_by_anchor.get(normalized_anchor):
+                    # Unclassified textual anchors are not enough to assert a
+                    # unique section location; provenance remains conservative.
                     continue
                 has_contextual_provenance = any(
                     record.get("scope") in {"section_context", "global_context"}
@@ -2163,17 +2177,48 @@ def _generate_paper_article_markdown(
             }
         )
     draft = _paper_assemble_markdown(display_title, abstract_lead, sections)
-    review = _paper_review(
-        client,
-        abstract,
-        paper_text,
-        source_paragraphs,
+    _validate_paper_evidence_plan(
         plan,
         draft,
-        settings.model_name,
+        valid_source_ids,
+        figure_evidence_bundles if figure_first else None,
     )
-    for revision_attempt in range(3):
+    logger.info("PAPER deterministic evidence validation passed")
+    scientific_review: dict[str, Any] = {
+        "status": "pass",
+        "cycles": 0,
+        "unresolved_issues": [],
+    }
+    for cycle in range(1, 4):
+        review = _paper_review(
+            client,
+            abstract,
+            paper_text,
+            source_paragraphs,
+            plan,
+            draft,
+            settings.model_name,
+        )
+        corrections = review["corrections"]
+        logger.info(
+            "PAPER scientific review cycle %d: %s, issues=%d",
+            cycle,
+            review["status"],
+            len(corrections),
+        )
+        scientific_review = {
+            "status": "pass" if review["status"] == "pass" else "needs_revision",
+            "cycles": cycle,
+            "unresolved_issues": corrections,
+        }
         if review["status"] == "pass":
+            break
+        if cycle == 3:
+            scientific_review["status"] = "unresolved_after_max_cycles"
+            logger.warning(
+                "PAPER scientific review unresolved after 3 cycles; "
+                "continuing because deterministic validation passed"
+            )
             break
         revised_bodies = _paper_revision(
             client,
@@ -2182,7 +2227,7 @@ def _generate_paper_article_markdown(
             source_paragraphs,
             plan,
             draft,
-            review["corrections"],
+            corrections,
             settings.model_name,
         )
         revised_abstract = str(plan.pop("_revised_abstract", "")).strip()
@@ -2196,19 +2241,15 @@ def _generate_paper_article_markdown(
                 for section, body in zip(plan["sections"], revised_bodies)
             ],
         )
-        review = _paper_review(
-            client,
-            abstract,
-            paper_text,
-            source_paragraphs,
+        _validate_paper_evidence_plan(
             plan,
             draft,
-            settings.model_name,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
         )
-        if review["status"] == "pass":
-            break
-    else:
-        raise RuntimeError("PAPER scientific review failed after revision")
+        logger.info("PAPER deterministic evidence validation passed")
+
+    plan["scientific_review"] = scientific_review
 
     style_exemplar = _paper_style_exemplar()
     editor_baseline = draft
@@ -2235,15 +2276,19 @@ def _generate_paper_article_markdown(
         markdown,
         plan,
     )
-    needs_popular_retry = (
-        _paper_ai_style_lint_failed(lint)
-        or popular_feedback["abstract_overlong"]
-        or popular_feedback["body_lengths"]["overlong_sections"]
-        or popular_feedback["body_lengths"]["total_overlong"]
-        or popular_feedback["readability"]["issue_count"]
-        or popular_feedback["anchor_preservation"]["issue_count"]
-    )
-    if needs_popular_retry:
+    def popular_audit_failed() -> bool:
+        return bool(
+            _paper_ai_style_lint_failed(lint)
+            or popular_feedback["abstract_overlong"]
+            or popular_feedback["body_lengths"]["overlong_sections"]
+            or popular_feedback["body_lengths"]["total_overlong"]
+            or popular_feedback["readability"]["issue_count"]
+            or popular_feedback["anchor_preservation"]["issue_count"]
+        )
+
+    retry_count = 0
+    if popular_audit_failed():
+        retry_count = 1
         editor_bodies = _paper_editorial_rewrite(
             client,
             plan,
@@ -2268,28 +2313,32 @@ def _generate_paper_article_markdown(
             markdown,
             plan,
         )
-        if (
-            _paper_ai_style_lint_failed(lint)
-            or popular_feedback["abstract_overlong"]
-            or popular_feedback["body_lengths"]["overlong_sections"]
-            or popular_feedback["body_lengths"]["total_overlong"]
-            or popular_feedback["readability"]["issue_count"]
-            or popular_feedback["anchor_preservation"]["issue_count"]
-        ):
-            raise RuntimeError(
-                f"PAPER popular-science audit failed: {json.dumps(popular_feedback, ensure_ascii=False)}"
-            )
+
+    popular_science_audit = {
+        "status": "warning" if popular_audit_failed() else "pass",
+        "retry_count": retry_count,
+        "unresolved_issues": {
+            "style_lint": lint if _paper_ai_style_lint_failed(lint) else {},
+            "feedback": popular_feedback if popular_audit_failed() else {},
+        },
+    }
+    if popular_science_audit["status"] == "warning":
+        logger.warning(
+            "PAPER popular science audit unresolved after retry; continuing with warning"
+        )
 
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
+    plan["popular_science_audit"] = popular_science_audit
     _validate_paper_evidence_plan(
         plan,
         markdown,
         valid_source_ids,
         figure_evidence_bundles if figure_first else None,
     )
+    logger.info("PAPER deterministic evidence validation passed")
     dossier["paper_evidence_plan"] = plan
     return _write_article_files(dossier, settings, output_dir, markdown, plan)
 
