@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -377,6 +378,154 @@ def _paper_figure_evidence_bundles(
     return bundles
 
 
+def _paper_stable_evidence_id(prefix: str, *parts: Any) -> str:
+    payload = "\x1f".join(str(part or "") for part in parts)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"evidence-{prefix}-{digest}"
+
+
+def _paper_canonical_evidence_registry(
+    source_paragraphs: list[dict[str, Any]],
+    figure_evidence_bundles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build immutable evidence/provenance records before any LLM planning."""
+    registry: dict[str, dict[str, Any]] = {}
+    for index, record in enumerate(source_paragraphs):
+        source_id = str(record.get("id") or "")
+        text = str(record.get("text") or "").strip()
+        if not source_id or not text:
+            continue
+        figure_numbers = _paper_figure_numbers_in_text(text)
+        supported_figures = (
+            [f"Fig. {number}" for number in sorted(figure_numbers)]
+            if len(figure_numbers) == 1
+            else []
+        )
+        scope = "global_context" if index == 0 or source_id in {"abstract", "source-abstract"} else "section_context"
+        if source_id.startswith("source-figure-") and supported_figures:
+            scope = "figure_specific"
+        evidence_id = f"evidence-source-{source_id}"
+        registry[evidence_id] = {
+            "evidence_id": evidence_id,
+            "value": text,
+            "normalized_value": _normalize_evidence_anchor(text),
+            "source_paragraph_ids": [source_id],
+            "source_sentence": text,
+            "scope": scope,
+            "supported_figures": supported_figures,
+            "anchors": _paper_quantitative_anchors(text),
+        }
+
+    for bundle in figure_evidence_bundles:
+        for provenance in bundle.get("provenance") or []:
+            if not isinstance(provenance, dict):
+                continue
+            value = str(provenance.get("value") or "").strip()
+            normalized = _normalize_evidence_anchor(
+                str(provenance.get("normalized_value") or value)
+            )
+            source_ids = tuple(
+                dict.fromkeys(
+                    str(source_id)
+                    for source_id in provenance.get("source_paragraph_ids") or []
+                    if str(source_id).strip()
+                )
+            )
+            scope = str(provenance.get("scope") or "section_context")
+            supported_figures = tuple(
+                dict.fromkeys(
+                    _paper_figure_id(value)
+                    for value in provenance.get("supported_figures") or []
+                    if str(value).strip()
+                )
+            )
+            if not value or not normalized or not source_ids:
+                continue
+            evidence_id = _paper_stable_evidence_id(
+                "anchor", normalized, source_ids, scope, supported_figures
+            )
+            registry.setdefault(
+                evidence_id,
+                {
+                    "evidence_id": evidence_id,
+                    "value": value,
+                    "normalized_value": normalized,
+                    "source_paragraph_ids": list(source_ids),
+                    "source_sentence": str(provenance.get("source_sentence") or value),
+                    "scope": scope,
+                    "supported_figures": list(supported_figures),
+                    "anchors": [value],
+                },
+            )
+    return list(registry.values())
+
+
+def _paper_evidence_by_id(registry: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(record.get("evidence_id") or ""): record
+        for record in registry
+        if str(record.get("evidence_id") or "")
+    }
+
+
+def _paper_registry_for_llm(registry: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            key: record.get(key)
+            for key in (
+                "evidence_id",
+                "value",
+                "normalized_value",
+                "source_sentence",
+                "scope",
+                "supported_figures",
+                "anchors",
+            )
+        }
+        for record in registry
+    ]
+
+
+def _paper_clean_evidence_for_llm(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: record.get(key)
+        for key in (
+            "evidence_id",
+            "evidence_group",
+            "role",
+            "core_finding",
+            "anchors",
+            "source_evidence",
+        )
+    }
+
+
+def _paper_derived_source_ids(
+    evidence_ids: list[str],
+    evidence_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    source_set: set[str] = set()
+    for evidence_id in evidence_ids:
+        record = evidence_by_id.get(evidence_id)
+        if record is None:
+            raise RuntimeError(f"PAPER unknown evidence_id: {evidence_id}")
+        source_set.update(
+            str(source_id).strip()
+            for source_id in record.get("source_paragraph_ids") or []
+            if str(source_id).strip()
+        )
+    source_ids: list[str] = []
+    for record in evidence_by_id.values():
+        for source_id in record.get("source_paragraph_ids") or []:
+            source_id = str(source_id).strip()
+            if source_id in source_set and source_id not in source_ids:
+                source_ids.append(source_id)
+    for source_id in sorted(source_set):
+        if source_id not in source_ids:
+            source_ids.append(source_id)
+    return source_ids
+
+
 def _extract_paper_evidence_plan(markdown: str) -> tuple[dict[str, Any], str]:
     match = re.search(
         r"<!--\s*PAPER_EVIDENCE_PLAN\s*(\{.*?\})\s*-->",
@@ -417,10 +566,13 @@ def _paper_validate_story_blocks(
     sections: list[tuple[str, str]],
     supported_figures_by_anchor: dict[str, set[str]],
     provenance_by_anchor: dict[str, list[dict[str, Any]]],
+    evidence_registry: list[dict[str, Any]] | None = None,
 ) -> None:
     story_evidence = plan.get("story_evidence")
     if not isinstance(story_evidence, dict):
         return
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_mode = bool(evidence_registry)
     planned_sections = plan.get("sections") or []
     if len(sections) != len(planned_sections):
         raise RuntimeError("PAPER story block validation failed: section count changed")
@@ -448,6 +600,15 @@ def _paper_validate_story_blocks(
                 or any(evidence_id not in story_evidence for evidence_id in evidence_ids)
             ):
                 raise RuntimeError("PAPER story block validation failed: invalid evidence assignment")
+            if canonical_mode:
+                expected_source_ids = _paper_derived_source_ids(evidence_ids, evidence_by_id)
+                actual_source_ids = list(block.get("source_paragraph_ids") or [])
+                if actual_source_ids != expected_source_ids:
+                    raise RuntimeError(
+                        "PAPER evidence block source mismatch: "
+                        f"block={block_id!r}; source_paragraph_ids={actual_source_ids!r}; "
+                        f"expected={expected_source_ids!r}"
+                    )
             figure_groups = {
                 tuple(story_evidence[evidence_id].get("figure_ids") or [])
                 for evidence_id in evidence_ids
@@ -516,6 +677,7 @@ def _validate_paper_evidence_plan(
     markdown: str,
     valid_source_paragraph_ids: set[str] | None = None,
     figure_evidence_bundles: list[dict[str, Any]] | None = None,
+    evidence_registry: list[dict[str, Any]] | None = None,
 ) -> None:
     sections = _paper_body_sections(markdown)
     planned_sections = plan.get("sections") or []
@@ -556,11 +718,14 @@ def _validate_paper_evidence_plan(
             supported_figures_by_anchor.setdefault(
                 _normalize_evidence_anchor(str(anchor)), set()
             ).update(_paper_figure_id(value) for value in figures)
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_mode = bool(evidence_registry)
     _paper_validate_story_blocks(
         plan,
         sections,
         supported_figures_by_anchor,
         provenance_by_anchor,
+        evidence_registry,
     )
     for planned_index, section in enumerate(planned_sections):
         if not isinstance(section, dict):
@@ -578,6 +743,42 @@ def _validate_paper_evidence_plan(
                 raise RuntimeError(
                     "PAPER evidence plan validation failed: unknown source paragraph ids: "
                     + ", ".join(sorted(unknown_ids))
+                )
+        if canonical_mode:
+            section_evidence_ids = [
+                str(value).strip()
+                for finding in section.get("findings") or []
+                for value in finding.get("evidence_ids") or []
+                if str(value).strip()
+            ]
+            unique_evidence_ids = list(dict.fromkeys(section_evidence_ids))
+            expected_source_ids = _paper_derived_source_ids(
+                unique_evidence_ids, evidence_by_id
+            )
+            for evidence_id in unique_evidence_ids:
+                record = evidence_by_id[evidence_id]
+                source_sentence = _normalize_evidence_anchor(
+                    str(record.get("source_sentence") or record.get("value") or "")
+                )
+                for anchor in record.get("anchors") or []:
+                    normalized_anchor = _normalize_evidence_anchor(str(anchor))
+                    if normalized_anchor and normalized_anchor not in source_sentence:
+                        raise RuntimeError(
+                            "PAPER evidence source mismatch: "
+                            f"evidence_id={evidence_id!r}; anchor={anchor!r}; "
+                            f"source_paragraph_ids={record.get('source_paragraph_ids')!r}"
+                        )
+                logger.debug(
+                    "PAPER evidence provenance evidence_id=%s sources=%s scope=%s",
+                    evidence_id,
+                    record.get("source_paragraph_ids") or [],
+                    record.get("scope") or "",
+                )
+            if source_ids != expected_source_ids:
+                raise RuntimeError(
+                    "PAPER evidence source mismatch: "
+                    f"section={section.get('title')!r}; source_paragraph_ids={source_ids!r}; "
+                    f"expected={expected_source_ids!r}"
                 )
         section_figure_ids = [
             _paper_figure_id(value)
@@ -701,12 +902,15 @@ def _validate_paper_plan_structure(
     plan: dict[str, Any],
     valid_source_paragraph_ids: set[str],
     selected_figure_ids: set[str] | None = None,
+    evidence_registry: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     sections = plan.get("sections")
     if not isinstance(sections, list) or not sections:
         raise RuntimeError("PAPER scientific planner returned no sections")
     seen_ids: set[str] = set()
     validated: list[dict[str, Any]] = []
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_mode = bool(evidence_registry)
     for section in sections:
         if not isinstance(section, dict):
             raise RuntimeError("PAPER scientific planner returned an invalid section")
@@ -717,10 +921,14 @@ def _validate_paper_plan_structure(
         findings = section.get("findings")
         if not section_id or section_id in seen_ids or not title or not role:
             raise RuntimeError("PAPER scientific planner returned invalid section metadata")
-        if not isinstance(source_ids, list) or not source_ids:
-            raise RuntimeError("PAPER scientific planner returned invalid source paragraph ids")
-        if not all(isinstance(source_id, str) and source_id in valid_source_paragraph_ids for source_id in source_ids):
-            raise RuntimeError("PAPER scientific planner returned unknown source paragraph ids")
+        if canonical_mode:
+            if source_ids is not None:
+                raise RuntimeError("PAPER scientific planner returned source provenance")
+        else:
+            if not isinstance(source_ids, list) or not source_ids:
+                raise RuntimeError("PAPER scientific planner returned invalid source paragraph ids")
+            if not all(isinstance(source_id, str) and source_id in valid_source_paragraph_ids for source_id in source_ids):
+                raise RuntimeError("PAPER scientific planner returned unknown source paragraph ids")
         figure_ids = [
             _paper_figure_id(value)
             for value in (section.get("figure_ids") or section.get("selected_body_figures") or [])
@@ -732,8 +940,50 @@ def _validate_paper_plan_structure(
             section["figure_ids"] = figure_ids
         if not isinstance(findings, list) or not findings:
             raise RuntimeError("PAPER scientific planner returned a section without findings")
+        derived_section_evidence_ids: list[str] = []
         for finding in findings:
-            if not isinstance(finding, dict) or not str(finding.get("evidence") or "").strip():
+            if not isinstance(finding, dict):
+                raise RuntimeError("PAPER scientific planner returned an invalid finding")
+            if canonical_mode:
+                if "source_paragraph_ids" in finding or "source_sentence" in finding:
+                    raise RuntimeError("PAPER scientific planner returned source provenance")
+                evidence_ids = [
+                    str(value).strip()
+                    for value in finding.get("evidence_ids") or []
+                    if str(value).strip()
+                ]
+                if not evidence_ids or len(set(evidence_ids)) != len(evidence_ids):
+                    raise RuntimeError("PAPER scientific planner returned invalid evidence_ids")
+                records = [evidence_by_id.get(evidence_id) for evidence_id in evidence_ids]
+                if any(record is None for record in records):
+                    raise RuntimeError("PAPER scientific planner returned unknown evidence_id")
+                finding["evidence_ids"] = evidence_ids
+                finding["evidence"] = " ".join(
+                    str(record.get("source_sentence") or record.get("value") or "").strip()
+                    for record in records
+                    if record is not None
+                ).strip()
+                finding["anchors"] = list(
+                    dict.fromkeys(
+                        str(anchor)
+                        for record in records
+                        if record is not None
+                        for anchor in record.get("anchors") or []
+                        if str(anchor).strip()
+                    )
+                )
+                finding["source_paragraph_ids"] = _paper_derived_source_ids(
+                    evidence_ids, evidence_by_id
+                )
+                finding["source_sentence"] = [
+                    str(record.get("source_sentence") or "")
+                    for record in records
+                    if record is not None
+                ]
+                for evidence_id in evidence_ids:
+                    if evidence_id not in derived_section_evidence_ids:
+                        derived_section_evidence_ids.append(evidence_id)
+            elif not str(finding.get("evidence") or "").strip():
                 raise RuntimeError("PAPER scientific planner returned an invalid finding")
             finding_figure_ids = [
                 _paper_figure_id(value)
@@ -757,6 +1007,10 @@ def _validate_paper_plan_structure(
             finding["anchors"] = anchors
             finding.pop("quantitative_anchors", None)
             finding.pop("quantitative anchors", None)
+        if canonical_mode:
+            section["source_paragraph_ids"] = _paper_derived_source_ids(
+                derived_section_evidence_ids, evidence_by_id
+            )
         seen_ids.add(section_id)
         validated.append(section)
     return validated
@@ -1085,8 +1339,11 @@ def _paper_plain_language_cleanup(text: str) -> str:
 def _paper_clean_story_evidence(
     plan: dict[str, Any],
     source_paragraphs: list[dict[str, Any]],
+    evidence_registry: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[dict[str, Any], dict[str, Any]]]]:
     source_by_id = {str(record.get("id") or ""): record for record in source_paragraphs}
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_mode = bool(evidence_registry)
     evidence: list[dict[str, Any]] = []
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     figure_groups: dict[tuple[str, ...], str] = {}
@@ -1100,8 +1357,15 @@ def _paper_clean_story_evidence(
         for finding in section.get("findings") or []:
             if not isinstance(finding, dict):
                 continue
-            evidence_id = f"evidence-{counter}"
-            counter += 1
+            finding_evidence_ids = (
+                [str(value).strip() for value in finding.get("evidence_ids") or [] if str(value).strip()]
+                if canonical_mode
+                else [f"evidence-{counter}"]
+            )
+            if not finding_evidence_ids:
+                continue
+            if not canonical_mode:
+                counter += 1
             finding_figures = tuple(
                 dict.fromkeys(
                     _paper_figure_id(value)
@@ -1120,17 +1384,68 @@ def _paper_clean_story_evidence(
                 evidence_group = figure_groups[finding_figures]
             else:
                 evidence_group = "context"
-            source_evidence = list(dict.fromkeys(text for text in section_sources if text))
-            record = {
-                "evidence_id": evidence_id,
-                "evidence_group": evidence_group,
-                "role": str(section.get("role") or "").strip(),
-                "core_finding": _paper_clean_story_text(finding.get("evidence", "")),
-                "anchors": [str(anchor) for anchor in finding.get("anchors") or [] if str(anchor).strip()],
-                "source_evidence": source_evidence[:8],
-            }
-            evidence.append(record)
-            evidence_map[evidence_id] = (section, finding)
+            for evidence_id in finding_evidence_ids:
+                canonical_records = (
+                    [evidence_by_id[evidence_id]]
+                    if canonical_mode and evidence_id in evidence_by_id
+                    else []
+                )
+                if canonical_mode and not canonical_records:
+                    raise RuntimeError(f"PAPER unknown evidence_id: {evidence_id}")
+                source_evidence = list(
+                    dict.fromkeys(
+                        _paper_clean_story_text(
+                            str(record.get("source_sentence") or record.get("value") or "")
+                        )
+                        for record in canonical_records
+                        if str(record.get("source_sentence") or record.get("value") or "").strip()
+                    )
+                ) if canonical_mode else list(dict.fromkeys(text for text in section_sources if text))
+                source_ids = (
+                    _paper_derived_source_ids([evidence_id], evidence_by_id)
+                    if canonical_mode
+                    else list(section.get("source_paragraph_ids") or [])
+                )
+                source_sentences = [
+                    str(record.get("source_sentence") or record.get("value") or "")
+                    for record in canonical_records
+                ] if canonical_mode else source_evidence[:]
+                scopes = list(
+                    dict.fromkeys(
+                        str(record.get("scope") or "section_context")
+                        for record in canonical_records
+                    )
+                ) if canonical_mode else []
+                supported_figures = list(
+                    dict.fromkeys(
+                        _paper_figure_id(value)
+                        for record in canonical_records
+                        for value in record.get("supported_figures") or []
+                        if str(value).strip()
+                    )
+                ) if canonical_mode else []
+                record = {
+                    "evidence_id": evidence_id,
+                    "evidence_group": evidence_group,
+                    "role": str(section.get("role") or "").strip(),
+                    "core_finding": (
+                        _paper_clean_story_text(source_sentences[0])
+                        if canonical_mode and source_sentences
+                        else _paper_clean_story_text(finding.get("evidence", ""))
+                    ),
+                    "anchors": (
+                        [str(anchor) for anchor in canonical_records[0].get("anchors") or [] if str(anchor).strip()]
+                        if canonical_mode
+                        else [str(anchor) for anchor in finding.get("anchors") or [] if str(anchor).strip()]
+                    ),
+                    "source_evidence": source_evidence[:8],
+                    "source_paragraph_ids": source_ids,
+                    "source_sentence": source_sentences,
+                    "scope": scopes,
+                    "supported_figures": supported_figures,
+                }
+                evidence.append(record)
+                evidence_map[evidence_id] = (section, finding)
     return evidence, evidence_map
 
 
@@ -1197,8 +1512,11 @@ def _paper_validate_story_plan(
 def _paper_story_sections(
     story_beats: list[dict[str, Any]],
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    evidence_registry: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = []
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_mode = bool(evidence_registry)
     for beat in story_beats:
         source_ids: list[str] = []
         figure_ids: list[str] = []
@@ -1210,17 +1528,30 @@ def _paper_story_sections(
             role = str(original_section.get("role") or "").strip()
             if role and role not in roles:
                 roles.append(role)
-            for source_id in original_section.get("source_paragraph_ids") or []:
-                if source_id not in source_ids:
-                    source_ids.append(source_id)
+            if not canonical_mode:
+                for source_id in original_section.get("source_paragraph_ids") or []:
+                    if source_id not in source_ids:
+                        source_ids.append(source_id)
             for figure_id in original_section.get("figure_ids") or original_section.get("selected_body_figures") or []:
                 normalized = _paper_figure_id(figure_id)
                 if normalized not in figure_ids:
                     figure_ids.append(normalized)
             marker = id(finding)
             if marker not in seen_findings:
-                findings.append(finding)
+                finding_output = dict(finding)
+                if canonical_mode:
+                    finding_output["evidence_ids"] = [
+                        candidate_id
+                        for candidate_id in beat["evidence_ids"]
+                        if evidence_map.get(candidate_id, (None, None))[1] is finding
+                    ]
+                    finding_output["source_paragraph_ids"] = _paper_derived_source_ids(
+                        finding_output["evidence_ids"], evidence_by_id
+                    )
+                findings.append(finding_output)
                 seen_findings.add(marker)
+        if canonical_mode:
+            source_ids = _paper_derived_source_ids(beat["evidence_ids"], evidence_by_id)
         sections.append(
             {
                 "id": beat["id"],
@@ -1244,9 +1575,12 @@ def _paper_apply_story_output(
     sections: list[dict[str, Any]],
     generated: list[dict[str, Any]],
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    evidence_registry: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Attach block-local Figure bindings after the clean writer stage."""
+    """Attach block-local Figure and source bindings after each LLM stage."""
     by_id = {str(item.get("id") or ""): item for item in generated}
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_mode = bool(evidence_registry)
     for section in sections:
         item = by_id.get(str(section.get("id") or ""))
         if item is None:
@@ -1272,12 +1606,18 @@ def _paper_apply_story_output(
                     normalized = _paper_figure_id(value)
                     if normalized not in figure_ids:
                         figure_ids.append(normalized)
+            source_ids = (
+                _paper_derived_source_ids(list(block["evidence_ids"]), evidence_by_id)
+                if canonical_mode
+                else list(section.get("source_paragraph_ids") or [])
+            )
             blocks.append(
                 {
                     "id": str(block["id"]),
                     "evidence_ids": list(block["evidence_ids"]),
                     "text": str(block["text"]).strip(),
                     "figure_ids": figure_ids,
+                    "source_paragraph_ids": source_ids,
                 }
             )
         if not blocks:
@@ -1321,7 +1661,7 @@ def _paper_story_planner(
                 "purpose": "用几分钟讲清论文最值得知道的科学发现",
                 "tone": "清楚、自然、克制、有解释感，不像论文、汇报或营销稿",
             },
-            "clean_evidence": clean_evidence,
+            "clean_evidence": [_paper_clean_evidence_for_llm(record) for record in clean_evidence],
             "style_exemplar": style_exemplar,
             "targeted_feedback": feedback or {},
             "_model": model,
@@ -1419,7 +1759,7 @@ def _paper_story_writer(
             {
                 "editorial_brief": story_plan["editorial_brief"],
                 "story_beat": beat,
-                "clean_evidence": beat_evidence,
+                "clean_evidence": [_paper_clean_evidence_for_llm(record) for record in beat_evidence],
                 "style_exemplar": style_exemplar,
                 "targeted_feedback": feedback or {},
                 "_model": model,
@@ -1486,7 +1826,10 @@ def _paper_humanize_story(
                         "evidence_ids": evidence_ids,
                         "text": str(block.get("text") or ""),
                     },
-                    "clean_evidence": [evidence_by_id[evidence_id] for evidence_id in evidence_ids],
+                    "clean_evidence": [
+                        _paper_clean_evidence_for_llm(evidence_by_id[evidence_id])
+                        for evidence_id in evidence_ids
+                    ],
                     "targeted_feedback": feedback or {},
                     "_model": model,
                     "_temperature": 0.2,
@@ -1567,6 +1910,7 @@ def _paper_plan(
             "metadata": metadata,
             "selected_body_figures": selected_figure_ids or [],
             "figure_evidence_bundles": figure_evidence_bundles or [],
+            "evidence_registry": _paper_registry_for_llm(metadata.get("evidence_registry") or []),
             "validation_feedback": validation_feedback,
             "_model": metadata["model"],
             "_temperature": 0.1,
@@ -1610,16 +1954,23 @@ def _paper_write_section(
         for bundle in figure_evidence_bundles
         if _paper_figure_id(bundle.get("figure_id")) in section_figure_ids
     ]
-    directly_associated_ids = {
-        str(source_id)
-        for bundle in section_bundles
-        for source_id in bundle.get("directly_associated_source_paragraph_ids") or []
-    }
     section_sources = [
         record
         for record in source_paragraphs
         if record["id"] in source_ids
-        and record["id"] in directly_associated_ids
+    ]
+    section_for_llm = {
+        key: value
+        for key, value in section.items()
+        if key not in {"source_paragraph_ids", "source_sentence", "scope"}
+    }
+    section_for_llm["findings"] = [
+        {
+            key: value
+            for key, value in finding.items()
+            if key not in {"source_paragraph_ids", "source_sentence", "scope"}
+        }
+        for finding in section.get("findings") or []
     ]
     payload = {
         # The Planner has already used the authoritative Abstract to define
@@ -1627,9 +1978,9 @@ def _paper_write_section(
         # results as evidence for the current Figure bundle.
         "abstract": "",
         "abstract_context": "Abstract structure and lead are locked; use only the current section findings and Figure bundles below for evidence.",
-        "section": section,
+        "section": section_for_llm,
         "figure_evidence_bundles": section_bundles,
-        "source_paragraphs": section_sources,
+        "source_paragraphs": [{"text": record.get("text", "")} for record in section_sources],
     }
     response = _paper_completion_with_retry(
         client,
@@ -1737,15 +2088,10 @@ def _paper_revision(
     local_source_ids: set[str] = set()
     bundles = plan.get("figure_evidence_bundles") or []
     for section in plan.get("sections") or []:
-        section_figures = {
-            _paper_figure_id(value)
-            for value in section.get("figure_ids") or section.get("selected_body_figures") or []
-        }
         local_source_ids.update(
             str(source_id)
-            for bundle in bundles
-            if _paper_figure_id(bundle.get("figure_id")) in section_figures
-            for source_id in bundle.get("directly_associated_source_paragraph_ids") or []
+            for source_id in section.get("source_paragraph_ids") or []
+            if str(source_id).strip()
         )
     local_sources = [
         record
@@ -2701,12 +3047,12 @@ PAPER_STORY_PLANNER_PROMPT = (
     "读者是跨专业、受过高等教育但非该领域专家的人；目的不是逐项汇报结果，而是用几分钟讲清论文最值得知道的发现。"
     "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
     "再把clean_evidence组织成2到4个story beats，通常约3个但不要硬凑。每个beat包含id、title、reader_question、core_message、"
-    "evidence_ids和transition_to_next。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
+    "evidence_ids和transition_to_next。evidence_ids必须逐字复制输入registry中的真实ID，禁止编号、改写、合并或创造新ID。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
     "允许多个证据共同进入一个beat；标题必须专业、直接、简洁，优先10到22个中文字，直接陈述科学结果。避免为何、线索、改写、同一片中国、谁在主导、真正的答案、背后的秘密等媒体化措辞。不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
     "只学习style_exemplar的中文节奏、句长、信息密度和推进方式，不复制其中的科学事实、数字、地点、机制或句子。"
     "返回严格JSON："
     '{"editorial_brief":{"audience":"...","purpose":"...","tone":"...","reader_should_leave_with":"...","story_question":"..."},'
-    '"story_beats":[{"id":"beat-1","title":"...","reader_question":"...","core_message":"...","evidence_ids":["evidence-1"],"transition_to_next":"..."}]}'
+    '"story_beats":[{"id":"beat-1","title":"...","reader_question":"...","core_message":"...","evidence_ids":["复制registry中的真实evidence_id"],"transition_to_next":"..."}]}'
 )
 
 PAPER_STORY_WRITER_PROMPT = (
@@ -2716,11 +3062,11 @@ PAPER_STORY_WRITER_PROMPT = (
     "标题应专业、直接、简洁，优先10到22个中文字，直接陈述科学结果，不用为何、线索、改写、同一片中国等媒体化表达。"
     "正文不要写成论文Results、摘要扩写、图注翻译或科普新闻稿。避免第一/第二/第三/第四、首先/其次/最后、模板化排比和不必要的分号。"
     "每句话只讲一个主要科学意思，中文逗号和句号为主。保留必要专业词，第一次出现时用简短中文解释；不要为了通俗创造比喻或抽象术语。"
-    "每个beat必须拆成一个或多个paragraph blocks。一个block只能使用同一个evidence_group的Figure-specific evidence；背景性的global_context或section_context可以陪同，但不能携带另一组Figure的核心定量结果。"
+    "每个beat必须拆成一个或多个paragraph blocks。block中的evidence_ids必须逐字复制当前story beat的evidence_ids，禁止编号或创造新ID。一个block只能使用同一个evidence_group的Figure-specific evidence；背景性的global_context或section_context可以陪同，但不能携带另一组Figure的核心定量结果。"
     "clean_evidence中的每个anchor都必须在包含对应evidence_id的block正文中原样保留；不能跨block移动、重复或删除已验证anchor。"
     "正文总量以约350到500个中文字符为目标；按故事需要分配篇幅，不要把每个beat或block机械写成等长。"
     + PAPER_FIDELITY_CONTRACT
-    + "本次只写当前story beat，返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"id\":\"block-1\",\"evidence_ids\":[\"evidence-1\"],\"text\":\"...\"}]}。"
+    + "本次只写当前story beat，返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"id\":\"block-1\",\"evidence_ids\":[\"复制当前beat的evidence_id\"],\"text\":\"...\"}]}。"
 )
 
 PAPER_HUMANIZER_PROMPT = (
@@ -2734,23 +3080,23 @@ PAPER_HUMANIZER_PROMPT = (
     "非anchor的细节可以删减，但不能新增事实、机制、意义或因果关系。"
     "若targeted_feedback指出技术密度或模板风险，优先删除方法、变量和公式清单，只保留当前block理解结论所需的信息。"
     + PAPER_FIDELITY_CONTRACT
-    + "只返回严格JSON：{\"block\":{\"id\":\"block-1\",\"evidence_ids\":[\"evidence-1\"],\"text\":\"...\"}}。"
+    + "只返回严格JSON：{\"block\":{\"id\":\"block-1\",\"evidence_ids\":[\"复制当前block的evidence_id\"],\"text\":\"...\"}}。"
 )
 
 PAPER_PLANNER_PROMPT = (
     "你是Figure-first Scientific Planner，不写文章正文。根据Abstract、paper_text、source_paragraphs、selected_body_figures和figure_evidence_bundles，"
     "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；不要自行猜测Figure归属。"
-    "每个section包含id、title、role、figure_ids、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、figure_ids、evidence、anchors。"
+    "每个section包含id、title、role、figure_ids和findings；source provenance由Python根据evidence_ids推导，禁止返回source_paragraph_ids、source_sentence或其他source字段。title必须是适合中文成稿的简洁中文小标题；每个finding包含id、figure_ids和evidence_ids。"
     "有selected Figure时，section和Figure-specific finding应明确绑定当前section的figure_ids；一个section可以包含多张高度相关Figure。若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section；这类section允许使用global_context或section_context，不得因为没有Figure-specific evidence而返回空sections。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
     "每个Figure bundle的核心finding只能进入包含该Figure的section；Figure 只可通过bundle中的caption、明确引用段落和直接关联Results段落支持正文。不要把Fig.2的R=0.71写入只包含Fig.3的section。"
     "无独立主图的机制内容只能作为最相关Figure section中的2到3句解释，不要新建无图机制section；只有删除会造成明显科学逻辑断裂时才保留无图短过渡。"
-    "role使用贴合论文的简洁自然标签，不要套固定taxonomy。source_paragraph_ids只能使用输入中真实存在的source id。"
-    "每个finding都要有anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；有Figure支持时填写figure_ids，没有Figure-specific支持时允许figure_ids为空数组。anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
+    "role使用贴合论文的简洁自然标签，不要套固定taxonomy。只能引用输入registry中真实存在的evidence_id，不能生成或修改source provenance。"
+    "每个finding都要有evidence_ids数组；不要返回anchors、source_paragraph_ids、source_sentence或scope，anchors和全部source provenance由Python registry推导。"
     "如果输入包含validation_feedback，必须优先修复其中指出的Figure、source或anchor归属，不能重复提交同一错误计划。"
-    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"source_paragraph_ids":["source-0"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence":"...","anchors":["R = 0.71"]}]}]}'
+    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence_ids":["复制registry中的真实evidence_id"]}]}]}'
 )
 
 PAPER_REVIEWER_PROMPT = (
@@ -2896,7 +3242,13 @@ def _generate_paper_article_markdown(
         selected_images,
         source_paragraphs,
     )
+    evidence_registry = _paper_canonical_evidence_registry(
+        source_paragraphs,
+        figure_evidence_bundles,
+    )
+    evidence_by_id = _paper_evidence_by_id(evidence_registry)
     selected_figure_ids = [str(bundle["figure_id"]) for bundle in figure_evidence_bundles]
+    dossier["paper_evidence_registry"] = evidence_registry
     dossier["paper_figure_evidence_bundles"] = figure_evidence_bundles
     metadata = {
         "title": dossier.get("title", ""),
@@ -2906,6 +3258,7 @@ def _generate_paper_article_markdown(
         "authors": dossier.get("authors", []),
         "selected_body_figures": selected_figure_ids,
         "figure_evidence_bundles": figure_evidence_bundles,
+        "evidence_registry": evidence_registry,
         "figure_captions": [
             {"caption": image.get("caption", "")}
             for image in dossier.get("images", [])
@@ -2944,6 +3297,7 @@ def _generate_paper_article_markdown(
         plan,
         valid_source_ids,
         set(selected_figure_ids) if figure_first else None,
+        evidence_registry,
     )
     logger.info(
         "PAPER stage=scientific_planner normalized_sections=%d",
@@ -2953,6 +3307,7 @@ def _generate_paper_article_markdown(
         section.pop("necessary_transition", None)
         section.pop("transition_reason", None)
     plan["figure_evidence_bundles"] = figure_evidence_bundles
+    plan["evidence_registry"] = evidence_registry
     plan["planner_sections"] = [dict(section) for section in plan["sections"]]
     # The grey Abstract is a faithful translation and is locked before any
     # story, style, or readability stage runs.
@@ -2982,6 +3337,7 @@ def _generate_paper_article_markdown(
             draft,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
     except RuntimeError as exc:
         if not any(
@@ -3008,6 +3364,7 @@ def _generate_paper_article_markdown(
             plan,
             valid_source_ids,
             set(selected_figure_ids) if figure_first else None,
+            evidence_registry,
         )
         logger.info(
             "PAPER stage=scientific_planner normalized_sections=%d",
@@ -3024,6 +3381,7 @@ def _generate_paper_article_markdown(
             draft,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
     logger.info(
         "PAPER stage=scientific_planner done elapsed=%.3f",
@@ -3089,13 +3447,18 @@ def _generate_paper_article_markdown(
             draft,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
         logger.info("PAPER deterministic evidence validation passed")
 
     plan["scientific_review"] = scientific_review
 
     style_exemplar = _paper_clean_story_text(_paper_style_exemplar())
-    clean_evidence, evidence_map = _paper_clean_story_evidence(plan, source_paragraphs)
+    clean_evidence, evidence_map = _paper_clean_story_evidence(
+        plan,
+        source_paragraphs,
+        evidence_registry,
+    )
     story_plan = _paper_story_planner(
         client,
         clean_evidence,
@@ -3115,11 +3478,19 @@ def _generate_paper_article_markdown(
             {"validation": "Use every evidence_id exactly once across the beats; keep each anchor in its assigned beat."},
         )
         story_beats = _paper_validate_story_plan(story_plan, valid_evidence_ids)
-    story_sections = _paper_story_sections(story_beats, evidence_map)
+    story_sections = _paper_story_sections(
+        story_beats,
+        evidence_map,
+        evidence_registry,
+    )
     plan["story_plan"] = story_plan
     plan["sections"] = story_sections
-    plan["story_evidence"] = {
-        evidence_id: {
+    story_evidence: dict[str, dict[str, Any]] = {}
+    for evidence_id, (original_section, finding) in evidence_map.items():
+        canonical = evidence_by_id.get(evidence_id)
+        if canonical is None:
+            raise RuntimeError(f"PAPER unknown evidence_id: {evidence_id}")
+        story_evidence[evidence_id] = {
             "figure_ids": list(
                 dict.fromkeys(
                     _paper_figure_id(value)
@@ -3127,15 +3498,19 @@ def _generate_paper_article_markdown(
                         finding.get("figure_ids")
                         or original_section.get("figure_ids")
                         or original_section.get("selected_body_figures")
+                        or canonical.get("supported_figures")
                         or []
                     )
                     if str(value).strip()
                 )
             ),
-            "anchors": list(finding.get("anchors") or []),
+            "anchors": list(canonical.get("anchors") or finding.get("anchors") or []),
+            "source_paragraph_ids": list(canonical.get("source_paragraph_ids") or []),
+            "source_sentence": str(canonical.get("source_sentence") or ""),
+            "scope": str(canonical.get("scope") or "section_context"),
+            "supported_figures": list(canonical.get("supported_figures") or []),
         }
-        for evidence_id, (original_section, finding) in evidence_map.items()
-    }
+    plan["story_evidence"] = story_evidence
     story_writer_retry_count = 0
     try:
         story_output = _paper_story_writer(
@@ -3158,7 +3533,7 @@ def _generate_paper_article_markdown(
             settings.model_name,
             {"structure": "Return every story beat exactly once and partition every evidence_id into non-mixed Figure blocks."},
         )
-    _paper_apply_story_output(plan["sections"], story_output, evidence_map)
+    _paper_apply_story_output(plan["sections"], story_output, evidence_map, evidence_registry)
     draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
     try:
         _validate_paper_evidence_plan(
@@ -3166,6 +3541,7 @@ def _generate_paper_article_markdown(
             draft,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
     except RuntimeError as exc:
         if not any(
@@ -3189,13 +3565,14 @@ def _generate_paper_article_markdown(
                 "deterministic_validation": "A deterministic evidence check found an anchor placement issue. Preserve every supplied anchor exactly and keep it with its evidence."
             },
         )
-        _paper_apply_story_output(plan["sections"], story_output, evidence_map)
+        _paper_apply_story_output(plan["sections"], story_output, evidence_map, evidence_registry)
         draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
             draft,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
     logger.info("PAPER deterministic evidence validation passed")
     plan["story_writer_retry_count"] = story_writer_retry_count
@@ -3230,13 +3607,14 @@ def _generate_paper_article_markdown(
             settings.model_name,
             {"style_lint": lint, **popular_feedback},
         )
-        _paper_apply_story_output(plan["sections"], story_output, evidence_map)
+        _paper_apply_story_output(plan["sections"], story_output, evidence_map, evidence_registry)
         markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
             markdown,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
         logger.info("PAPER deterministic evidence validation passed")
         lint = _paper_ai_style_lint(markdown)
@@ -3266,13 +3644,14 @@ def _generate_paper_article_markdown(
         _paper_story_draft_blocks(plan["sections"]),
         settings.model_name,
     )
-    _paper_apply_story_output(plan["sections"], humanized_output, evidence_map)
+    _paper_apply_story_output(plan["sections"], humanized_output, evidence_map, evidence_registry)
     markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
     _validate_paper_evidence_plan(
         plan,
         markdown,
         valid_source_ids,
         figure_evidence_bundles if figure_first else None,
+        evidence_registry,
     )
     logger.info("PAPER deterministic evidence validation passed")
 
@@ -3300,13 +3679,14 @@ def _generate_paper_article_markdown(
             settings.model_name,
             {"readability": final_humanizer_feedback},
         )
-        _paper_apply_story_output(plan["sections"], targeted_output, evidence_map)
+        _paper_apply_story_output(plan["sections"], targeted_output, evidence_map, evidence_registry)
         markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
             markdown,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
         logger.info("PAPER deterministic evidence validation passed")
         final_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
@@ -3329,13 +3709,14 @@ def _generate_paper_article_markdown(
             settings.model_name,
             {"stop_slop": stop_slop_feedback},
         )
-        _paper_apply_story_output(plan["sections"], targeted_output, evidence_map)
+        _paper_apply_story_output(plan["sections"], targeted_output, evidence_map, evidence_registry)
         markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
             markdown,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
+            evidence_registry,
         )
         logger.info("PAPER deterministic evidence validation passed")
         stop_slop_feedback = _paper_stop_slop_audit(markdown)
@@ -3378,6 +3759,7 @@ def _generate_paper_article_markdown(
         markdown,
         valid_source_ids,
         figure_evidence_bundles if figure_first else None,
+        evidence_registry,
     )
     logger.info("PAPER deterministic evidence validation passed")
     dossier["paper_evidence_plan"] = plan

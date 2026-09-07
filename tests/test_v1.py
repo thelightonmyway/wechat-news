@@ -87,10 +87,14 @@ from writer.llm import (
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_apply_story_output,
     _paper_body_length_audit,
     _paper_chinese_char_count,
+    _paper_canonical_evidence_registry,
     _paper_clean_story_evidence,
     _paper_clean_story_text,
+    _paper_evidence_by_id,
+    _paper_story_sections,
     _paper_plain_language_cleanup,
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
@@ -101,6 +105,7 @@ from writer.llm import (
     _paper_story_sections,
     _paper_story_writer,
     _paper_validate_story_plan,
+    _validate_paper_plan_structure,
     prune_paper_sections_after_allocation,
     _normalize_article_markdown,
     _paper_revision,
@@ -2095,10 +2100,11 @@ class V1Tests(unittest.TestCase):
                 "title": "总体结果",
                 "role": "phenomenon",
                 "figure_ids": [],
-                "source_paragraph_ids": ["source-0"],
-                "findings": [{"id": "E1", "figure_ids": [], "evidence": "总体结果", "anchors": []}],
+                "findings": [{"id": "E1", "figure_ids": [], "evidence_ids": ["evidence-source-source-0"]}],
             }]
         }
+        story_plan = _story_plan_for_evidence(1)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-source-source-0"]
         settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
         with tempfile.TemporaryDirectory() as tmp, patch(
             "writer.llm._paper_plan", side_effect=[empty_plan, valid_plan]
@@ -2109,7 +2115,7 @@ class V1Tests(unittest.TestCase):
         ), patch(
             "writer.llm._paper_review", return_value={"status": "pass", "corrections": []}
         ), patch(
-            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)
+            "writer.llm._paper_story_planner", return_value=story_plan
         ), patch(
             "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["总体结果。"])
         ), patch(
@@ -2147,16 +2153,14 @@ class V1Tests(unittest.TestCase):
                                         "title": "机器学习重构",
                                         "role": "attribution",
                                         "figure_ids": ["Fig. 2"],
-                                        "source_paragraph_ids": ["source-0"],
-                                        "findings": [{"id": "E1", "figure_ids": ["Fig. 2"], "evidence": "重构", "anchors": ["R = 0.71"]}],
+                                        "findings": [{"id": "E1", "figure_ids": ["Fig. 2"], "evidence_ids": ["evidence-source-source-figure-1"]}],
                                     },
                                     {
                                         "id": "section-2",
                                         "title": "森林相关",
                                         "role": "attribution",
                                         "figure_ids": ["Fig. 3"],
-                                        "source_paragraph_ids": ["source-0"],
-                                        "findings": [{"id": "E2", "figure_ids": ["Fig. 3"], "evidence": "森林相关", "anchors": ["R = −0.77"]}],
+                                        "findings": [{"id": "E2", "figure_ids": ["Fig. 3"], "evidence_ids": ["evidence-source-source-figure-2"]}],
                                     },
                                 ]
                             },
@@ -2180,8 +2184,11 @@ class V1Tests(unittest.TestCase):
         settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
         client = MagicMock()
         client.chat.completions.create.side_effect = responses
+        story_plan = _story_plan_for_evidence(2)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-source-source-figure-1"]
+        story_plan["story_beats"][1]["evidence_ids"] = ["evidence-source-source-figure-2"]
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
-            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(2)
+            "writer.llm._paper_story_planner", return_value=story_plan
         ), patch(
             "writer.llm._paper_story_writer",
             return_value=_story_output_for_evidence(2, ["机器学习重构R = 0.71。", "森林相关R = −0.77。"]),
@@ -2278,6 +2285,200 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(bundles[0]["figure_id"], "Fig. 2")
         self.assertEqual(bundles[0]["explicit_source_paragraph_ids"], ["source-0"])
         self.assertIn("R = 0.71", bundles[0]["quantitative_anchors"])
+
+    def test_paper_canonical_registry_keeps_anchor_source_provenance(self):
+        source_paragraphs = [
+            {"id": "source-0", "text": "Abstract context."},
+            {"id": "source-8", "text": "U ISV improves Niño-3.4 reconstruction (r = 0.73)."},
+            {"id": "source-47", "text": "The combined predictor improves reconstruction to r = 0.73 (Fig. 2)."},
+        ]
+        bundles = _paper_figure_evidence_bundles(
+            [{"figure_number": 2, "caption": "Figure 2. ENSO reconstruction."}],
+            source_paragraphs,
+        )
+        registry = _paper_canonical_evidence_registry(source_paragraphs, bundles)
+        records = [
+            record for record in registry if record["normalized_value"] == "r=0.73"
+        ]
+        self.assertTrue(records)
+        self.assertEqual(records[0]["source_paragraph_ids"], ["source-8"])
+        self.assertIn("r = 0.73", records[0]["source_sentence"])
+        self.assertEqual(records[0]["scope"], "section_context")
+
+    def test_paper_planner_cannot_return_source_provenance(self):
+        registry = [{
+            "evidence_id": "evidence-anchor",
+            "value": "r = 0.73",
+            "normalized_value": "r=0.73",
+            "source_paragraph_ids": ["source-8"],
+            "source_sentence": "The reconstruction reaches r = 0.73.",
+            "scope": "section_context",
+            "supported_figures": [],
+            "anchors": ["r = 0.73"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "source_paragraph_ids": ["source-1"],
+                "findings": [{"id": "E1", "evidence_ids": ["evidence-anchor"]}],
+            }]
+        }
+        with self.assertRaisesRegex(RuntimeError, "source provenance"):
+            _validate_paper_plan_structure(plan, {"source-1", "source-8"}, None, registry)
+
+    def test_paper_canonical_section_sources_derive_from_evidence_ids(self):
+        registry = [{
+            "evidence_id": "evidence-anchor",
+            "value": "r = 0.73",
+            "normalized_value": "r=0.73",
+            "source_paragraph_ids": ["source-8"],
+            "source_sentence": "The reconstruction reaches r = 0.73.",
+            "scope": "section_context",
+            "supported_figures": [],
+            "anchors": ["r = 0.73"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "figure_ids": [],
+                "findings": [{"id": "E1", "evidence_ids": ["evidence-anchor"]}],
+            }]
+        }
+        sections = _validate_paper_plan_structure(plan, {"source-8"}, None, registry)
+        self.assertEqual(sections[0]["source_paragraph_ids"], ["source-8"])
+        self.assertEqual(sections[0]["findings"][0]["anchors"], ["r = 0.73"])
+
+    def test_paper_canonical_section_source_order_is_registry_order(self):
+        registry = [
+            {
+                "evidence_id": "evidence-source-context",
+                "value": "context",
+                "normalized_value": "context",
+                "source_paragraph_ids": ["source-80"],
+                "source_sentence": "Context source.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": [],
+            },
+            {
+                "evidence_id": "evidence-source-caption",
+                "value": "caption",
+                "normalized_value": "caption",
+                "source_paragraph_ids": ["source-figure-2"],
+                "source_sentence": "Caption source.",
+                "scope": "figure_specific",
+                "supported_figures": ["Fig. 2"],
+                "anchors": [],
+            },
+        ]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "figure_ids": ["Fig. 2"],
+                "findings": [
+                    {"id": "E1", "figure_ids": ["Fig. 2"], "evidence_ids": ["evidence-source-caption"]},
+                    {"id": "E2", "figure_ids": ["Fig. 2"], "evidence_ids": ["evidence-source-context"]},
+                ],
+            }]
+        }
+        sections = _validate_paper_plan_structure(
+            plan,
+            {"source-80", "source-figure-2"},
+            {"Fig. 2"},
+            registry,
+        )
+        self.assertEqual(
+            sections[0]["source_paragraph_ids"],
+            ["source-80", "source-figure-2"],
+        )
+
+    def test_paper_block_sources_are_recomputed_after_story_output(self):
+        registry = [{
+            "evidence_id": "evidence-anchor",
+            "source_paragraph_ids": ["source-8"],
+            "source_sentence": "The reconstruction reaches r = 0.73.",
+            "scope": "section_context",
+            "supported_figures": [],
+            "anchors": ["r = 0.73"],
+        }]
+        sections = [{
+            "id": "beat-1",
+            "title": "结果",
+            "source_paragraph_ids": ["source-8"],
+            "story_beat": {"evidence_ids": ["evidence-anchor"]},
+        }]
+        evidence_map = {
+            "evidence-anchor": (
+                sections[0],
+                {"figure_ids": [], "evidence_ids": ["evidence-anchor"]},
+            )
+        }
+        _paper_apply_story_output(
+            sections,
+            [{
+                "id": "beat-1",
+                "title": "结果",
+                "blocks": [{"id": "block-1", "evidence_ids": ["evidence-anchor"], "text": "r = 0.73。"}],
+            }],
+            evidence_map,
+            registry,
+        )
+        self.assertEqual(sections[0]["blocks"][0]["source_paragraph_ids"], ["source-8"])
+
+    def test_paper_canonical_wrong_source_fails_hard(self):
+        registry = [{
+            "evidence_id": "evidence-anchor",
+            "value": "r = 0.73",
+            "normalized_value": "r=0.73",
+            "source_paragraph_ids": ["source-8"],
+            "source_sentence": "The reconstruction reaches r = 0.73.",
+            "scope": "section_context",
+            "supported_figures": [],
+            "anchors": ["r = 0.73"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "source_paragraph_ids": ["source-1"],
+                "findings": [{"id": "E1", "evidence_ids": ["evidence-anchor"], "anchors": ["r = 0.73"]}],
+            }]
+        }
+        markdown = "# 标题\n\n## 结果\n\nr = 0.73。"
+        with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+            _validate_paper_evidence_plan(
+                plan,
+                markdown,
+                {"source-1", "source-8"},
+                [],
+                registry,
+            )
+
+    def test_paper_canonical_source_duplicate_is_deduplicated(self):
+        registry = [{
+            "evidence_id": "evidence-anchor",
+            "value": "r = 0.73",
+            "normalized_value": "r=0.73",
+            "source_paragraph_ids": ["source-8", "source-8"],
+            "source_sentence": "The reconstruction reaches r = 0.73.",
+            "scope": "section_context",
+            "supported_figures": [],
+            "anchors": ["r = 0.73"],
+        }]
+        self.assertEqual(
+            _paper_clean_story_evidence(
+                {"sections": [{"role": "result", "source_paragraph_ids": ["source-8"], "findings": [{"evidence": "r = 0.73", "anchors": ["r = 0.73"]}]}]},
+                [{"id": "source-8", "text": "The reconstruction reaches r = 0.73."}],
+            )[0][0]["source_paragraph_ids"],
+            ["source-8"],
+        )
 
     def test_paper_provenance_figure_specific_mismatch_is_rejected(self):
         images = [
