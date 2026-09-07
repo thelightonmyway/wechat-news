@@ -96,6 +96,7 @@ from writer.llm import (
     _paper_clean_story_evidence,
     _paper_clean_story_text,
     _paper_evidence_by_id,
+    _paper_derived_source_ids,
     _paper_story_sections,
     _paper_story_block_specs,
     _paper_plain_language_cleanup,
@@ -2310,6 +2311,95 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(records[0]["source_paragraph_ids"], ["source-8"])
         self.assertIn("r = 0.73", records[0]["source_sentence"])
         self.assertEqual(records[0]["scope"], "section_context")
+
+    def test_paper_caption_provenance_stays_out_of_source_paragraph_ids(self):
+        source_paragraphs = [{
+            "id": "source-figure-3",
+            "text": "Fig. 3. Forest trend relation and approximately 74% reduction.",
+        }]
+        bundles = _paper_figure_evidence_bundles(
+            [{"figure_number": 3, "caption": source_paragraphs[0]["text"]}],
+            source_paragraphs,
+        )
+        registry = _paper_canonical_evidence_registry(source_paragraphs, bundles)
+        caption_record = next(
+            record
+            for record in registry
+            if record["source_paragraph_ids"] == ["caption:Fig. 3"]
+        )
+        self.assertEqual(caption_record["supported_figures"], ["Fig. 3"])
+        self.assertIn("74%", caption_record["source_sentence"])
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "森林变化",
+                "role": "result",
+                "figure_ids": ["Fig. 3"],
+                "findings": [{
+                    "id": "E1",
+                    "figure_ids": ["Fig. 3"],
+                    "evidence_ids": [caption_record["evidence_id"]],
+                }],
+            }]
+        }
+        validated = _validate_paper_plan_structure(
+            plan,
+            {"source-figure-3"},
+            {"Fig. 3"},
+            registry,
+        )
+        self.assertEqual(validated[0]["source_paragraph_ids"], [])
+        self.assertNotIn("caption:Fig. 3", validated[0]["source_paragraph_ids"])
+        evidence_map = {
+            caption_record["evidence_id"]: (
+                validated[0],
+                validated[0]["findings"][0],
+            )
+        }
+        story_plan = {
+            "story_beats": [{
+                "id": "beat-1",
+                "title": "森林变化",
+                "reader_question": "森林变化如何影响结果？",
+                "core_message": "森林变化与结果相关。",
+                "evidence_ids": [caption_record["evidence_id"]],
+                "transition_to_next": "文章收束。",
+            }]
+        }
+        story_sections = _paper_story_sections(
+            story_plan["story_beats"],
+            evidence_map,
+            registry,
+            {"source-figure-3"},
+        )
+        block_specs = _paper_story_block_specs(
+            story_plan,
+            [{
+                "evidence_id": caption_record["evidence_id"],
+                "evidence_group": "evidence_group_A",
+                "anchors": ["approximately 74%"],
+            }],
+            evidence_map,
+            registry,
+            {"source-figure-3"},
+        )
+        self.assertEqual(story_sections[0]["source_paragraph_ids"], [])
+        self.assertEqual(block_specs["beat-1"][0]["source_paragraph_ids"], ())
+        _validate_paper_evidence_plan(
+            {
+                "sections": validated,
+            },
+            "# 标题\n\n## 森林变化\n\n约74%的差异来自森林变化。",
+            {"source-figure-3"},
+            bundles,
+            registry,
+        )
+        with self.assertRaisesRegex(RuntimeError, "unknown source paragraph id"):
+            _paper_derived_source_ids(
+                ["bad-evidence"],
+                {"bad-evidence": {"source_paragraph_ids": ["source-999"]}},
+                {"source-figure-3"},
+            )
 
     def test_paper_planner_cannot_return_source_provenance(self):
         registry = [{

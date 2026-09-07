@@ -503,21 +503,27 @@ def _paper_clean_evidence_for_llm(record: dict[str, Any]) -> dict[str, Any]:
 def _paper_derived_source_ids(
     evidence_ids: list[str],
     evidence_by_id: dict[str, dict[str, Any]],
+    valid_source_ids: set[str] | None = None,
 ) -> list[str]:
+    """Resolve only real source-paragraph IDs; keep caption IDs evidence-local."""
     source_set: set[str] = set()
     for evidence_id in evidence_ids:
         record = evidence_by_id.get(evidence_id)
         if record is None:
             raise RuntimeError(f"PAPER unknown evidence_id: {evidence_id}")
-        source_set.update(
-            str(source_id).strip()
-            for source_id in record.get("source_paragraph_ids") or []
-            if str(source_id).strip()
-        )
+        for raw_source_id in record.get("source_paragraph_ids") or []:
+            source_id = str(raw_source_id).strip()
+            if not source_id or source_id.startswith("caption:"):
+                continue
+            if not source_id.startswith("source-"):
+                raise RuntimeError(f"PAPER invalid source paragraph id: {source_id}")
+            if valid_source_ids is not None and source_id not in valid_source_ids:
+                raise RuntimeError(f"PAPER unknown source paragraph id: {source_id}")
+            source_set.add(source_id)
     source_ids: list[str] = []
     for record in evidence_by_id.values():
-        for source_id in record.get("source_paragraph_ids") or []:
-            source_id = str(source_id).strip()
+        for raw_source_id in record.get("source_paragraph_ids") or []:
+            source_id = str(raw_source_id).strip()
             if source_id in source_set and source_id not in source_ids:
                 source_ids.append(source_id)
     for source_id in sorted(source_set):
@@ -567,6 +573,7 @@ def _paper_validate_story_blocks(
     supported_figures_by_anchor: dict[str, set[str]],
     provenance_by_anchor: dict[str, list[dict[str, Any]]],
     evidence_registry: list[dict[str, Any]] | None = None,
+    valid_source_paragraph_ids: set[str] | None = None,
 ) -> None:
     story_evidence = plan.get("story_evidence")
     if not isinstance(story_evidence, dict):
@@ -605,7 +612,9 @@ def _paper_validate_story_blocks(
             ):
                 raise RuntimeError("PAPER story block validation failed: invalid evidence assignment")
             if canonical_mode:
-                expected_source_ids = _paper_derived_source_ids(evidence_ids, evidence_by_id)
+                expected_source_ids = _paper_derived_source_ids(
+                    evidence_ids, evidence_by_id, valid_source_paragraph_ids
+                )
                 actual_source_ids = list(block.get("source_paragraph_ids") or [])
                 if actual_source_ids != expected_source_ids:
                     raise RuntimeError(
@@ -730,14 +739,16 @@ def _validate_paper_evidence_plan(
         supported_figures_by_anchor,
         provenance_by_anchor,
         evidence_registry,
+        valid_source_paragraph_ids,
     )
     for planned_index, section in enumerate(planned_sections):
         if not isinstance(section, dict):
             raise RuntimeError("PAPER evidence plan validation failed: invalid section")
         source_ids = section.get("source_paragraph_ids")
-        if not isinstance(source_ids, list) or not source_ids or not all(
-            isinstance(source_id, str) and source_id.strip() for source_id in source_ids
-        ):
+        if not isinstance(source_ids, list) or any(
+            not isinstance(source_id, str) or not source_id.strip()
+            for source_id in source_ids
+        ) or (not canonical_mode and not source_ids):
             raise RuntimeError(
                 "PAPER evidence plan validation failed: invalid source_paragraph_ids"
             )
@@ -757,7 +768,7 @@ def _validate_paper_evidence_plan(
             ]
             unique_evidence_ids = list(dict.fromkeys(section_evidence_ids))
             expected_source_ids = _paper_derived_source_ids(
-                unique_evidence_ids, evidence_by_id
+                unique_evidence_ids, evidence_by_id, valid_source_paragraph_ids
             )
             for evidence_id in unique_evidence_ids:
                 record = evidence_by_id[evidence_id]
@@ -977,7 +988,7 @@ def _validate_paper_plan_structure(
                     )
                 )
                 finding["source_paragraph_ids"] = _paper_derived_source_ids(
-                    evidence_ids, evidence_by_id
+                    evidence_ids, evidence_by_id, valid_source_paragraph_ids
                 )
                 finding["source_sentence"] = [
                     str(record.get("source_sentence") or "")
@@ -1013,7 +1024,7 @@ def _validate_paper_plan_structure(
             finding.pop("quantitative anchors", None)
         if canonical_mode:
             section["source_paragraph_ids"] = _paper_derived_source_ids(
-                derived_section_evidence_ids, evidence_by_id
+                derived_section_evidence_ids, evidence_by_id, valid_source_paragraph_ids
             )
         seen_ids.add(section_id)
         validated.append(section)
@@ -1406,7 +1417,9 @@ def _paper_clean_story_evidence(
                     )
                 ) if canonical_mode else list(dict.fromkeys(text for text in section_sources if text))
                 source_ids = (
-                    _paper_derived_source_ids([evidence_id], evidence_by_id)
+                    _paper_derived_source_ids(
+                        [evidence_id], evidence_by_id, set(source_by_id)
+                    )
                     if canonical_mode
                     else list(section.get("source_paragraph_ids") or [])
                 )
@@ -1517,6 +1530,7 @@ def _paper_story_sections(
     story_beats: list[dict[str, Any]],
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
     evidence_registry: list[dict[str, Any]] | None = None,
+    valid_source_paragraph_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = []
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
@@ -1550,12 +1564,16 @@ def _paper_story_sections(
                         if evidence_map.get(candidate_id, (None, None))[1] is finding
                     ]
                     finding_output["source_paragraph_ids"] = _paper_derived_source_ids(
-                        finding_output["evidence_ids"], evidence_by_id
+                        finding_output["evidence_ids"],
+                        evidence_by_id,
+                        valid_source_paragraph_ids,
                     )
                 findings.append(finding_output)
                 seen_findings.add(marker)
         if canonical_mode:
-            source_ids = _paper_derived_source_ids(beat["evidence_ids"], evidence_by_id)
+            source_ids = _paper_derived_source_ids(
+                beat["evidence_ids"], evidence_by_id, valid_source_paragraph_ids
+            )
         sections.append(
             {
                 "id": beat["id"],
@@ -1580,6 +1598,7 @@ def _paper_story_block_specs(
     clean_evidence: list[dict[str, Any]],
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]] | None,
     evidence_registry: list[dict[str, Any]] | None = None,
+    valid_source_paragraph_ids: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Build immutable Python-owned block bindings for each validated beat."""
     clean_by_id = {
@@ -1634,7 +1653,7 @@ def _paper_story_block_specs(
                 )
                 if evidence_registry:
                     resolved_sources = _paper_derived_source_ids(
-                        [evidence_id], evidence_by_id
+                        [evidence_id], evidence_by_id, valid_source_paragraph_ids
                     )
                 else:
                     resolved_sources = list(
@@ -1644,7 +1663,9 @@ def _paper_story_block_specs(
                     if source_id not in source_ids:
                         source_ids.append(source_id)
             if evidence_registry:
-                source_ids = _paper_derived_source_ids(evidence_ids, evidence_by_id)
+                source_ids = _paper_derived_source_ids(
+                    evidence_ids, evidence_by_id, valid_source_paragraph_ids
+                )
             specs.append(
                 {
                     "block_id": f"{beat_id}-block-{index}",
@@ -3621,12 +3642,14 @@ def _generate_paper_article_markdown(
         story_beats,
         evidence_map,
         evidence_registry,
+        valid_source_ids,
     )
     block_specs = _paper_story_block_specs(
         story_plan,
         clean_evidence,
         evidence_map,
         evidence_registry,
+        valid_source_ids,
     )
     plan["story_plan"] = story_plan
     plan["sections"] = story_sections
