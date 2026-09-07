@@ -13,9 +13,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from db import Database, utc_now
-from images.policy import apply_policy, format_license_label, is_no_derivatives_license
 from images.search import search_public_images
-from news.extract import download_publishable_images, extract_article
+from news.extract import download_images, download_publishable_images, extract_article
 from news.feeds import fetch_all_feeds, normalize_title
 from papers.doi import resolve_doi_landing_page
 from papers.first_page import render_paper_first_page
@@ -1282,35 +1281,10 @@ def _paper_html_access_failed(
     )
 
 
-def _apply_article_license_to_html_figures(
-    images: list[dict[str, Any]],
-    article_license: str,
-) -> list[dict[str, Any]]:
-    updated: list[dict[str, Any]] = []
-    for image in images:
-        record = dict(image)
-        if record.get("image_source") == "html_figure":
-            record["license"] = article_license or record.get("license") or ""
-            record = apply_policy(record, allow_no_derivatives=True)
-            if (
-                record.get("publishable")
-                and is_no_derivatives_license(str(record.get("license") or ""))
-                and int(record.get("figure_image_count") or 1) != 1
-            ):
-                record["publishable"] = False
-                record["cover_eligible"] = False
-                record["reason"] = (
-                    "ND figure contains multiple image regions; complete unmodified figure "
-                    "cannot be guaranteed"
-                )
-        updated.append(record)
-    return updated
-
-
-def _has_publishable_html_image(images: list[dict[str, Any]]) -> bool:
+def _has_local_html_image(images: list[dict[str, Any]]) -> bool:
     rejected_terms = ("logo", "icon", "advertisement", "tracking", "banner", "sprite")
     for image in images:
-        if not image.get("publishable") or image.get("image_source") == "pdf_figure":
+        if image.get("image_source") == "pdf_figure":
             continue
         local_path = str(image.get("local_path") or "")
         if not local_path or not Path(local_path).is_file():
@@ -1390,7 +1364,7 @@ def _paper_allocate_images(
     limit: int = 4,
     source_context: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Map every legal PAPER image before applying the global image limit."""
+    """Map every usable PAPER image before applying the global image limit."""
     lines = context.splitlines()
     section_slots = _paper_section_slots(lines) if context.strip() else []
     numbered_images = [
@@ -1764,11 +1738,7 @@ def _select_article_images(
         ),
         reverse=True,
     )
-    cover_ranked = [
-        image
-        for image in ranked
-        if not is_no_derivatives_license(str(image.get("license") or ""))
-    ]
+    cover_ranked = ranked
     cover: dict[str, Any] | None = cover_ranked[0] if cover_ranked else None
     if content_type == PAPER_CONTENT and cover_ranked:
         preferred_html = [
@@ -1820,46 +1790,8 @@ def _select_article_images(
     return cover, body, redundant_count
 
 
-def _paper_nd_attribution(image: dict[str, Any], dossier: dict[str, Any]) -> str:
-    if dossier.get("content_type") != PAPER_CONTENT or not is_no_derivatives_license(
-        str(image.get("license") or "")
-    ):
-        return ""
-
-    credit = " ".join(str(image.get("credit") or "").split())
-    openalex = dossier.get("openalex") or {}
-    authors = openalex.get("authors") or dossier.get("authors") or []
-    creator = credit
-    if not creator and authors:
-        creator = str(authors[0]).strip()
-        if creator and len(authors) > 1:
-            creator = f"{creator} et al."
-
-    year = ""
-    for value in (
-        openalex.get("publication_year"),
-        openalex.get("publication_date"),
-        dossier.get("published_at"),
-    ):
-        match = re.search(r"\b(?:19|20)\d{2}\b", str(value or ""))
-        if match:
-            year = match.group(0)
-            break
-    if creator and year and year not in creator:
-        creator = f"{creator} ({year})"
-
-    license_label = format_license_label(
-        str(image.get("license") or ""),
-        str(image.get("license_url") or ""),
-    )
-    parts = [part for part in (creator, license_label) if part]
-    return f"图源：{', '.join(parts)}" if parts else ""
-
-
 def _paper_wechat_cover(paper_first_page: dict[str, Any]) -> dict[str, Any]:
-    if not paper_first_page.get("wechat_cover_path") or is_no_derivatives_license(
-        str(paper_first_page.get("license") or "")
-    ):
+    if not paper_first_page.get("wechat_cover_path"):
         return {}
     return {
         "image_source": "paper_first_page",
@@ -2169,9 +2101,6 @@ def _insert_paper_figures(
             f"![Fig. {figure_number}](images/{local_name})",
             f"*Fig. {figure_number} | {caption}*",
         ]
-        attribution = _paper_nd_attribution(image, dossier)
-        if attribution:
-            block.append(f"*{attribution}*")
         insertions.setdefault(insertion_index, []).append("\n".join(block))
 
     if dossier.get("content_type") == PAPER_CONTENT:
@@ -3055,10 +2984,7 @@ class NewsPipeline:
                 "images": [],
             }
             publisher_extracted = await asyncio.to_thread(extract_article, paper_item)
-            publisher_extracted["images"] = _apply_article_license_to_html_figures(
-                list(publisher_extracted.get("images") or []),
-                str(openalex.get("license") or ""),
-            )
+            publisher_extracted["images"] = list(publisher_extracted.get("images") or [])
             paper_extracted = publisher_extracted
             oa_mirror: dict[str, Any] = {
                 "attempted": False,
@@ -3095,10 +3021,7 @@ class NewsPipeline:
                         "images": [],
                     }
                     mirror_extracted = await asyncio.to_thread(extract_article, mirror_item)
-                    mirror_extracted["images"] = _apply_article_license_to_html_figures(
-                        list(mirror_extracted.get("images") or []),
-                        str(openalex.get("license") or ""),
-                    )
+                    mirror_extracted["images"] = list(mirror_extracted.get("images") or [])
                     mirror_figures = [
                         image
                         for image in mirror_extracted.get("images") or []
@@ -3145,7 +3068,6 @@ class NewsPipeline:
     def format_paper(self, dossier: dict[str, Any]) -> str:
         openalex = dossier.get("openalex") or {}
         images = dossier.get("images") or []
-        publishable = sum(1 for image in images if image.get("publishable"))
         authors = openalex.get("authors") or dossier.get("authors") or []
         summary = str(openalex.get("abstract") or dossier.get("summary") or "")
         if len(summary) > 900:
@@ -3162,8 +3084,7 @@ class NewsPipeline:
                 f"Journal：{openalex.get('journal') or dossier.get('journal') or '未知'}",
                 f"作者：{', '.join(authors) if authors else '未知'}",
                 f"OA status：{openalex.get('oa_status', '未查询')}",
-                f"License：{openalex.get('license', '未知')}",
-                f"图片：{len(images)}；可自动使用：{publishable}",
+                f"图片：{len(images)}",
             ]
         )
 
@@ -3187,6 +3108,24 @@ class NewsPipeline:
             raise LookupError(
                 "未获取到 DOI、论文标题或正文 metadata，无法确认这是论文链接"
             )
+        if dossier.get("content_type") == PAPER_CONTENT:
+            policy_fields = {
+                "credit",
+                "cover_eligible",
+                "derivatives_allowed",
+                "license",
+                "license_url",
+                "publishable",
+                "reason",
+            }
+            dossier["images"] = [
+                {
+                    key: value
+                    for key, value in image.items()
+                    if key not in policy_fields
+                }
+                for image in dossier.get("images") or []
+            ]
         if (
             item_override is not None
             and dossier.get("content_type") == PAPER_CONTENT
@@ -3220,7 +3159,7 @@ class NewsPipeline:
                 if not is_local
             ]
             downloaded_html_images = await asyncio.to_thread(
-                download_publishable_images,
+                download_images,
                 html_remote_images,
                 str(output_dir / "images"),
             )
@@ -3231,9 +3170,9 @@ class NewsPipeline:
             ]
             dossier["pdf_figure_fallback"] = {
                 "attempted": False,
-                "reason": "usable legal HTML image downloaded",
+                "reason": "usable HTML image downloaded",
             }
-            if not _has_publishable_html_image(list(dossier.get("images") or [])):
+            if not _has_local_html_image(list(dossier.get("images") or [])):
                 dossier["pdf_figure_fallback"] = {
                     "attempted": True,
                     "reason": (
@@ -3241,12 +3180,10 @@ class NewsPipeline:
                     ),
                 }
                 try:
-                    openalex = dossier.get("openalex") or {}
                     source = await asyncio.to_thread(
                         discover_pdf_source,
                         str(dossier.get("url") or ""),
                         str(dossier.get("doi") or ""),
-                        str(openalex.get("license") or ""),
                     )
                     dossier["pdf_figure_source"] = source
                     if source.get("pdf_url"):
@@ -3255,8 +3192,6 @@ class NewsPipeline:
                             str(source["pdf_url"]),
                             output_dir / "images",
                             article_url=str(source.get("landing_url") or dossier.get("url") or ""),
-                            article_license=str(source.get("license") or ""),
-                            license_url=str(source.get("license_url") or ""),
                             doi=str(dossier.get("doi") or ""),
                             wiley_tdm_token=self.settings.wiley_tdm_api_token,
                         )
@@ -3286,8 +3221,7 @@ class NewsPipeline:
             preselection_images = [
                 image
                 for image in dossier.get("images") or []
-                if image.get("publishable")
-                and image.get("local_path")
+                if image.get("local_path")
                 and Path(str(image["local_path"])).is_file()
             ]
             preselection_context = " ".join(
@@ -3356,12 +3290,10 @@ class NewsPipeline:
             if not source_pdf.is_file() and not fallback_attempted:
                 try:
                     if not paper_pdf_source.get("pdf_url"):
-                        openalex = dossier.get("openalex") or {}
                         paper_pdf_source = await asyncio.to_thread(
                             discover_pdf_source,
                             str(dossier.get("url") or ""),
                             str(dossier.get("doi") or ""),
-                            str(openalex.get("license") or ""),
                         )
                     if paper_pdf_source.get("pdf_url"):
                         paper_pdf_download = await asyncio.to_thread(
@@ -3395,10 +3327,6 @@ class NewsPipeline:
                         {
                             "doi": dossier.get("doi", ""),
                             "journal": openalex.get("journal") or dossier.get("journal") or "",
-                            "license": paper_pdf_source.get("license")
-                            or openalex.get("license")
-                            or "",
-                            "license_url": paper_pdf_source.get("license_url", ""),
                         }
                     )
                 except Exception as exc:
@@ -3419,8 +3347,13 @@ class NewsPipeline:
         remote_images = [
             image for image, is_local in zip(source_images, local_flags) if not is_local
         ]
+        downloader = (
+            download_images
+            if dossier.get("content_type") == PAPER_CONTENT
+            else download_publishable_images
+        )
         downloaded_remote = await asyncio.to_thread(
-            download_publishable_images,
+            downloader,
             remote_images,
             str(output_dir / "images"),
         )
@@ -3429,10 +3362,10 @@ class NewsPipeline:
             dict(image) if is_local else next(remote_iterator)
             for image, is_local in zip(source_images, local_flags)
         ]
-        legal_images = [
+        usable_images = [
             image
             for image in downloaded_images
-            if image.get("publishable") and image.get("local_path")
+            if image.get("local_path")
         ]
         selection_context = (
             " ".join(
@@ -3446,7 +3379,7 @@ class NewsPipeline:
             else ""
         )
         paper_image_allocation: dict[str, Any] = {}
-        allocation_input_images = legal_images
+        allocation_input_images = usable_images
         if dossier.get("content_type") == PAPER_CONTENT and isinstance(
             dossier.get("paper_selected_body_images"), list
         ):
@@ -3460,7 +3393,7 @@ class NewsPipeline:
             }
             allocation_input_images = [
                 image
-                for image in legal_images
+                for image in usable_images
                 if _paper_image_label(image) in selected_labels
                 or str(image.get("url") or "") in selected_urls
             ]
@@ -3507,8 +3440,8 @@ class NewsPipeline:
         dossier["body_image_captions"] = body_image_captions
         dossier["redundant_images_removed"] = redundant_count
         self.logger.info(
-            "Publishable downloaded images: %s (downloaded records=%s body=%s redundant=%s)",
-            len(legal_images),
+            "Downloaded images: %s (downloaded records=%s body=%s redundant=%s)",
+            len(usable_images),
             len(downloaded_images),
             len(body_images),
             redundant_count,
@@ -3522,9 +3455,6 @@ class NewsPipeline:
                 caption = body_image_captions[index - 1]
                 if caption:
                     image_section.append(f"*图{index}. {caption}*")
-                attribution = _paper_nd_attribution(image, dossier)
-                if attribution:
-                    image_section.append(f"*{attribution}*")
                 image_section.append("")
             terminal_sections.append("\n".join(image_section).rstrip())
         references = reference_markdown(dossier)

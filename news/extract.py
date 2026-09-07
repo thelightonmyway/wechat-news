@@ -56,7 +56,13 @@ def _credit_for_figure(figure: Any) -> str:
     return ""
 
 
-def discover_figure_images(html: str, base_url: str, page_license: str) -> list[dict[str, Any]]:
+def discover_figure_images(
+    html: str,
+    base_url: str,
+    page_license: str,
+    *,
+    apply_image_policy: bool = True,
+) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     images: list[dict[str, Any]] = []
     figure_nodes = []
@@ -118,32 +124,30 @@ def discover_figure_images(html: str, base_url: str, page_license: str) -> list[
             re.IGNORECASE,
         )
         alt = str(image.get("alt") or "").strip()
-        credit = _credit_for_figure(figure)
         image_url = urljoin(base_url, src)
-        images.append(
-            apply_policy(
-                {
-                    "url": image_url,
-                    "original_url": image_url,
-                    "source_url": base_url,
-                    "local_path": "",
-                    "caption": caption or alt,
-                    "original_caption": caption,
-                    "alt": alt,
-                    "credit": credit,
-                    "license": page_license,
-                    "image_source": "html_figure",
-                    "image_role": "figure",
-                    "figure_number": (
-                        int(figure_number_match.group(1)) if figure_number_match else None
-                    ),
-                    "figure_title": figure_title,
-                    "figure_image_count": len(figure_images),
-                    "image_url_source": image_url_source,
-                    "metadata_title": figure_title or caption or alt,
-                }
-            )
-        )
+        record = {
+            "url": image_url,
+            "original_url": image_url,
+            "source_url": base_url,
+            "local_path": "",
+            "caption": caption or alt,
+            "original_caption": caption,
+            "alt": alt,
+            "image_source": "html_figure",
+            "image_role": "figure",
+            "figure_number": (
+                int(figure_number_match.group(1)) if figure_number_match else None
+            ),
+            "figure_title": figure_title,
+            "figure_image_count": len(figure_images),
+            "image_url_source": image_url_source,
+            "metadata_title": figure_title or caption or alt,
+        }
+        if apply_image_policy:
+            record["credit"] = _credit_for_figure(figure)
+            record["license"] = page_license
+            record = apply_policy(record)
+        images.append(record)
     return images
 
 
@@ -199,8 +203,14 @@ def extract_article(item: dict[str, Any]) -> dict[str, Any]:
     )
 
     soup = BeautifulSoup(html, "html.parser")
-    page_license = _page_license(soup)
-    image_records = discover_figure_images(html, url, page_license)
+    paper_mode = str(item.get("content_type") or "") == "paper"
+    page_license = "" if paper_mode else _page_license(soup)
+    image_records = discover_figure_images(
+        html,
+        url,
+        page_license,
+        apply_image_policy=not paper_mode,
+    )
 
     try:
         article = Article(url)
@@ -215,21 +225,20 @@ def extract_article(item: dict[str, Any]) -> dict[str, Any]:
             if not image_url or image_url in known_urls:
                 continue
             image_role = "hero" if image_url == article.top_image else "article_image"
-            image_records.append(
-                apply_policy(
-                    {
-                        "url": image_url,
-                        "local_path": "",
-                        "caption": "",
-                        "alt": "",
-                        "credit": "",
-                        "license": page_license,
-                        "image_source": "html",
-                        "image_role": image_role,
-                        "metadata_title": "article hero" if image_role == "hero" else "",
-                    }
-                )
-            )
+            record = {
+                "url": image_url,
+                "local_path": "",
+                "caption": "",
+                "alt": "",
+                "image_source": "html",
+                "image_role": image_role,
+                "metadata_title": "article hero" if image_role == "hero" else "",
+            }
+            if not paper_mode:
+                record["credit"] = ""
+                record["license"] = page_license
+                record = apply_policy(record)
+            image_records.append(record)
             known_urls.add(image_url)
     except Exception as exc:
         if not result["extraction_error"]:
@@ -240,11 +249,83 @@ def extract_article(item: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def download_images(
+    images: list[dict[str, Any]],
+    output_dir: str,
+) -> list[dict[str, Any]]:
+    """Download image records and normalize valid image files."""
+    from pathlib import Path
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    updated: list[dict[str, Any]] = []
+    with httpx.Client(timeout=30.0, follow_redirects=True, trust_env=True) as client:
+        for image in images:
+            record = dict(image)
+            if not record.get("url"):
+                updated.append(record)
+                continue
+            descriptor = " ".join(
+                str(record.get(key) or "")
+                for key in ("url", "caption", "alt", "metadata_title")
+            ).lower()
+            if any(
+                term in descriptor
+                for term in (
+                    "logo",
+                    "site icon",
+                    "favicon",
+                    "advertisement",
+                    "tracking pixel",
+                    "web banner",
+                    "ui icon",
+                    "sprite",
+                )
+            ):
+                updated.append(record)
+                continue
+            try:
+                response = client.get(str(record["url"]), headers={"User-Agent": USER_AGENT})
+                if response.status_code == 403:
+                    result = subprocess.run(
+                        [
+                            "curl", "--fail", "--silent", "--show-error", "--location",
+                            "--max-time", "30", "--user-agent", USER_AGENT, str(record["url"]),
+                        ],
+                        capture_output=True,
+                        timeout=35,
+                        check=True,
+                    )
+                    content = result.stdout
+                else:
+                    response.raise_for_status()
+                    content = response.content
+                if len(content) > 12 * 1024 * 1024:
+                    raise ValueError("image exceeds 12 MiB")
+                opened = Image.open(io.BytesIO(content))
+                width, height = opened.size
+                aspect_ratio = width / max(height, 1)
+                if width < 600 or height < 350 or aspect_ratio > 4 or aspect_ratio < 0.25:
+                    raise ValueError(f"non-content image dimensions: {width}x{height}")
+                digest = hashlib.sha256(str(record["url"]).encode("utf-8")).hexdigest()[:16]
+                if opened.format == "PNG":
+                    path = destination / f"{digest}.png"
+                    opened.save(path, format="PNG", optimize=True)
+                else:
+                    path = destination / f"{digest}.jpg"
+                    opened.convert("RGB").save(path, format="JPEG", quality=90, optimize=True)
+                record["local_path"] = str(path)
+            except Exception:
+                pass
+            updated.append(record)
+    return updated
+
+
 def download_publishable_images(
     images: list[dict[str, Any]],
     output_dir: str,
 ) -> list[dict[str, Any]]:
-    """Download only policy-approved images and normalize them to JPEG/PNG."""
+    """Download policy-approved NEWS images without changing generic NEWS behavior."""
     from pathlib import Path
 
     destination = Path(output_dir)
@@ -282,16 +363,8 @@ def download_publishable_images(
                 if response.status_code == 403:
                     result = subprocess.run(
                         [
-                            "curl",
-                            "--fail",
-                            "--silent",
-                            "--show-error",
-                            "--location",
-                            "--max-time",
-                            "30",
-                            "--user-agent",
-                            USER_AGENT,
-                            str(record["url"]),
+                            "curl", "--fail", "--silent", "--show-error", "--location",
+                            "--max-time", "30", "--user-agent", USER_AGENT, str(record["url"]),
                         ],
                         capture_output=True,
                         timeout=35,

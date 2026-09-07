@@ -34,13 +34,11 @@ from news.pipeline import (
     PRIMARY_SOURCES,
     SECONDARY_SOURCES,
     NewsPipeline,
-    _apply_article_license_to_html_figures,
     _images_redundant,
     _insert_paper_figures,
     _paper_publication_within_window,
     _paper_figure_reference_numbers,
     _paper_match_source_paragraphs,
-    _paper_wechat_cover,
     _prepare_paper_markdown,
     _select_article_images,
     content_type_for_date,
@@ -744,7 +742,7 @@ class V1Tests(unittest.TestCase):
         with (
             patch("news.pipeline.translate_paper_titles", return_value=(['中文完整标题'], True, "")),
             patch("news.pipeline.generate_article_markdown", side_effect=fake_markdown),
-            patch("news.pipeline.download_publishable_images", return_value=[]),
+            patch("news.pipeline.download_images", return_value=[]),
             patch("news.pipeline.generate_image_captions", return_value=[]),
             patch("news.pipeline._select_article_images", return_value=({}, [], 0)),
             patch("news.pipeline.discover_pdf_source", return_value={"pdf_url": ""}),
@@ -1783,7 +1781,6 @@ class V1Tests(unittest.TestCase):
                         "abstract": "Paper abstract.",
                         "publication_date": "2024-11-06",
                         "oa_url": "https://doi.org/10.1126/sciadv.adn9389",
-                        "license": "cc-by-nc",
                         "authors": ["Researcher One"],
                     }
                 )
@@ -1893,7 +1890,6 @@ class V1Tests(unittest.TestCase):
                         "abstract": "Paper abstract.",
                         "publication_date": "2024-11-06",
                         "oa_url": "https://doi.org/10.1126/sciadv.adn9389",
-                        "license": "cc-by-nc",
                         "authors": ["Researcher One"],
                         "pmcid": "PMC11540010",
                         "pmc_url": mirror_url,
@@ -1921,13 +1917,9 @@ class V1Tests(unittest.TestCase):
                                     "url": "https://cdn.example.test/figure-1.jpg",
                                     "local_path": "",
                                     "caption": "Fig. 1. Drought severity time series.",
-                                    "credit": "",
-                                    "license": "",
                                     "image_source": "html_figure",
                                     "image_role": "figure",
                                     "metadata_title": "Fig. 1",
-                                    "publishable": False,
-                                    "reason": "unknown or non-reusable license",
                                 }
                             ],
                             "authors": [],
@@ -1975,8 +1967,7 @@ class V1Tests(unittest.TestCase):
                 self.assertEqual(dossier["oa_mirror_url"], mirror_url)
                 self.assertEqual(dossier["actual_image_source"], "oa_mirror")
                 self.assertEqual(len(dossier["images"]), 1)
-                self.assertTrue(dossier["images"][0]["publishable"])
-                self.assertEqual(dossier["images"][0]["reason"], "CC BY-NC")
+                self.assertEqual(dossier["images"][0]["image_source"], "html_figure")
 
         asyncio.run(check())
 
@@ -2604,7 +2595,7 @@ class V1Tests(unittest.TestCase):
                     "text": "source",
                     "openalex": {"abstract": "Abstract"},
                     "images": [
-                        {"image_role": "figure", "figure_number": 1, "caption": "Figure 1", "publishable": True}
+                        {"image_role": "figure", "figure_number": 1, "caption": "Figure 1"}
                     ],
                 },
                 replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model"),
@@ -3428,9 +3419,9 @@ class V1Tests(unittest.TestCase):
                     "text": "historical source\nattribution source\nprojection source",
                     "openalex": {"abstract": "Paper abstract"},
                     "images": [
-                        {"image_role": "figure", "figure_number": 1, "caption": "Figure 1", "publishable": True},
-                        {"image_role": "figure", "figure_number": 2, "caption": "Figure 2", "publishable": True},
-                        {"image_role": "figure", "figure_number": 3, "caption": "Figure 3", "publishable": True},
+                        {"image_role": "figure", "figure_number": 1, "caption": "Figure 1"},
+                        {"image_role": "figure", "figure_number": 2, "caption": "Figure 2"},
+                        {"image_role": "figure", "figure_number": 3, "caption": "Figure 3"},
                     ],
                 },
                 settings,
@@ -3681,7 +3672,7 @@ class V1Tests(unittest.TestCase):
                     "images": [],
                 }
 
-                async def fake_details(_rank, _date, _content_type=None):
+                async def fake_details(_rank, _date, _content_type=None, **_kwargs):
                     return copy.deepcopy(dossier)
 
                 def fake_markdown(value, _settings, destination):
@@ -3792,23 +3783,19 @@ class V1Tests(unittest.TestCase):
                     "authors": ["Author One"],
                     "openalex": {
                         "journal": "Nature Communications",
-                        "license": "CC BY 4.0",
                     },
                     "images": [
                         {
                             "url": "https://example.test/html-figure.png",
                             "local_path": "",
                             "caption": "Complete Figure 1",
-                            "credit": "Author One",
-                            "license": "CC BY 4.0",
-                            "publishable": True,
                             "image_source": "html_figure",
                             "image_role": "figure",
                         }
                     ],
                 }
 
-                async def fake_details(_rank, _date, _content_type=None):
+                async def fake_details(_rank, _date, _content_type=None, **_kwargs):
                     return copy.deepcopy(dossier)
 
                 def fake_markdown(value, _settings, destination):
@@ -3827,8 +3814,6 @@ class V1Tests(unittest.TestCase):
                         {
                             **record,
                             "local_path": "",
-                            "publishable": False,
-                            "reason": "download failed",
                         }
                         for record in records
                     ]
@@ -3841,9 +3826,6 @@ class V1Tests(unittest.TestCase):
                         "url": "https://example.test/paper.pdf#figure=1",
                         "local_path": str(path),
                         "caption": "Fig. 1 | Atmospheric circulation.",
-                        "credit": "Author One",
-                        "license": "CC BY 4.0",
-                        "publishable": True,
                         "image_source": "pdf_figure",
                         "image_role": "figure",
                         "figure_number": 1,
@@ -3853,14 +3835,12 @@ class V1Tests(unittest.TestCase):
                 pipeline.paper_details = fake_details
                 with (
                     patch("news.pipeline.article_output_dir", return_value=root / "article"),
-                    patch("news.pipeline.download_publishable_images", side_effect=fake_download),
+                    patch("news.pipeline.download_images", side_effect=fake_download),
                     patch(
                         "news.pipeline.discover_pdf_source",
                         return_value={
                             "pdf_url": "https://example.test/paper.pdf",
                             "landing_url": "https://example.test/paper",
-                            "license": "CC BY 4.0",
-                            "license_url": "https://creativecommons.org/licenses/by/4.0/",
                         },
                     ),
                     patch(
@@ -3912,7 +3892,6 @@ class V1Tests(unittest.TestCase):
                     "image_role": "figure",
                     "figure_number": 5,
                     "caption": "Fig. 5 | Moisture transport and precipitation.",
-                    "publishable": True,
                 },
                 {
                     "local_path": str(figure_two),
@@ -3920,7 +3899,6 @@ class V1Tests(unittest.TestCase):
                     "image_role": "figure",
                     "figure_number": 2,
                     "caption": "Fig. 2 | Atmospheric circulation and surface wind.",
-                    "publishable": True,
                 },
             ]
             captions = _insert_paper_figures(
@@ -4969,7 +4947,6 @@ class V1Tests(unittest.TestCase):
                 figures, metadata = extract_pdf_figures(
                     "https://example.test/article_reference.pdf",
                     root / "images",
-                    article_license="CC BY 4.0",
                 )
 
             self.assertEqual(metadata["layout_picture_regions"], 2)
@@ -4978,7 +4955,6 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(figures[0]["figure_number"], 3)
             self.assertEqual(figures[0]["caption_boxclasses"], ["text", "text"])
             self.assertIn("Panels a-j", figures[0]["original_caption"])
-            self.assertTrue(figures[0]["publishable"])
             self.assertTrue(Path(figures[0]["local_path"]).is_file())
 
     def test_pdf_figure_mapping_merges_all_panels_for_one_figure(self):
@@ -5068,7 +5044,6 @@ class V1Tests(unittest.TestCase):
                 figures, metadata = extract_pdf_figures(
                     "https://example.test/article_reference.pdf",
                     root / "images",
-                    article_license="CC BY",
                 )
 
             self.assertEqual(metadata["matched_figures"], 1)
@@ -5115,6 +5090,34 @@ class V1Tests(unittest.TestCase):
                 {**figure_two, "image_role": "article_image", "figure_number": None},
             )
         )
+
+    def test_paper_selection_ignores_legacy_publishable_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            images = []
+            for number in range(1, 9):
+                path = Path(tmp) / f"figure-{number}.png"
+                path.write_bytes(b"cached figure")
+                images.append(
+                    {
+                        "local_path": str(path),
+                        "url": f"https://example.test/figure-{number}.png",
+                        "image_source": "pdf_figure",
+                        "image_role": "figure",
+                        "figure_number": number,
+                        "caption": f"Figure {number} atmospheric circulation result",
+                        "publishable": False,
+                        "license": "unknown",
+                    }
+                )
+            cover, body, _ = _select_article_images(
+                images,
+                PAPER_CONTENT,
+                "Atmospheric circulation and surface wind results",
+            )
+
+        self.assertIsNotNone(cover)
+        self.assertEqual(len(body), 4)
+        self.assertTrue(all(image["local_path"] for image in body))
 
     def test_paper_cover_fallback_compares_only_first_and_last_when_many(self):
         images = [
@@ -5284,65 +5287,6 @@ class V1Tests(unittest.TestCase):
         self.assertFalse(assess_image("CC BY-NC", credit="Reproduced with permission")[0])
         self.assertFalse(assess_image("CC BY-NC", credit="Based on Google Earth imagery")[0])
         self.assertFalse(assess_image("unknown")[0])
-
-    def test_paper_nd_figures_allow_body_but_not_cover(self):
-        nd = apply_policy(
-            {
-                "url": "https://example.test/nd.png",
-                "local_path": "/tmp/nd.png",
-                "license": "CC BY-NC-ND 4.0",
-                "caption": "Complete Figure 1",
-                "image_source": "html_figure",
-                "image_role": "figure",
-            },
-            allow_no_derivatives=True,
-        )
-        reusable = apply_policy(
-            {
-                "url": "https://example.test/by.png",
-                "local_path": "/tmp/by.png",
-                "license": "CC BY 4.0",
-                "caption": "Complete Figure 2",
-                "image_source": "html_figure",
-                "image_role": "figure",
-            }
-        )
-
-        self.assertTrue(nd["publishable"])
-        self.assertFalse(nd["derivatives_allowed"])
-        self.assertFalse(nd["cover_eligible"])
-        cover, body, _ = _select_article_images([nd, reusable], PAPER_CONTENT)
-        self.assertEqual(cover, reusable)
-        self.assertIn(nd, body)
-        nd_only_cover, nd_only_body, _ = _select_article_images([nd], PAPER_CONTENT)
-        self.assertIsNone(nd_only_cover)
-        self.assertEqual(nd_only_body, [nd])
-        self.assertEqual(
-            _paper_wechat_cover(
-                {
-                    "wechat_cover_path": "/tmp/cropped-cover.png",
-                    "source_pdf": "/tmp/paper.pdf",
-                    "license": "CC BY-NC-ND 4.0",
-                }
-            ),
-            {},
-        )
-
-    def test_paper_nd_figure_specific_restrictions_take_priority(self):
-        records = _apply_article_license_to_html_figures(
-            [
-                {
-                    "image_source": "html_figure",
-                    "figure_image_count": 1,
-                    "caption": "Figure 1",
-                    "credit": "Reproduced with permission",
-                    "license": "",
-                }
-            ],
-            "CC BY-NC-ND 4.0",
-        )
-        self.assertFalse(records[0]["publishable"])
-        self.assertIn("third-party marker", records[0]["reason"])
 
     def test_target_openid_binds_only_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

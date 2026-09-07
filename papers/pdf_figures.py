@@ -15,46 +15,11 @@ import pymupdf
 import pymupdf4llm
 from bs4 import BeautifulSoup
 
-from images.policy import apply_policy, is_no_derivatives_license
-
 USER_AGENT = "Mozilla/5.0 (compatible; wechat-news/0.1; +local-research-bot)"
 WILEY_TDM_ENDPOINT = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/"
 FIGURE_NUMBER = re.compile(r"^\s*(?:fig(?:ure)?\.?)\s*(\d+)\s*(?:[|:.-]\s*)?", re.IGNORECASE)
 PDF_EXCLUSIONS = ("supplement", "moesm", "peer-review", "peer_review", "reviewer")
 WILEY_LIBRARY_HOST_SUFFIX = ".onlinelibrary.wiley.com"
-CREDIT_MARKERS = (
-    "credit",
-    "copyright",
-    "©",
-    "courtesy",
-    "reproduced",
-    "with permission",
-    "base map",
-    "imagery",
-)
-
-
-def _canonical_license(value: str | None) -> str:
-    text = " ".join((value or "").strip().lower().replace("_", " ").split())
-    if "creativecommons.org/publicdomain/zero" in text or text in {"cc0", "cc-0"}:
-        return "CC0"
-    if "creativecommons.org/licenses/by-sa" in text or text in {"cc-by-sa", "cc by-sa"}:
-        return "CC BY-SA"
-    if "creativecommons.org/licenses/by/" in text or text in {"cc-by", "cc by"}:
-        return "CC BY"
-    if "public domain" in text:
-        return "Public Domain"
-    return value or ""
-
-
-def _page_license(soup: BeautifulSoup, fallback: str = "") -> tuple[str, str]:
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor.get("href") or "").strip()
-        if "creativecommons.org/" in href.lower():
-            return _canonical_license(href), href
-    return _canonical_license(fallback), ""
-
-
 def _is_wiley_library_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host == "onlinelibrary.wiley.com" or host.endswith(WILEY_LIBRARY_HOST_SUFFIX)
@@ -70,9 +35,8 @@ def _is_pdf_candidate_url(url: str) -> bool:
 def discover_pdf_source(
     article_url: str,
     doi: str = "",
-    article_license: str = "",
 ) -> dict[str, str]:
-    """Find a formal/reference PDF and explicit article license from its landing page."""
+    """Find a formal/reference PDF from a landing page."""
     direct_pdf = article_url if urlparse(article_url).path.lower().endswith(".pdf") else ""
     landing_candidates: list[str] = []
     if doi:
@@ -92,8 +56,6 @@ def discover_pdf_source(
             )
         )
     landing_url = ""
-    resolved_license = _canonical_license(article_license)
-    license_url = ""
 
     with httpx.Client(timeout=30.0, follow_redirects=True, trust_env=True) as client:
         for landing_candidate in dict.fromkeys(landing_candidates):
@@ -111,10 +73,6 @@ def discover_pdf_source(
                 continue
             landing_url = str(response.url)
             soup = BeautifulSoup(response.text, "html.parser")
-            page_license, page_license_url = _page_license(soup, resolved_license)
-            if page_license:
-                resolved_license = page_license
-                license_url = page_license_url
 
             for meta in soup.find_all("meta"):
                 name = str(meta.get("name") or meta.get("property") or "").lower()
@@ -148,8 +106,6 @@ def discover_pdf_source(
     return {
         "pdf_url": usable[0][1] if usable else "",
         "landing_url": landing_url or article_url,
-        "license": resolved_license,
-        "license_url": license_url,
     }
 
 
@@ -197,18 +153,6 @@ def _caption_continuations(
         if same_row and horizontal <= 36.0:
             selected.append(index)
     return sorted(selected, key=lambda index: boxes[index]["x0"])
-
-
-def _credit_from_caption(caption: str) -> str:
-    protected = caption
-    for abbreviation in ("Fig.", "Figs.", "s.d.", "e.g.", "i.e.", "et al."):
-        protected = protected.replace(abbreviation, abbreviation.replace(".", "<dot>"))
-    sentences = re.split(r"(?<=[.!?])\s+", protected)
-    return " ".join(
-        sentence.replace("<dot>", ".").strip()
-        for sentence in sentences
-        if any(marker in sentence.lower() for marker in CREDIT_MARKERS)
-    )
 
 
 def _save_validated_pdf(content: bytes, destination: Path) -> None:
@@ -440,8 +384,6 @@ def extract_pdf_figures(
     output_dir: Path,
     *,
     article_url: str = "",
-    article_license: str = "",
-    license_url: str = "",
     doi: str = "",
     wiley_tdm_token: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -566,21 +508,6 @@ def extract_pdf_figures(
                     for picture_index, picture_bbox in group
                 )
                 continue
-            if is_no_derivatives_license(article_license) and len(group) != 1:
-                rejected.extend(
-                    {
-                        "page": page.get("page_number"),
-                        "picture_box_index": picture_index,
-                        "picture_bbox": picture_bbox,
-                        "reason": (
-                            "ND figure has multiple picture regions; complete unmodified "
-                            "figure cannot be guaranteed"
-                        ),
-                    }
-                    for picture_index, picture_bbox in group
-                )
-                continue
-
             picture_index = picture_indices[0]
             caption_indices = _caption_continuations(boxes, anchor_index, picture_index)
             caption = " ".join(_box_text(boxes[index]) for index in caption_indices).strip()
@@ -654,7 +581,6 @@ def extract_pdf_figures(
                     )
                     continue
 
-            credit = _credit_from_caption(caption)
             figure_metadata: dict[str, Any] = {
                 "url": f"{pdf_url}#page={page['page_number']}&figure={number}",
                 "source_url": pdf_url,
@@ -663,9 +589,6 @@ def extract_pdf_figures(
                 "caption": caption,
                 "original_caption": caption,
                 "alt": caption,
-                "credit": credit,
-                "license": _canonical_license(article_license),
-                "license_url": license_url,
                 "provider": "PDF Figure",
                 "image_source": "pdf_figure",
                 "image_role": "figure",
@@ -678,7 +601,7 @@ def extract_pdf_figures(
             }
             if len(group) > 1:
                 figure_metadata["picture_bboxes"] = picture_bboxes
-            matched.append(apply_policy(figure_metadata, allow_no_derivatives=True))
+            matched.append(figure_metadata)
             used_numbers.add(number)
 
     matched.sort(key=lambda image: int(image.get("figure_number") or 0))

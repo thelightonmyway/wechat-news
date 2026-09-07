@@ -478,7 +478,6 @@ class OpenAlexAdapter:
         open_access = work.get("open_access") or {}
         abstract_index = work.get("abstract_inverted_index")
         abstract = invert_abstract(abstract_index) if abstract_index else ""
-        license_value = best_oa.get("license") or primary_location.get("license") or ""
         ids = work.get("ids") or {}
         locations = []
         pmc_url = ""
@@ -491,7 +490,6 @@ class OpenAlexAdapter:
                 {
                     "landing_page_url": landing_page_url,
                     "pdf_url": pdf_url,
-                    "license": location.get("license") or "",
                     "is_oa": bool(location.get("is_oa")),
                     "version": location.get("version") or "",
                     "source": location_source.get("display_name") or "",
@@ -524,7 +522,6 @@ class OpenAlexAdapter:
             "oa_status": open_access.get("oa_status") or "unknown",
             "is_oa": bool(open_access.get("is_oa")),
             "oa_url": open_access.get("oa_url") or best_oa.get("landing_page_url") or best_oa.get("pdf_url") or "",
-            "license": license_value or "unknown",
             "openalex_id": work.get("id") or "",
             "pmid": ids.get("pmid") or "",
             "pmcid": pmcid,

@@ -2558,7 +2558,7 @@ def generate_image_captions(
                     "content": (
                         "根据每张图片各自的文本metadata，独立生成简短、准确的中文图注。"
                         "必须描述该图片实际展示的内容，不能仅根据文章主题写通用句子，"
-                        "不同图片不得复用同一句图注。不得输出credit、license、copyright、URL、"
+                        "不同图片不得复用同一句图注。不得输出外部图片元数据或 URL、"
                         "图库名称或英文长caption。metadata不足时caption_cn返回空字符串。"
                         "不要添加‘图1’等编号。返回严格JSON："
                         '{"items":[{"index":1,"caption_cn":"..."}]}。'
@@ -2907,11 +2907,7 @@ def _generate_paper_article_markdown(
         "selected_body_figures": selected_figure_ids,
         "figure_evidence_bundles": figure_evidence_bundles,
         "figure_captions": [
-            {
-                "caption": image.get("caption", ""),
-                "credit": image.get("credit", ""),
-                "license": image.get("license", ""),
-            }
+            {"caption": image.get("caption", "")}
             for image in dossier.get("images", [])
         ],
         "model": settings.model_name,
@@ -3415,11 +3411,7 @@ def generate_article_markdown(
         "authors": dossier.get("authors", []),
         "openalex": dossier.get("openalex", {}),
         "figure_captions": [
-            {
-                "caption": image.get("caption", ""),
-                "credit": image.get("credit", ""),
-                "license": image.get("license", ""),
-            }
+            {"caption": image.get("caption", "")}
             for image in dossier.get("images", [])
         ],
     }

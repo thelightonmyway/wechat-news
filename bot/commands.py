@@ -72,8 +72,7 @@ def _paper_image_summary(markdown_path: Path, images: list[dict]) -> str:
         except (OSError, ValueError, TypeError):
             pass
     available = sum(
-        bool(image.get("publishable"))
-        and bool(image.get("local_path"))
+        bool(image.get("local_path"))
         and Path(str(image["local_path"])).is_file()
         for image in images
     )
