@@ -97,6 +97,7 @@ from writer.llm import (
     _paper_clean_story_text,
     _paper_evidence_by_id,
     _paper_story_sections,
+    _paper_story_block_specs,
     _paper_plain_language_cleanup,
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
@@ -152,7 +153,10 @@ def _story_output_for_evidence(count: int, bodies: list[str] | None = None) -> l
         {
             "id": f"beat-{index}",
             "title": f"发现{index}",
-            "body": (bodies or [f"核心发现{item}。" for item in range(1, count + 1)])[index - 1],
+            "blocks": [{
+                "block_id": f"beat-{index}-block-1",
+                "text": (bodies or [f"核心发现{item}。" for item in range(1, count + 1)])[index - 1],
+            }],
         }
         for index in range(1, count + 1)
     ]
@@ -167,7 +171,7 @@ def _story_block_output(
         "id": beat_id,
         "title": title,
         "blocks": [
-            {"id": block_id, "evidence_ids": evidence_ids, "text": text}
+            {"block_id": block_id, "text": text}
             for block_id, evidence_ids, text in blocks
         ],
     }]
@@ -2426,10 +2430,18 @@ class V1Tests(unittest.TestCase):
             [{
                 "id": "beat-1",
                 "title": "结果",
-                "blocks": [{"id": "block-1", "evidence_ids": ["evidence-anchor"], "text": "r = 0.73。"}],
+                "blocks": [{"block_id": "beat-1-block-1", "text": "r = 0.73。"}],
             }],
             evidence_map,
             registry,
+            {
+                "beat-1": [{
+                    "block_id": "beat-1-block-1",
+                    "evidence_ids": ("evidence-anchor",),
+                    "figure_ids": (),
+                    "source_paragraph_ids": ("source-8",),
+                }],
+            },
         )
         self.assertEqual(sections[0]["blocks"][0]["source_paragraph_ids"], ["source-8"])
 
@@ -2740,8 +2752,8 @@ class V1Tests(unittest.TestCase):
                                             "id": "section-1",
                                             "title": "归因",
                                             "role": "attribution",
-                                            "source_paragraph_ids": ["source-figure-1"],
-                                            "findings": [{"id": "E1", "evidence": "森林差异", "anchors": []}],
+                                            "figure_ids": ["Fig. 1"],
+                                            "findings": [{"id": "E1", "figure_ids": ["Fig. 1"], "evidence_ids": ["evidence-source-source-0"]}],
                                         }
                                     ]
                                 },
@@ -2779,8 +2791,10 @@ class V1Tests(unittest.TestCase):
         ]
         client = MagicMock()
         client.chat.completions.create.side_effect = responses
+        story_plan = _story_plan_for_evidence(1)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-source-source-0"]
         with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
-            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)
+            "writer.llm._paper_story_planner", return_value=story_plan
         ), patch(
             "writer.llm._paper_story_writer",
             side_effect=[
@@ -2862,7 +2876,7 @@ class V1Tests(unittest.TestCase):
                 SimpleNamespace(
                     message=SimpleNamespace(
                         content=json.dumps(
-                            {"sections": [{"id": "beat-1", "title": "森林变化提供线索", "body": "森林变化与风速差异相关。"}]},
+                            {"sections": [{"id": "beat-1", "title": "森林变化提供线索", "blocks": [{"block_id": "beat-1-block-1", "text": "森林变化与风速差异相关。"}]}]},
                             ensure_ascii=False,
                         )
                     )
@@ -2934,18 +2948,17 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(lint["issue_count"], 3)
         self.assertTrue(all(item["term"] in {"同一片中国", "为何", "改写"} for item in lint["issues"]))
 
-    def test_paper_story_writer_rejects_mixed_figure_groups_in_block(self):
+    def test_paper_story_writer_pre_splits_different_figure_groups(self):
         client = MagicMock()
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
                 "sections": [{
                     "id": "beat-1",
                     "title": "专业结果",
-                    "blocks": [{
-                        "id": "block-1",
-                        "evidence_ids": ["evidence-1", "evidence-2"],
-                        "text": "两个结果分别为R = 0.71和R = -0.77。",
-                    }],
+                    "blocks": [
+                        {"block_id": "beat-1-block-1", "text": "重构结果达到R = 0.71。"},
+                        {"block_id": "beat-1-block-2", "text": "森林相关结果为R = -0.77。"},
+                    ],
                 }]
             }, ensure_ascii=False)))]
         )
@@ -2955,8 +2968,72 @@ class V1Tests(unittest.TestCase):
         ]
         story_plan = _story_plan_for_evidence(1)
         story_plan["story_beats"][0]["evidence_ids"] = ["evidence-1", "evidence-2"]
-        with self.assertRaisesRegex(RuntimeError, "mixed different Figure evidence groups"):
-            _paper_story_writer(client, story_plan, clean_evidence, "", "test-model")
+        output = _paper_story_writer(client, story_plan, clean_evidence, "", "test-model")
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(
+            [block["block_id"] for block in payload["blocks"]],
+            ["beat-1-block-1", "beat-1-block-2"],
+        )
+        self.assertEqual(
+            [block["block_id"] for block in output[0]["blocks"]],
+            ["beat-1-block-1", "beat-1-block-2"],
+        )
+
+    def test_paper_python_restores_evidence_after_writer_text_output(self):
+        story_plan = _story_plan_for_evidence(1)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-1", "evidence-2"]
+        clean_evidence = [
+            {"evidence_id": "evidence-1", "evidence_group": "group-a", "anchors": ["R = 0.71"]},
+            {"evidence_id": "evidence-2", "evidence_group": "group-b", "anchors": ["R = -0.77"]},
+        ]
+        sections = [{
+            "id": "beat-1",
+            "title": "结果",
+            "figure_ids": ["Fig. 2", "Fig. 3"],
+            "story_beat": {"evidence_ids": ["evidence-1", "evidence-2"]},
+        }]
+        evidence_map = {
+            "evidence-1": (sections[0], {"figure_ids": ["Fig. 2"]}),
+            "evidence-2": (sections[0], {"figure_ids": ["Fig. 3"]}),
+        }
+        specs = _paper_story_block_specs(story_plan, clean_evidence, evidence_map)
+        _paper_apply_story_output(
+            sections,
+            [{
+                "id": "beat-1",
+                "title": "结果",
+                "blocks": [
+                    {"block_id": "beat-1-block-1", "text": "R = -0.77。"},
+                    {"block_id": "beat-1-block-2", "text": "R = 0.71。"},
+                ],
+            }],
+            evidence_map,
+            block_specs=specs,
+        )
+        self.assertEqual(
+            [block["evidence_ids"] for block in sections[0]["blocks"]],
+            [["evidence-1"], ["evidence-2"]],
+        )
+        self.assertEqual(
+            [block["figure_ids"] for block in sections[0]["blocks"]],
+            [["Fig. 2"], ["Fig. 3"]],
+        )
+
+    def test_paper_story_writer_retries_missing_fixed_block_once(self):
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "sections": [{"id": "beat-1", "blocks": [{"block_id": "wrong", "text": "结果。"}]}]
+            }, ensure_ascii=False)))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "sections": [{"id": "beat-1", "blocks": [{"block_id": "beat-1-block-1", "text": "结果。"}]}]
+            }, ensure_ascii=False)))]),
+        ]
+        story_plan = _story_plan_for_evidence(1)
+        clean_evidence = [{"evidence_id": "evidence-1", "evidence_group": "context", "anchors": []}]
+        output = _paper_story_writer(client, story_plan, clean_evidence, "", "test-model")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(output[0]["blocks"][0]["block_id"], "beat-1-block-1")
 
     def test_paper_story_block_validator_rejects_anchor_in_wrong_figure_block(self):
         bundles = [
@@ -3014,7 +3091,7 @@ class V1Tests(unittest.TestCase):
         client = MagicMock()
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "block": {"id": "block-1", "evidence_ids": ["evidence-1"], "text": "R = 0.71。"}
+                "block": {"block_id": "beat-1-block-1", "text": "R = 0.71。"}
             }, ensure_ascii=False)))]
         )
         story_plan = _story_plan_for_evidence(1)
@@ -3024,7 +3101,7 @@ class V1Tests(unittest.TestCase):
             client,
             story_plan,
             clean_evidence,
-            [{"beat_id": "beat-1", "blocks": [{"id": "block-1", "evidence_ids": ["evidence-1"], "text": "R = 0.71。"}]}],
+            [{"beat_id": "beat-1", "blocks": [{"block_id": "beat-1-block-1", "text": "R = 0.71。"}]}],
             "test-model",
         )
         payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])

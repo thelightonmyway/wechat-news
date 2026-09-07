@@ -574,6 +574,7 @@ def _paper_validate_story_blocks(
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
     canonical_mode = bool(evidence_registry)
     planned_sections = plan.get("sections") or []
+    seen_block_ids: set[str] = set()
     if len(sections) != len(planned_sections):
         raise RuntimeError("PAPER story block validation failed: section count changed")
     for section_index, section in enumerate(planned_sections):
@@ -589,6 +590,9 @@ def _paper_validate_story_blocks(
             if not isinstance(block, dict):
                 raise RuntimeError("PAPER story block validation failed: invalid block")
             block_id = str(block.get("id") or "").strip()
+            if block_id in seen_block_ids:
+                raise RuntimeError("PAPER story block validation failed: duplicate block id")
+            seen_block_ids.add(block_id)
             evidence_ids = [str(value).strip() for value in block.get("evidence_ids") or [] if str(value).strip()]
             text = str(block.get("text") or "").strip()
             if (
@@ -1571,58 +1575,157 @@ def _paper_story_sections(
     return sections
 
 
+def _paper_story_block_specs(
+    story_plan: dict[str, Any],
+    clean_evidence: list[dict[str, Any]],
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]] | None,
+    evidence_registry: list[dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Build immutable Python-owned block bindings for each validated beat."""
+    clean_by_id = {
+        str(record.get("evidence_id") or ""): record
+        for record in clean_evidence
+        if str(record.get("evidence_id") or "")
+    }
+    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    specs_by_beat: dict[str, list[dict[str, Any]]] = {}
+    for beat in story_plan.get("story_beats") or []:
+        beat_id = str(beat.get("id") or "")
+        runs: list[tuple[str, list[str]]] = []
+        current_group = ""
+        current_evidence: list[str] = []
+        for evidence_id in beat.get("evidence_ids") or []:
+            evidence_id = str(evidence_id).strip()
+            record = clean_by_id.get(evidence_id)
+            if record is None:
+                raise RuntimeError(f"PAPER unknown evidence_id: {evidence_id}")
+            group = str(record.get("evidence_group") or "context")
+            if current_evidence and group != current_group:
+                runs.append((current_group, current_evidence))
+                current_evidence = []
+            current_group = group
+            current_evidence.append(evidence_id)
+        if current_evidence:
+            runs.append((current_group, current_evidence))
+
+        specs: list[dict[str, Any]] = []
+        for index, (group, evidence_ids) in enumerate(runs, start=1):
+            figure_ids: list[str] = []
+            anchors: list[str] = []
+            source_ids: list[str] = []
+            for evidence_id in evidence_ids:
+                original_section, finding = (
+                    evidence_map[evidence_id] if evidence_map is not None else ({}, {})
+                )
+                for value in (
+                    finding.get("figure_ids")
+                    or original_section.get("figure_ids")
+                    or original_section.get("selected_body_figures")
+                    or evidence_by_id.get(evidence_id, {}).get("supported_figures")
+                    or []
+                ):
+                    normalized = _paper_figure_id(value)
+                    if normalized and normalized not in figure_ids:
+                        figure_ids.append(normalized)
+                anchors.extend(
+                    str(anchor)
+                    for anchor in clean_by_id[evidence_id].get("anchors") or []
+                    if str(anchor).strip()
+                )
+                if evidence_registry:
+                    resolved_sources = _paper_derived_source_ids(
+                        [evidence_id], evidence_by_id
+                    )
+                else:
+                    resolved_sources = list(
+                        original_section.get("source_paragraph_ids") or []
+                    )
+                for source_id in resolved_sources:
+                    if source_id not in source_ids:
+                        source_ids.append(source_id)
+            if evidence_registry:
+                source_ids = _paper_derived_source_ids(evidence_ids, evidence_by_id)
+            specs.append(
+                {
+                    "block_id": f"{beat_id}-block-{index}",
+                    "beat_id": beat_id,
+                    "evidence_group": group,
+                    "evidence_ids": tuple(evidence_ids),
+                    "figure_ids": tuple(figure_ids),
+                    "anchors": tuple(dict.fromkeys(anchors)),
+                    "source_paragraph_ids": tuple(source_ids),
+                }
+            )
+        if not specs:
+            raise RuntimeError(f"PAPER story beat has no evidence blocks: {beat_id}")
+        specs_by_beat[beat_id] = specs
+    return specs_by_beat
+
+
+def _paper_block_specs_by_id(
+    block_specs: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for specs in block_specs.values():
+        for spec in specs:
+            block_id = str(spec.get("block_id") or "")
+            if not block_id or block_id in by_id:
+                raise RuntimeError(f"PAPER duplicate block_id: {block_id}")
+            by_id[block_id] = spec
+    return by_id
+
+
 def _paper_apply_story_output(
     sections: list[dict[str, Any]],
     generated: list[dict[str, Any]],
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
     evidence_registry: list[dict[str, Any]] | None = None,
+    block_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
-    """Attach block-local Figure and source bindings after each LLM stage."""
+    """Attach immutable Python-owned Figure and source bindings to text blocks."""
     by_id = {str(item.get("id") or ""): item for item in generated}
-    evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
-    canonical_mode = bool(evidence_registry)
+    if block_specs is None:
+        raise RuntimeError("PAPER story output missing immutable block specs")
+    specs_by_id = _paper_block_specs_by_id(block_specs)
+    seen_block_ids: set[str] = set()
     for section in sections:
-        item = by_id.get(str(section.get("id") or ""))
+        section_id = str(section.get("id") or "")
+        item = by_id.get(section_id)
         if item is None:
             raise RuntimeError("PAPER story output omitted a planned section")
+        expected_specs = block_specs.get(section_id) or []
+        expected_ids = [str(spec.get("block_id") or "") for spec in expected_specs]
+        raw_blocks = item.get("blocks")
+        if not isinstance(raw_blocks, list) or not raw_blocks:
+            raise RuntimeError("PAPER story output returned no blocks")
+        returned_ids = [str(block.get("block_id") or "").strip() for block in raw_blocks if isinstance(block, dict)]
+        if (
+            len(returned_ids) != len(raw_blocks)
+            or len(set(returned_ids)) != len(returned_ids)
+            or returned_ids != expected_ids
+            or any(block_id not in specs_by_id for block_id in returned_ids)
+        ):
+            raise RuntimeError("PAPER story output returned invalid block structure")
         blocks: list[dict[str, Any]] = []
-        raw_blocks = item.get("blocks") or []
-        if not raw_blocks and isinstance(item.get("body"), str) and item["body"].strip():
-            raw_blocks = [{
-                "id": f"{section['id']}-block-1",
-                "evidence_ids": list((section.get("story_beat") or {}).get("evidence_ids") or []),
-                "text": item["body"],
-            }]
-        for block in raw_blocks:
-            figure_ids: list[str] = []
-            for evidence_id in block.get("evidence_ids") or []:
-                original_section, finding = evidence_map[evidence_id]
-                for value in (
-                    finding.get("figure_ids")
-                    or original_section.get("figure_ids")
-                    or original_section.get("selected_body_figures")
-                    or []
-                ):
-                    normalized = _paper_figure_id(value)
-                    if normalized not in figure_ids:
-                        figure_ids.append(normalized)
-            source_ids = (
-                _paper_derived_source_ids(list(block["evidence_ids"]), evidence_by_id)
-                if canonical_mode
-                else list(section.get("source_paragraph_ids") or [])
-            )
+        for raw_block in raw_blocks:
+            block_id = str(raw_block.get("block_id") or "").strip()
+            text = raw_block.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("PAPER story output returned an empty block")
+            if block_id in seen_block_ids:
+                raise RuntimeError(f"PAPER duplicate block_id: {block_id}")
+            seen_block_ids.add(block_id)
+            spec = specs_by_id[block_id]
             blocks.append(
                 {
-                    "id": str(block["id"]),
-                    "evidence_ids": list(block["evidence_ids"]),
-                    "text": str(block["text"]).strip(),
-                    "figure_ids": figure_ids,
-                    "source_paragraph_ids": source_ids,
+                    "id": block_id,
+                    "evidence_ids": list(spec["evidence_ids"]),
+                    "text": text.strip(),
+                    "figure_ids": list(spec["figure_ids"]),
+                    "source_paragraph_ids": list(spec["source_paragraph_ids"]),
                 }
             )
-        if not blocks:
-            raise RuntimeError("PAPER story output returned no blocks")
-        section["title"] = str(item["title"])
+        section["title"] = str(item.get("title") or section.get("title") or "")
         section["blocks"] = blocks
         section["body"] = "\n\n".join(block["text"] for block in blocks)
 
@@ -1634,8 +1737,7 @@ def _paper_story_draft_blocks(sections: list[dict[str, Any]]) -> list[dict[str, 
             "title": str(section.get("title") or ""),
             "blocks": [
                 {
-                    "id": block.get("id", ""),
-                    "evidence_ids": list(block.get("evidence_ids") or []),
+                    "block_id": block.get("id", ""),
                     "text": str(block.get("text") or ""),
                 }
                 for block in section.get("blocks") or []
@@ -1675,11 +1777,13 @@ def _paper_normalize_story_output(
     story_plan: dict[str, Any],
     clean_evidence: list[dict[str, Any]],
     stage: str,
+    block_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     sections = response.get("sections")
     if not isinstance(sections, list) or len(sections) != len(story_plan["story_beats"]):
         raise RuntimeError(f"PAPER {stage} returned invalid sections")
-    evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
+    if block_specs is None:
+        raise RuntimeError(f"PAPER {stage} missing immutable block specs")
     by_id = {str(item.get("id") or ""): item for item in sections if isinstance(item, dict)}
     output: list[dict[str, Any]] = []
     for beat in story_plan["story_beats"]:
@@ -1687,49 +1791,28 @@ def _paper_normalize_story_output(
         if item is None:
             raise RuntimeError(f"PAPER {stage} omitted a story beat")
         raw_blocks = item.get("blocks")
-        if raw_blocks is None:
-            body = item.get("body")
-            if not isinstance(body, str) or not body.strip():
-                raise RuntimeError(f"PAPER {stage} returned no evidence blocks")
-            raw_blocks = [{"id": f"{beat['id']}-block-1", "evidence_ids": beat["evidence_ids"], "text": body}]
+        specs = block_specs.get(beat["id"]) or []
+        expected_ids = [str(spec.get("block_id") or "") for spec in specs]
         if not isinstance(raw_blocks, list) or not raw_blocks:
             raise RuntimeError(f"PAPER {stage} returned invalid evidence blocks")
-        seen_evidence: set[str] = set()
+        returned_ids: list[str] = []
         blocks: list[dict[str, Any]] = []
-        for block_index, raw_block in enumerate(raw_blocks, start=1):
-            if not isinstance(raw_block, dict):
-                raise RuntimeError(f"PAPER {stage} returned an invalid evidence block")
-            block_id = str(raw_block.get("id") or f"{beat['id']}-block-{block_index}").strip()
-            evidence_ids = [
-                str(value).strip()
-                for value in raw_block.get("evidence_ids") or []
-                if str(value).strip()
-            ]
-            text = raw_block.get("text", raw_block.get("body"))
-            if (
-                not block_id
-                or not evidence_ids
-                or not isinstance(text, str)
-                or not text.strip()
-                or block_id in {block["id"] for block in blocks}
-                or not set(evidence_ids).issubset(set(beat["evidence_ids"]))
-                or seen_evidence.intersection(evidence_ids)
-            ):
+        for raw_block in raw_blocks:
+            if not isinstance(raw_block, dict) or set(raw_block) - {"block_id", "text"}:
                 raise RuntimeError(f"PAPER {stage} returned invalid evidence block fields")
-            groups = {
-                str(evidence_by_id[evidence_id].get("evidence_group") or "context")
-                for evidence_id in evidence_ids
-                if evidence_id in evidence_by_id
-                and str(evidence_by_id[evidence_id].get("evidence_group") or "context") != "context"
-            }
-            if len(groups) > 1:
-                raise RuntimeError(f"PAPER {stage} mixed different Figure evidence groups in one block")
+            block_id = str(raw_block.get("block_id") or "").strip()
+            text = raw_block.get("text")
+            if not block_id or not isinstance(text, str) or not text.strip():
+                raise RuntimeError(f"PAPER {stage} returned invalid evidence block fields")
+            returned_ids.append(block_id)
             clean_text = _paper_plain_language_cleanup(_paper_clean_story_text(text))
             clean_text = re.sub(r"\s*\n+\s*", " ", clean_text).strip()
-            blocks.append({"id": block_id, "evidence_ids": evidence_ids, "text": clean_text})
-            seen_evidence.update(evidence_ids)
-        if seen_evidence != set(beat["evidence_ids"]):
-            raise RuntimeError(f"PAPER {stage} omitted or duplicated evidence across blocks")
+            blocks.append({"block_id": block_id, "text": clean_text})
+        if (
+            len(set(returned_ids)) != len(returned_ids)
+            or returned_ids != expected_ids
+        ):
+            raise RuntimeError(f"PAPER {stage} returned invalid evidence block fields")
         title = _paper_clean_story_text(item.get("title") or beat["title"]) or beat["title"]
         output.append({
             "id": beat["id"],
@@ -1747,42 +1830,76 @@ def _paper_story_writer(
     style_exemplar: str,
     model: str,
     feedback: dict[str, Any] | None = None,
+    block_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Write one story beat per completion while keeping its evidence blocks isolated."""
+    """Write text for Python-owned blocks, never assign evidence to blocks."""
     evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
+    block_specs = block_specs or _paper_story_block_specs(
+        story_plan, clean_evidence, None
+    )
     output: list[dict[str, Any]] = []
     for beat in story_plan["story_beats"]:
+        beat_id = beat["id"]
+        beat_specs = block_specs.get(beat_id) or []
         beat_evidence = [evidence_by_id[evidence_id] for evidence_id in beat["evidence_ids"]]
-        response = _paper_completion_json(
-            client,
-            PAPER_STORY_WRITER_PROMPT,
-            {
-                "editorial_brief": story_plan["editorial_brief"],
-                "story_beat": beat,
-                "clean_evidence": [_paper_clean_evidence_for_llm(record) for record in beat_evidence],
-                "style_exemplar": style_exemplar,
-                "targeted_feedback": feedback or {},
-                "_model": model,
-                "_temperature": 0.25,
-            },
-        )
-        if isinstance(response.get("sections"), list):
-            candidate = response
-        else:
-            candidate = {
+        beat_feedback = feedback or {}
+        for attempt in range(2):
+            response = _paper_completion_json(
+                client,
+                PAPER_STORY_WRITER_PROMPT,
+                {
+                    "editorial_brief": story_plan["editorial_brief"],
+                    "story_beat": {
+                        key: value
+                        for key, value in beat.items()
+                        if key != "evidence_ids"
+                    },
+                    "blocks": [
+                        {
+                            "block_id": spec["block_id"],
+                            "clean_evidence": [
+                                _paper_clean_evidence_for_llm(evidence_by_id[evidence_id])
+                                for evidence_id in spec["evidence_ids"]
+                            ],
+                        }
+                        for spec in beat_specs
+                    ],
+                    "clean_evidence": [
+                        _paper_clean_evidence_for_llm(record) for record in beat_evidence
+                    ],
+                    "style_exemplar": style_exemplar,
+                    "targeted_feedback": beat_feedback,
+                    "_model": model,
+                    "_temperature": 0.25,
+                },
+            )
+            candidate = response if isinstance(response.get("sections"), list) else {
                 "sections": [{
-                    "id": beat["id"],
+                    "id": beat_id,
                     "title": response.get("title") or beat["title"],
                     "blocks": response.get("blocks"),
                 }]
             }
-        normalized = _paper_normalize_story_output(
-            candidate,
-            {"story_beats": [beat]},
-            clean_evidence,
-            "story writer",
-        )
-        output.append(normalized[0])
+            try:
+                normalized = _paper_normalize_story_output(
+                    candidate,
+                    {"story_beats": [beat]},
+                    clean_evidence,
+                    "story writer",
+                    {beat_id: beat_specs},
+                )
+                output.append(normalized[0])
+                break
+            except RuntimeError as exc:
+                if attempt:
+                    raise
+                beat_feedback = {
+                    "structure": (
+                        f"Return exactly these block_id values in this order: "
+                        f"{[spec['block_id'] for spec in beat_specs]!r}. "
+                        f"Return only block_id and text; do not return evidence_ids. Error: {exc}"
+                    )
+                }
     return output
 
 
@@ -1793,9 +1910,13 @@ def _paper_humanize_story(
     draft_blocks: list[dict[str, Any]],
     model: str,
     feedback: dict[str, Any] | None = None,
+    block_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Humanize one block per completion so evidence cannot cross block boundaries."""
+    """Humanize text for immutable Python-owned blocks."""
     evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
+    block_specs = block_specs or _paper_story_block_specs(
+        story_plan, clean_evidence, None
+    )
     draft_by_beat = {
         str(item.get("beat_id") or item.get("id") or ""): item
         for item in draft_blocks
@@ -1805,48 +1926,66 @@ def _paper_humanize_story(
     for beat in story_plan["story_beats"]:
         beat_id = beat["id"]
         draft_item = draft_by_beat.get(beat_id) or {}
-        current_blocks = draft_item.get("blocks") or []
-        if not current_blocks:
-            raise RuntimeError("PAPER humanizer received no blocks for a story beat")
+        current_by_id = {
+            str(block.get("block_id") or block.get("id") or ""): block
+            for block in draft_item.get("blocks") or []
+            if isinstance(block, dict)
+        }
         humanized_blocks: list[dict[str, Any]] = []
-        for block in current_blocks:
-            evidence_ids = [str(value).strip() for value in block.get("evidence_ids") or [] if str(value).strip()]
-            response = _paper_completion_json(
-                client,
-                PAPER_HUMANIZER_PROMPT,
-                {
-                    "story_beat": {
-                        "id": beat_id,
-                        "title": beat["title"],
-                        "reader_question": beat["reader_question"],
-                        "core_message": beat["core_message"],
+        for spec in block_specs.get(beat_id) or []:
+            block_id = spec["block_id"]
+            current = current_by_id.get(block_id)
+            if current is None:
+                raise RuntimeError(f"PAPER humanizer missing block: {block_id}")
+            block_feedback = feedback or {}
+            for attempt in range(2):
+                response = _paper_completion_json(
+                    client,
+                    PAPER_HUMANIZER_PROMPT,
+                    {
+                        "story_beat": {
+                            "id": beat_id,
+                            "title": beat["title"],
+                            "reader_question": beat["reader_question"],
+                            "core_message": beat["core_message"],
+                        },
+                        "current_block": {
+                            "block_id": block_id,
+                            "text": str(current.get("text") or ""),
+                        },
+                        "clean_evidence": [
+                            _paper_clean_evidence_for_llm(evidence_by_id[evidence_id])
+                            for evidence_id in spec["evidence_ids"]
+                        ],
+                        "targeted_feedback": block_feedback,
+                        "_model": model,
+                        "_temperature": 0.2,
                     },
-                    "current_block": {
-                        "id": block.get("id", ""),
-                        "evidence_ids": evidence_ids,
-                        "text": str(block.get("text") or ""),
-                    },
-                    "clean_evidence": [
-                        _paper_clean_evidence_for_llm(evidence_by_id[evidence_id])
-                        for evidence_id in evidence_ids
-                    ],
-                    "targeted_feedback": feedback or {},
-                    "_model": model,
-                    "_temperature": 0.2,
-                },
-            )
-            result = response.get("block") if isinstance(response.get("block"), dict) else response
-            if not isinstance(result, dict):
-                raise RuntimeError("PAPER humanizer returned an invalid block")
-            returned_ids = [str(value).strip() for value in result.get("evidence_ids") or evidence_ids if str(value).strip()]
-            if returned_ids != evidence_ids:
-                raise RuntimeError("PAPER humanizer changed block evidence assignment")
-            text = result.get("text", result.get("body"))
-            if not isinstance(text, str) or not text.strip():
-                raise RuntimeError("PAPER humanizer returned an empty block")
-            clean_text = _paper_plain_language_cleanup(_paper_clean_story_text(text))
-            clean_text = re.sub(r"\s*\n+\s*", " ", clean_text).strip()
-            humanized_blocks.append({"id": str(block.get("id") or result.get("id") or ""), "evidence_ids": evidence_ids, "text": clean_text})
+                )
+                try:
+                    result = response.get("block") if isinstance(response.get("block"), dict) else response
+                    if (
+                        not isinstance(result, dict)
+                        or set(result) - {"block_id", "text"}
+                        or str(result.get("block_id") or "").strip() != block_id
+                    ):
+                        raise RuntimeError("PAPER humanizer returned an invalid block structure")
+                    text = result.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        raise RuntimeError("PAPER humanizer returned an empty block")
+                    clean_text = _paper_plain_language_cleanup(_paper_clean_story_text(text))
+                    clean_text = re.sub(r"\s*\n+\s*", " ", clean_text).strip()
+                    humanized_blocks.append({"block_id": block_id, "text": clean_text})
+                    break
+                except RuntimeError as exc:
+                    if attempt:
+                        raise
+                    block_feedback = {
+                        "structure": (
+                            f"Return only block_id={block_id!r} and text; "
+                            f"do not return evidence_ids or other metadata. Error: {exc}"
+                        )
+                    }
         output.append({
             "id": beat_id,
             "title": _paper_plain_language_cleanup(
@@ -3062,25 +3201,25 @@ PAPER_STORY_WRITER_PROMPT = (
     "标题应专业、直接、简洁，优先10到22个中文字，直接陈述科学结果，不用为何、线索、改写、同一片中国等媒体化表达。"
     "正文不要写成论文Results、摘要扩写、图注翻译或科普新闻稿。避免第一/第二/第三/第四、首先/其次/最后、模板化排比和不必要的分号。"
     "每句话只讲一个主要科学意思，中文逗号和句号为主。保留必要专业词，第一次出现时用简短中文解释；不要为了通俗创造比喻或抽象术语。"
-    "每个beat必须拆成一个或多个paragraph blocks。block中的evidence_ids必须逐字复制当前story beat的evidence_ids，禁止编号或创造新ID。一个block只能使用同一个evidence_group的Figure-specific evidence；背景性的global_context或section_context可以陪同，但不能携带另一组Figure的核心定量结果。"
-    "clean_evidence中的每个anchor都必须在包含对应evidence_id的block正文中原样保留；不能跨block移动、重复或删除已验证anchor。"
+    "每个beat必须按输入的固定blocks分别写作。Python已经决定每个block_id及其对应的科学证据边界；不得新增、删除、重排、合并或拆分block，不得分配或返回evidence_ids。"
+    "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
     "正文总量以约350到500个中文字符为目标；按故事需要分配篇幅，不要把每个beat或block机械写成等长。"
     + PAPER_FIDELITY_CONTRACT
-    + "本次只写当前story beat，返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"id\":\"block-1\",\"evidence_ids\":[\"复制当前beat的evidence_id\"],\"text\":\"...\"}]}。"
+    + "本次只写当前story beat，严格按输入blocks顺序返回；每个block只能包含block_id和text。返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}]}。"
 )
 
 PAPER_HUMANIZER_PROMPT = (
     "你是中文母语科学编辑，依据ai-zixun/humanizer-zh的原则，对Story Writer成稿做一次保守的人文化编辑。"
     "输入按beat再按paragraph block分组；每次只能修改当前block，不能看到或重写其他block的正文。"
-    "每个block的evidence_ids和顺序是硬边界，不能合并block、拆出跨组句子、移动finding或把另一组Figure的结果带进来。"
+    "每个block_id及其证据边界是Python设定的硬边界，不能合并block、拆出跨组句子、移动finding或把另一组Figure的结果带进来。"
     "保持专业、直接、简洁的科研公众号中文，去掉翻译腔、空泛总结、机械连接、过度修辞和不必要分号。"
     "标题应专业、直接、简洁，优先陈述科学结果，避免为何、线索、改写、同一片中国等媒体化措辞。"
     "每句话只讲一个主要科学意思；保留必要专业词并做简短解释，不为了通俗创造比喻、抽象术语或媒体式悬念。"
     "每个block对应的anchor必须原样保留，不能因润色而删除、改写、重复或移动。"
-    "非anchor的细节可以删减，但不能新增事实、机制、意义或因果关系。"
+    "非anchor的细节可以删减，但不能新增事实、机制、意义或因果关系；不新增事实。"
     "若targeted_feedback指出技术密度或模板风险，优先删除方法、变量和公式清单，只保留当前block理解结论所需的信息。"
     + PAPER_FIDELITY_CONTRACT
-    + "只返回严格JSON：{\"block\":{\"id\":\"block-1\",\"evidence_ids\":[\"复制当前block的evidence_id\"],\"text\":\"...\"}}。"
+    + "只返回严格JSON：{\"block\":{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}}。"
 )
 
 PAPER_PLANNER_PROMPT = (
@@ -3483,6 +3622,12 @@ def _generate_paper_article_markdown(
         evidence_map,
         evidence_registry,
     )
+    block_specs = _paper_story_block_specs(
+        story_plan,
+        clean_evidence,
+        evidence_map,
+        evidence_registry,
+    )
     plan["story_plan"] = story_plan
     plan["sections"] = story_sections
     story_evidence: dict[str, dict[str, Any]] = {}
@@ -3512,28 +3657,17 @@ def _generate_paper_article_markdown(
         }
     plan["story_evidence"] = story_evidence
     story_writer_retry_count = 0
-    try:
-        story_output = _paper_story_writer(
-            client,
-            story_plan,
-            clean_evidence,
-            style_exemplar,
-            settings.model_name,
-        )
-    except RuntimeError as exc:
-        if not str(exc).startswith("PAPER story writer"):
-            raise
-        story_writer_retry_count = 1
-        logger.warning("PAPER story writer returned invalid block structure; retrying once: %s", exc)
-        story_output = _paper_story_writer(
-            client,
-            story_plan,
-            clean_evidence,
-            style_exemplar,
-            settings.model_name,
-            {"structure": "Return every story beat exactly once and partition every evidence_id into non-mixed Figure blocks."},
-        )
-    _paper_apply_story_output(plan["sections"], story_output, evidence_map, evidence_registry)
+    story_output = _paper_story_writer(
+        client,
+        story_plan,
+        clean_evidence,
+        style_exemplar,
+        settings.model_name,
+        block_specs=block_specs,
+    )
+    _paper_apply_story_output(
+        plan["sections"], story_output, evidence_map, evidence_registry, block_specs
+    )
     draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
     try:
         _validate_paper_evidence_plan(
@@ -3562,10 +3696,13 @@ def _generate_paper_article_markdown(
             style_exemplar,
             settings.model_name,
             {
-                "deterministic_validation": "A deterministic evidence check found an anchor placement issue. Preserve every supplied anchor exactly and keep it with its evidence."
+                "deterministic_validation": "A deterministic evidence check found an anchor placement issue. Preserve every supplied anchor exactly and keep it with its fixed block."
             },
+            block_specs=block_specs,
         )
-        _paper_apply_story_output(plan["sections"], story_output, evidence_map, evidence_registry)
+        _paper_apply_story_output(
+            plan["sections"], story_output, evidence_map, evidence_registry, block_specs
+        )
         draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
@@ -3606,8 +3743,11 @@ def _generate_paper_article_markdown(
             style_exemplar,
             settings.model_name,
             {"style_lint": lint, **popular_feedback},
+            block_specs=block_specs,
         )
-        _paper_apply_story_output(plan["sections"], story_output, evidence_map, evidence_registry)
+        _paper_apply_story_output(
+            plan["sections"], story_output, evidence_map, evidence_registry, block_specs
+        )
         markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
@@ -3643,8 +3783,11 @@ def _generate_paper_article_markdown(
         clean_evidence,
         _paper_story_draft_blocks(plan["sections"]),
         settings.model_name,
+        block_specs=block_specs,
     )
-    _paper_apply_story_output(plan["sections"], humanized_output, evidence_map, evidence_registry)
+    _paper_apply_story_output(
+        plan["sections"], humanized_output, evidence_map, evidence_registry, block_specs
+    )
     markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
     _validate_paper_evidence_plan(
         plan,
@@ -3678,8 +3821,11 @@ def _generate_paper_article_markdown(
             _paper_story_draft_blocks(plan["sections"]),
             settings.model_name,
             {"readability": final_humanizer_feedback},
+            block_specs=block_specs,
         )
-        _paper_apply_story_output(plan["sections"], targeted_output, evidence_map, evidence_registry)
+        _paper_apply_story_output(
+            plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
+        )
         markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
@@ -3708,8 +3854,11 @@ def _generate_paper_article_markdown(
             _paper_story_draft_blocks(plan["sections"]),
             settings.model_name,
             {"stop_slop": stop_slop_feedback},
+            block_specs=block_specs,
         )
-        _paper_apply_story_output(plan["sections"], targeted_output, evidence_map, evidence_registry)
+        _paper_apply_story_output(
+            plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
+        )
         markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
         _validate_paper_evidence_plan(
             plan,
