@@ -2096,6 +2096,53 @@ class V1Tests(unittest.TestCase):
         self.assertIn("attribution", synthetic_text)
         self.assertIn("projection", synthetic_text)
 
+    def test_paper_scientific_planner_retries_empty_sections(self):
+        empty_plan = {"sections": []}
+        valid_plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "总体结果",
+                "role": "phenomenon",
+                "figure_ids": [],
+                "source_paragraph_ids": ["source-0"],
+                "findings": [{"id": "E1", "figure_ids": [], "evidence": "总体结果", "anchors": []}],
+            }]
+        }
+        settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "writer.llm._paper_plan", side_effect=[empty_plan, valid_plan]
+        ) as planner, patch(
+            "writer.llm.translate_paper_abstract", return_value="忠实摘要翻译。"
+        ), patch(
+            "writer.llm._paper_write_section", return_value="总体结果。"
+        ), patch(
+            "writer.llm._paper_review", return_value={"status": "pass", "corrections": []}
+        ), patch(
+            "writer.llm._paper_story_planner", return_value=_story_plan_for_evidence(1)
+        ), patch(
+            "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["总体结果。"])
+        ), patch(
+            "writer.llm._paper_humanize_story", return_value=_story_output_for_evidence(1, ["总体结果。"])
+        ):
+            path, _ = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Sparse paper",
+                    "title_cn": "稀疏证据论文",
+                    "text": "source",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": [],
+                    "paper_selected_body_images": [],
+                },
+                settings,
+                Path(tmp) / "paper",
+            )
+            article_text = path.read_text(encoding="utf-8")
+        self.assertEqual(planner.call_count, 2)
+        self.assertIn("总体结果", article_text)
+        self.assertIn("global_context", PAPER_PLANNER_PROMPT)
+        self.assertIn("section_context", PAPER_PLANNER_PROMPT)
+
     def test_paper_figure_first_writers_receive_only_current_bundles(self):
         planner = SimpleNamespace(
             choices=[

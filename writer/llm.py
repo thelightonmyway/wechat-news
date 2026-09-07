@@ -492,11 +492,7 @@ def _paper_validate_story_blocks(
                     block for block, block_text in normalized_blocks
                     if normalized_anchor in _normalize_evidence_anchor(block_text)
                 ]
-                occurrence_count = sum(
-                    _normalize_evidence_anchor(block_text).count(normalized_anchor)
-                    for _, block_text in normalized_blocks
-                )
-                if len(containing_blocks) != 1 or occurrence_count != 1:
+                if len(containing_blocks) != 1:
                     raise RuntimeError(
                         "PAPER story block validation failed: figure-specific anchor is not unique to one block: "
                         f"{anchor!r}"
@@ -590,12 +586,13 @@ def _validate_paper_evidence_plan(
         ]
         if bundles_by_id and not section_figure_ids:
             raise RuntimeError("PAPER evidence plan validation failed: section has no figure bundle")
-        unknown_figures = set(section_figure_ids) - set(bundles_by_id)
-        if unknown_figures:
-            raise RuntimeError(
-                "PAPER evidence plan validation failed: unknown figure bundle: "
-                + ", ".join(sorted(unknown_figures))
-            )
+        if bundles_by_id:
+            unknown_figures = set(section_figure_ids) - set(bundles_by_id)
+            if unknown_figures:
+                raise RuntimeError(
+                    "PAPER evidence plan validation failed: unknown figure bundle: "
+                    + ", ".join(sorted(unknown_figures))
+                )
         findings = section.get("findings") or []
         if not isinstance(findings, list):
             raise RuntimeError("PAPER evidence plan validation failed: invalid findings")
@@ -1555,7 +1552,12 @@ def _paper_plan(
     figure_evidence_bundles: list[dict[str, Any]] | None = None,
     validation_feedback: str = "",
 ) -> dict[str, Any]:
-    return _paper_completion_json(
+    started = time.perf_counter()
+    logger.info(
+        "PAPER stage=scientific_planner %s",
+        "retry" if validation_feedback else "start",
+    )
+    response = _paper_completion_json(
         client,
         PAPER_PLANNER_PROMPT,
         {
@@ -1570,6 +1572,13 @@ def _paper_plan(
             "_temperature": 0.1,
         },
     )
+    raw_sections = response.get("sections") if isinstance(response, dict) else None
+    logger.info(
+        "PAPER stage=scientific_planner response raw_sections=%d elapsed=%.3f",
+        len(raw_sections) if isinstance(raw_sections, list) else 0,
+        time.perf_counter() - started,
+    )
+    return response
 
 
 def _paper_section_body(response: dict[str, Any]) -> str:
@@ -2732,14 +2741,14 @@ PAPER_PLANNER_PROMPT = (
     "你是Figure-first Scientific Planner，不写文章正文。根据Abstract、paper_text、source_paragraphs、selected_body_figures和figure_evidence_bundles，"
     "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；不要自行猜测Figure归属。"
     "每个section包含id、title、role、figure_ids、source_paragraph_ids和findings；title必须是适合中文成稿的简洁中文小标题；每个finding包含id、figure_ids、evidence、anchors。"
-    "每个section至少包含一个selected Figure，每个finding必须明确绑定一个或多个当前section的figure_ids；一个section可以包含多张高度相关Figure。"
+    "有selected Figure时，section和Figure-specific finding应明确绑定当前section的figure_ids；一个section可以包含多张高度相关Figure。若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section；这类section允许使用global_context或section_context，不得因为没有Figure-specific evidence而返回空sections。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
     "每个Figure bundle的核心finding只能进入包含该Figure的section；Figure 只可通过bundle中的caption、明确引用段落和直接关联Results段落支持正文。不要把Fig.2的R=0.71写入只包含Fig.3的section。"
     "无独立主图的机制内容只能作为最相关Figure section中的2到3句解释，不要新建无图机制section；只有删除会造成明显科学逻辑断裂时才保留无图短过渡。"
     "role使用贴合论文的简洁自然标签，不要套固定taxonomy。source_paragraph_ids只能使用输入中真实存在的source id。"
-    "每个finding都要有figure_ids和anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
+    "每个finding都要有anchors数组（字段名必须是anchors，不得写成quantitative anchors或其他字段）；有Figure支持时填写figure_ids，没有Figure-specific支持时允许figure_ids为空数组。anchors保留原文指标大小写、R/r、符号、数值、百分号和时间段；不要使用跨section重复的P值作为anchor。"
     "如果输入包含validation_feedback，必须优先修复其中指出的Figure、source或anchor归属，不能重复提交同一错误计划。"
     '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"source_paragraph_ids":["source-0"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence":"...","anchors":["R = 0.71"]}]}]}'
 )
@@ -2876,9 +2885,10 @@ def _generate_paper_article_markdown(
     if abstract and paper_text:
         source_paragraphs.insert(0, {"id": "source-abstract", "text": abstract})
     valid_source_ids = {str(record["id"]) for record in source_paragraphs}
-    figure_first = isinstance(dossier.get("paper_selected_body_images"), list)
+    selected_body_images = dossier.get("paper_selected_body_images")
+    figure_first = isinstance(selected_body_images, list) and bool(selected_body_images)
     selected_images = (
-        list(dossier.get("paper_selected_body_images") or [])
+        list(selected_body_images)
         if figure_first
         else list(dossier.get("images") or [])
     )
@@ -2912,6 +2922,7 @@ def _generate_paper_article_markdown(
         timeout=180.0,
         max_retries=2,
     )
+    scientific_planner_started = time.perf_counter()
     plan = _paper_plan(
         client,
         abstract,
@@ -2921,10 +2932,26 @@ def _generate_paper_article_markdown(
         selected_figure_ids,
         figure_evidence_bundles,
     )
+    if not isinstance(plan.get("sections"), list) or not plan["sections"]:
+        logger.warning("PAPER scientific planner returned empty sections; retrying once")
+        plan = _paper_plan(
+            client,
+            abstract,
+            paper_text,
+            source_paragraphs,
+            metadata,
+            selected_figure_ids,
+            figure_evidence_bundles,
+            "The previous planner response had no sections. Return at least one section supported by the supplied paper_text or source_paragraphs. Use Figure-specific evidence when available, but allow global_context or section_context when no unique Figure supports the content. Do not invent results.",
+        )
     plan["sections"] = _validate_paper_plan_structure(
         plan,
         valid_source_ids,
         set(selected_figure_ids) if figure_first else None,
+    )
+    logger.info(
+        "PAPER stage=scientific_planner normalized_sections=%d",
+        len(plan["sections"]),
     )
     for section in plan["sections"]:
         section.pop("necessary_transition", None)
@@ -2986,6 +3013,10 @@ def _generate_paper_article_markdown(
             valid_source_ids,
             set(selected_figure_ids) if figure_first else None,
         )
+        logger.info(
+            "PAPER stage=scientific_planner normalized_sections=%d",
+            len(plan["sections"]),
+        )
         for section in plan["sections"]:
             section.pop("necessary_transition", None)
             section.pop("transition_reason", None)
@@ -2998,6 +3029,10 @@ def _generate_paper_article_markdown(
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
         )
+    logger.info(
+        "PAPER stage=scientific_planner done elapsed=%.3f",
+        time.perf_counter() - scientific_planner_started,
+    )
     logger.info("PAPER deterministic evidence validation passed")
     scientific_review: dict[str, Any] = {
         "status": "pass",
