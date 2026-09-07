@@ -305,7 +305,12 @@ def download_images(
                 opened = Image.open(io.BytesIO(content))
                 width, height = opened.size
                 aspect_ratio = width / max(height, 1)
-                if width < 600 or height < 350 or aspect_ratio > 4 or aspect_ratio < 0.25:
+                is_html_figure = str(record.get("image_source") or "") == "html_figure"
+                if (
+                    (not is_html_figure and (width < 600 or height < 350))
+                    or aspect_ratio > 4
+                    or aspect_ratio < 0.25
+                ):
                     raise ValueError(f"non-content image dimensions: {width}x{height}")
                 digest = hashlib.sha256(str(record["url"]).encode("utf-8")).hexdigest()[:16]
                 if opened.format == "PNG":

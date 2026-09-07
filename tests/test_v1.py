@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import re
 import tempfile
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pymupdf
+from PIL import Image
 
 from bot.bridge import QQNewsBot
 from bot.commands import (
@@ -25,7 +27,7 @@ from bot.commands import (
 from db import Database
 from images.policy import apply_policy, assess_image
 from images.search import normalize_search_result, search_public_images
-from news.extract import discover_figure_images
+from news.extract import discover_figure_images, download_images
 from news.feeds import canonicalize_url, load_feeds, normalize_title
 from news.pipeline import (
     PAPER_CONTENT,
@@ -3944,6 +3946,54 @@ class V1Tests(unittest.TestCase):
                 self.assertEqual(len(metadata["body_images"]), 1)
 
         asyncio.run(check())
+
+    def test_paper_html_figure_download_enters_body_images(self):
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (312, 116), color="white").save(image_buffer, format="PNG")
+        content = image_buffer.getvalue()
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self.content = payload
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _url, **_kwargs):
+                return FakeResponse(content)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("news.extract.httpx.Client", return_value=FakeClient()):
+                downloaded = download_images(
+                    [{
+                        "url": "https://example.test/Fig1_HTML.png",
+                        "local_path": "",
+                        "caption": "Fig. 1: Hadley circulation.",
+                        "metadata_title": "Fig. 1: Hadley circulation.",
+                        "image_source": "html_figure",
+                        "image_role": "figure",
+                        "figure_number": 1,
+                    }],
+                    tmp,
+                )
+
+            local_path = Path(downloaded[0]["local_path"])
+            self.assertTrue(local_path.is_file())
+            _, body_images, _ = _select_article_images(
+                downloaded,
+                PAPER_CONTENT,
+                "## Hadley circulation\\n\\nFigure 1 shows the Hadley circulation.",
+            )
+            self.assertEqual([image["figure_number"] for image in body_images], [1])
 
     def test_paper_pdf_fallback_runs_after_html_download_failure(self):
         async def check():

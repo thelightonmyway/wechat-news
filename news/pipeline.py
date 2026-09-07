@@ -3379,24 +3379,10 @@ class NewsPipeline:
             else ""
         )
         paper_image_allocation: dict[str, Any] = {}
+        # Let the final markdown-aware allocator see every valid downloaded
+        # PAPER image; the earlier planning preselection is only a writer hint
+        # and must not make later Figure candidates unrecoverable.
         allocation_input_images = usable_images
-        if dossier.get("content_type") == PAPER_CONTENT and isinstance(
-            dossier.get("paper_selected_body_images"), list
-        ):
-            selected_labels = {
-                _paper_image_label(image)
-                for image in dossier.get("paper_selected_body_images") or []
-            }
-            selected_urls = {
-                str(image.get("url") or "")
-                for image in dossier.get("paper_selected_body_images") or []
-            }
-            allocation_input_images = [
-                image
-                for image in usable_images
-                if _paper_image_label(image) in selected_labels
-                or str(image.get("url") or "") in selected_urls
-            ]
         cover_image, body_images, redundant_count = _select_article_images(
             allocation_input_images,
             str(dossier.get("content_type") or POPULAR_CONTENT),
