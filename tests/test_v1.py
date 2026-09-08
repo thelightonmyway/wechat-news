@@ -85,6 +85,7 @@ from writer.llm import (
     PAPER_STORY_PLANNER_PROMPT,
     PAPER_STORY_WRITER_PROMPT,
     PAPER_HUMANIZER_PROMPT,
+    PAPER_STYLE_REVIEWER_PROMPT,
     PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
@@ -109,6 +110,8 @@ from writer.llm import (
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
+    _paper_humanize_story,
+    _paper_style_review,
     _paper_validate_story_plan,
     _validate_paper_plan_structure,
     prune_paper_sections_after_allocation,
@@ -3235,6 +3238,99 @@ class V1Tests(unittest.TestCase):
         )
         self.assertEqual(_paper_ai_style_lint(quoted)["作者式第一人称"], 0)
 
+    def test_paper_ai_style_lint_rejects_one_hit_antithesis_patterns(self):
+        examples = (
+            ("不是而是", "不是A，而是B。"),
+            ("并不是而是", "并不是A，而是B。"),
+            ("并非而是", "并非A，而是B。"),
+            ("不在而在", "不在A，而在B。"),
+            ("不只是更是", "不只是A，更是B。"),
+            ("不仅更", "不仅A，更重要的是B。"),
+            ("真正不是而是", "真正重要的不是A，而是B。"),
+            ("与其说不如说", "与其说是A，不如说是B。"),
+        )
+        for key, text in examples:
+            with self.subTest(key=key):
+                counts = _paper_ai_style_lint(text)
+                self.assertEqual(counts[key], 1)
+                self.assertTrue(_paper_ai_style_lint_failed(counts))
+        self.assertFalse(_paper_ai_style_lint_failed(_paper_ai_style_lint("但是结果仍然稳定，因此可以继续比较。")))
+
+    def test_paper_ai_style_lint_flags_broad_body_author_voice(self):
+        for phrase in ("我们可以看到", "我们看到", "我们注意到", "咱们"):
+            with self.subTest(phrase=phrase):
+                counts = _paper_ai_style_lint(f"{phrase}结果仍然稳定。")
+                self.assertEqual(counts["作者式第一人称"], 1)
+                self.assertTrue(_paper_ai_style_lint_failed(counts))
+
+    def test_paper_style_reviewer_accepts_only_known_block_issues(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "issues": [{
+                    "block_id": "beat-1-block-1",
+                    "issue": "句式像Results翻译",
+                    "instruction": "保留事实，改成更自然的中文叙述。",
+                }]
+            }, ensure_ascii=False)))]
+        )
+        sections = [{
+            "id": "beat-1",
+            "title": "科学结果",
+            "blocks": [{"id": "beat-1-block-1", "text": "结果表明变化。"}],
+        }]
+        result = _paper_style_review(client, "范文", sections, "## 科学结果\n\n结果表明变化。", "test-model")
+        self.assertEqual(result["issues"][0]["block_id"], "beat-1-block-1")
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["sections"][0]["blocks"][0], {"block_id": "beat-1-block-1", "text": "结果表明变化。"})
+        self.assertNotIn("evidence_ids", json.dumps(payload, ensure_ascii=False))
+
+    def test_paper_style_reviewer_rejects_unknown_duplicate_and_extra_fields(self):
+        sections = [{"id": "beat-1", "title": "结果", "blocks": [{"id": "b1", "text": "正文。"}]}]
+        responses = (
+            {"issues": [{"block_id": "unknown", "issue": "问题", "instruction": "修改"}]},
+            {"issues": [{"block_id": "b1", "issue": "问题", "instruction": "修改"}, {"block_id": "b1", "issue": "重复", "instruction": "修改"}]},
+            {"issues": [{"block_id": "b1", "issue": "问题", "instruction": "修改", "text": "越权"}]},
+            {"issues": [], "status": "pass"},
+        )
+        for response in responses:
+            with self.subTest(response=response):
+                client = MagicMock()
+                client.chat.completions.create.return_value = SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(response, ensure_ascii=False)))]
+                )
+                with self.assertRaises(RuntimeError):
+                    _paper_style_review(client, "范文", sections, "## 结果\n\n正文。", "test-model")
+
+    def test_paper_humanizer_target_rewrites_only_selected_blocks(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "block": {"block_id": "b2", "text": "第二段已校对。"}
+            }, ensure_ascii=False)))]
+        )
+        story_plan = {
+            "editorial_brief": {},
+            "story_beats": [{
+                "id": "beat-1", "title": "结果", "reader_question": "问题？", "core_message": "核心。",
+                "evidence_ids": ["e1", "e2"],
+            }],
+        }
+        clean_evidence = [{"evidence_id": "e1", "anchors": []}, {"evidence_id": "e2", "anchors": []}]
+        output = _paper_humanize_story(
+            client, story_plan, clean_evidence,
+            [{"beat_id": "beat-1", "blocks": [
+                {"block_id": "b1", "text": "第一段保持不变。"},
+                {"block_id": "b2", "text": "第二段原文。"},
+            ]}], "test-model",
+            block_specs={"beat-1": [
+                {"block_id": "b1", "evidence_ids": ["e1"]},
+                {"block_id": "b2", "evidence_ids": ["e2"]},
+            ]}, target_block_ids={"b2"}, feedback_by_block={"b2": {"style_review": "问题"}},
+        )
+        self.assertEqual([block["text"] for block in output[0]["blocks"]], ["第一段保持不变。", "第二段已校对。"])
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+
     def test_paper_stop_slop_audit_reports_author_voice(self):
         audit = _paper_stop_slop_audit("## 结果\n\n我们使用了敏感性试验。")
         self.assertIn("author_voice", {issue["type"] for issue in audit["issues"]})
@@ -3249,18 +3345,18 @@ class V1Tests(unittest.TestCase):
         issue_types = {issue["type"] for issue in audit["issues"]}
         self.assertIn("repeated_paragraph_opening", issue_types)
 
-    def test_paper_story_prompts_require_story_first_plain_language(self):
-        self.assertIn("结论先于方法", PAPER_STORY_PLANNER_PROMPT)
-        self.assertIn("先说读者需要知道的结论", PAPER_STORY_WRITER_PROMPT)
-        self.assertIn("结论先于方法", PAPER_HUMANIZER_PROMPT)
+    def test_paper_story_prompts_prioritize_exemplars_without_fixed_arc(self):
+        self.assertIn("结论和方法的先后以自然表达为准", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("style_exemplar中的范文原文是主要写作参考", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("style corpus自然组织", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("style_exemplar中的范文原文是主要写作参考", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("style_exemplar中的范文原文是主要写作参考", PAPER_HUMANIZER_PROMPT)
         self.assertIn("非本领域专家", PAPER_STORY_PLANNER_PROMPT)
         self.assertIn("跨专业科研读者", PAPER_STORY_WRITER_PROMPT)
-        self.assertIn("帮助读者理解结果", PAPER_HUMANIZER_PROMPT)
-        for prompt in (PAPER_STORY_WRITER_PROMPT, PAPER_HUMANIZER_PROMPT):
-            self.assertIn("专业词第一次", prompt)
-        self.assertIn("问题/现象→核心发现→为什么→进一步证据→意义", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("专业词在需要时顺手解释", PAPER_HUMANIZER_PROMPT)
+        self.assertNotIn("问题/现象→核心发现→为什么→进一步证据→意义", PAPER_STORY_PLANNER_PROMPT)
+        self.assertNotIn("先回答读者问题，再给最重要的发现", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("不要写成论文Results", PAPER_STORY_WRITER_PROMPT)
-        self.assertIn("营销型自媒体", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("Results转述", PAPER_HUMANIZER_PROMPT)
         for prompt in (PAPER_STORY_WRITER_PROMPT, PAPER_HUMANIZER_PROMPT):
             self.assertIn("第三方科学公众号编辑", prompt)
@@ -3677,6 +3773,9 @@ class V1Tests(unittest.TestCase):
         self.assertIn("按证据需要保持紧凑", PAPER_STORY_WRITER_PROMPT)
         self.assertNotIn("每个beat固定", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("第三方科学公众号编辑", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
+        self.assertIn("只读", PAPER_STYLE_REVIEWER_PROMPT)
+        self.assertIn("style_exemplar", PAPER_STYLE_REVIEWER_PROMPT)
+        self.assertIn("不能移动证据", PAPER_STYLE_REVIEWER_PROMPT)
 
     def test_paper_popular_editor_anchor_audit_preserves_section_mapping(self):
         plan = {

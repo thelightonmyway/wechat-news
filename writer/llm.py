@@ -663,14 +663,14 @@ def _paper_validate_story_blocks(
             }
             for anchor in evidence_record.get("anchors") or []:
                 normalized_anchor = _normalize_evidence_anchor(str(anchor))
+                anchor_records = provenance_by_anchor.get(normalized_anchor, [])
+                supported_figures = supported_figures_by_anchor.get(normalized_anchor, set())
                 if (
                     not normalized_anchor
                     or re.fullmatch(r"[Pp][<>=]\d+(?:\.\d+)?", normalized_anchor)
                     or normalized_anchor in {"90%", "95%", "99%"}
                 ):
                     continue
-                anchor_records = provenance_by_anchor.get(normalized_anchor, [])
-                supported_figures = supported_figures_by_anchor.get(normalized_anchor, set())
                 figure_specific = bool(supported_figures) or any(
                     record.get("scope") == "figure_specific" for record in anchor_records
                 )
@@ -2036,8 +2036,10 @@ def _paper_humanize_story(
     feedback: dict[str, Any] | None = None,
     block_specs: dict[str, list[dict[str, Any]]] | None = None,
     style_exemplar: str = "",
+    target_block_ids: set[str] | None = None,
+    feedback_by_block: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Humanize text for immutable Python-owned blocks."""
+    """Humanize selected text blocks while preserving the complete immutable block list."""
     evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
     block_specs = block_specs or _paper_story_block_specs(
         story_plan, clean_evidence, None
@@ -2063,6 +2065,12 @@ def _paper_humanize_story(
             current = current_by_id.get(block_id)
             if current is None:
                 raise RuntimeError(f"PAPER humanizer missing block: {block_id}")
+            if target_block_ids is not None and block_id not in target_block_ids:
+                humanized_blocks.append({
+                    "block_id": block_id,
+                    "text": str(current.get("text") or "").strip(),
+                })
+                continue
             adjacent_blocks: list[dict[str, str]] = []
             for neighbor_index in (block_index - 1, block_index + 1):
                 if 0 <= neighbor_index < len(beat_specs):
@@ -2073,7 +2081,9 @@ def _paper_humanize_story(
                             "block_id": neighbor_id,
                             "text": str(neighbor.get("text") or "")[:240],
                         })
-            block_feedback = feedback or {}
+            block_feedback = dict((feedback_by_block or {}).get(block_id) or {})
+            if not block_feedback:
+                block_feedback = feedback or {}
             for attempt in range(2):
                 response = _paper_completion_json(
                     client,
@@ -2133,6 +2143,105 @@ def _paper_humanize_story(
             "body": "\n\n".join(block["text"] for block in humanized_blocks),
         })
     return output
+
+
+def _paper_style_issue_block_ids(sections: list[dict[str, Any]]) -> set[str]:
+    """Map deterministic prose warnings to blocks without exposing metadata to the model."""
+    target_ids: set[str] = set()
+    for section in sections:
+        for block in section.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            block_id = str(block.get("id") or block.get("block_id") or "").strip()
+            text = str(block.get("text") or "")
+            if not block_id:
+                continue
+            if _paper_ai_style_lint_failed(_paper_ai_style_lint(text)):
+                target_ids.add(block_id)
+                continue
+            if (
+                "；" in text
+                or ";" in text
+                or re.search(r"(?:第一|第二|第三|第四|首先|其次|再次|最后|图\s*\d+|Fig\.?\s*\d+)", text)
+                or _paper_readability_audit(f"## section\n\n{text}")["issue_count"]
+            ):
+                target_ids.add(block_id)
+    return target_ids
+
+
+def _paper_style_review(
+    client: OpenAI,
+    style_exemplar: str,
+    sections: list[dict[str, Any]],
+    _markdown: str,
+    model: str,
+) -> dict[str, Any]:
+    """Review prose only; never accept edits to text or scientific metadata."""
+    review_sections = [
+        {
+            "section_id": str(section.get("id") or ""),
+            "title": str(section.get("title") or ""),
+            "blocks": [
+                {
+                    "block_id": str(block.get("id") or block.get("block_id") or ""),
+                    "text": str(block.get("text") or ""),
+                }
+                for block in section.get("blocks") or []
+                if isinstance(block, dict)
+            ],
+        }
+        for section in sections
+    ]
+    article_body = "\n\n".join(
+        f"## {section['title']}\n\n"
+        + "\n\n".join(block["text"] for block in section["blocks"])
+        for section in review_sections
+    )
+    response = _paper_completion_json(
+        client,
+        PAPER_STYLE_REVIEWER_PROMPT,
+        {
+            "style_exemplar": style_exemplar,
+            "article_body": article_body,
+            "sections": review_sections,
+            "_model": model,
+            "_temperature": 0.1,
+        },
+    )
+    if set(response) != {"issues"} or not isinstance(response.get("issues"), list):
+        raise RuntimeError("PAPER style reviewer returned invalid fields")
+    valid_ids = {
+        block["block_id"]
+        for section in review_sections
+        for block in section["blocks"]
+        if block["block_id"]
+    }
+    issues: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for issue in response["issues"]:
+        if not isinstance(issue, dict) or set(issue) != {"block_id", "issue", "instruction"}:
+            raise RuntimeError("PAPER style reviewer returned invalid issue fields")
+        block_id = issue.get("block_id")
+        problem = issue.get("issue")
+        instruction = issue.get("instruction")
+        if (
+            not isinstance(block_id, str)
+            or not block_id.strip()
+            or block_id not in valid_ids
+            or block_id in seen_ids
+            or not isinstance(problem, str)
+            or not problem.strip()
+            or not isinstance(instruction, str)
+            or not instruction.strip()
+        ):
+            raise RuntimeError("PAPER style reviewer returned an invalid block issue")
+        seen_ids.add(block_id)
+        issues.append({
+            "block_id": block_id,
+            "issue": problem.strip(),
+            "instruction": instruction.strip(),
+        })
+    return {"issues": issues}
 
 
 def _paper_completion_json(client: OpenAI, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2511,10 +2620,29 @@ def _paper_style_lint_text(markdown: str) -> str:
     return markdown
 
 
+_PAPER_SINGLE_HIT_STYLE_KEYS = frozenset({
+    "不是而是",
+    "并不是而是",
+    "并非而是",
+    "不在而在",
+    "不只是更是",
+    "不仅更",
+    "真正不是而是",
+    "与其说不如说",
+})
+
+
 def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
     prose = _paper_style_lint_text(markdown)
     patterns = {
+        "不是而是": r"不是[^。！？\n]{0,50}而是",
+        "并不是而是": r"并不是[^。！？\n]{0,50}而是",
         "并非而是": r"并非[^。！？\n]{0,50}而是",
+        "不在而在": r"不在[^。！？\n]{0,50}而在",
+        "不只是更是": r"不只是[^。！？\n]{0,50}更是",
+        "不仅更": r"不仅[^。！？\n]{0,50}更",
+        "真正不是而是": r"真正[^。！？\n]{0,50}不是[^。！？\n]{0,50}而是",
+        "与其说不如说": r"与其说[^。！？\n]{0,50}不如说",
         "其原因在于": r"其原因在于",
         "也就是说": r"也就是说",
         "不只是": r"不只是",
@@ -2530,10 +2658,8 @@ def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
         "这意味着": r"这意味着",
         "综上所述": r"综上所述",
         "作者式第一人称": (
-            r"(?:我室|本研究(?:发现|展示|使用|进一步分析|的结果)|"
-            r"本文(?:发现|展示|使用|进一步分析|的结果)|"
-            r"我们(?:发现|展示|使用|进一步分析|的结果|将|采用|指出|揭示|证明|"
-            r"在|通过|对|从|以|把|用|认为))"
+            r"(?:我室|咱们|我们|本研究(?:发现|展示|使用|进一步分析|的结果)|"
+            r"本文(?:发现|展示|使用|进一步分析|的结果))"
         ),
     }
     return {name: len(re.findall(pattern, prose)) for name, pattern in patterns.items()}
@@ -2541,7 +2667,10 @@ def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
 
 def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
     return bool(counts.get("作者式第一人称")) or any(
-        count > 1 for count in counts.values()
+        counts.get(key, 0) > 0 for key in _PAPER_SINGLE_HIT_STYLE_KEYS
+    ) or any(
+        count > 1 for key, count in counts.items()
+        if key not in _PAPER_SINGLE_HIT_STYLE_KEYS and key != "作者式第一人称"
     ) or sum(counts.values()) > 4
 
 
@@ -3319,18 +3448,6 @@ NEWS_ARTICLE_PROMPT = (
     "图片只可依据图注文字理解，不得声称看过或分析过图片。"
 )
 
-PAPER_STYLE_EXAMPLE = (
-    "结构示例：\n"
-    "作者比较了三组模式试验。三组结果的变化方向基本一致，但幅度并不相同，其中 A 试验最强，B 试验相对较弱。"
-    "差异主要出现在事件后的几个月，随后逐渐减小。\n\n"
-    "论文进一步给出了敏感性试验。去掉 Z 过程后，Y 的响应明显减弱，作者据此认为，Z 是造成这组差异的重要因素。\n\n"
-    "不同区域的结果也有明显差别。A 区的变化最突出，B 区相对较弱，而且这种差异具有一定的季节性，"
-    "并不是全年都保持相同强度。\n"
-    "只学习以上示例的句长、段落节奏、信息密度和自然推进方式，不复制具体措辞，也不把它当作固定模板。"
-    "A、B、X、Y、Z 都只是占位符，绝不能进入实际文章。"
-)
-
-
 PAPER_EDITORIAL_GUIDE = (
     "中文科研表达编辑规则（仅作保守润色，服从Abstract、原文证据和section scope约束）："
     "1. 保留科学术语、数字、百分比、统计值、趋势方向和限定条件，不为追求自然而改写事实。"
@@ -3362,17 +3479,19 @@ PAPER_FIDELITY_CONTRACT = (
 )
 
 PAPER_NARRATOR_CONTRACT = (
-    "叙述者契约：PAPER是第三方科学公众号编辑，不是论文作者。正文禁止使用作者身份的“我们发现”、"
-    "“我们展示”、“我们使用”、“我们进一步分析”、“我们的结果”、“我室”、“本研究发现”或“本文发现”。"
-    "应改为自然的第三方表达，例如“研究进一步比较了……”或“敏感性试验进一步检验了这一结果的稳健性”，"
-    "但不要因此反复制造“研究发现”或“结果表明”等模板句。英文原文引用和论文题目保持原样，不要改写其中的第一人称。"
+    "叙述者契约：PAPER是第三方科学公众号编辑，不是论文作者。正文不得出现作者式第一人称“我们”或“咱们”，"
+    "也不得使用“我室”、“本研究发现”、“本文发现”等作者口吻；包括“我们发现”、“我们看到”、“我们可以看到”、"
+    "“我们展示”、“我们使用”、“我们进一步分析”、“我们注意到”和“我们的结果”。"
+    "应改为自然的第三方表达，但不要因此反复制造“研究发现”或“结果表明”等模板句。"
+    "英文原文引用和论文题目保持原样，不要改写其中的第一人称。"
 )
 
 PAPER_STORY_PLANNER_PROMPT = (
     "你是Story Planner，先读懂房间，再为已经通过Figure-first科学验证的证据设计自然的公众号故事线。"
     "读者是对科学感兴趣但非本领域专家的普通读者；目的不是逐项汇报Results，而是像人在解释一个值得知道的科学发现。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
-    "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。故事按问题/现象→核心发现→为什么→进一步证据→意义推进，结论先于方法，方法只保留帮助理解结果的部分。"
+    "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
+    "故事形状由当前证据决定，不套固定的A→B→C公式；可以从现象、结果、机制或影响切入，结论和方法的先后以自然表达为准，方法只保留帮助理解结果的部分。"
     "再把clean_evidence组织成2到4个story beats，通常约3个但不要硬凑。每个beat包含id、title、reader_question、core_message、"
     "evidence_ids和transition_to_next。evidence_ids必须逐字复制输入registry中的真实ID，禁止编号、改写、合并或创造新ID。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
     "允许多个证据共同进入一个beat；标题必须专业、直接、简洁，优先10到22个中文字，直接陈述科学结果。避免为何、线索、改写、同一片中国、谁在主导、真正的答案、背后的秘密等媒体化措辞。不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
@@ -3385,11 +3504,11 @@ PAPER_STORY_PLANNER_PROMPT = (
 PAPER_STORY_WRITER_PROMPT = (
     "你是Story Writer，为跨专业科研读者写专业、简洁、易懂的中文科学公众号正文。你只能看到按beat分组的clean evidence和story beats，"
     "绝不能提及或猜测图号、Figure、panel、source id，也不要按证据编号或资料顺序逐项汇报。"
-    "每个beat只能使用其对应的clean evidence，先回答读者问题，再给最重要的发现，随后用直接句解释如何理解；不要强行制造承上启下的金句。"
+    "每个beat只能使用其对应的clean evidence；在固定evidence/block边界内参考style corpus自然组织正文，不要为了结构完整硬加转折、总结句或解释句。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
-    "标题应专业、直接、简洁，优先10到22个中文字，直接陈述科学结果，不用为何、线索、改写、同一片中国等媒体化表达。"
-    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体。先说读者需要知道的结论，再补充必要证据和解释；方法、变量清单和统计术语只保留帮助理解结果的部分。避免第一/第二/第三/第四、首先/其次/最后、模板化排比和不必要的分号。"
-    "每句话只讲一个主要科学意思，中文逗号和句号为主。关键专业词第一次出现时顺手用半句话解释，不连续堆缩写、模型名和参数；段落长短自然变化，每段推进一个主要意思。"
+    "标题和正文以style corpus的自然表达为主要参考，清楚、克制即可，不把10到22字、固定小标题或禁用词清单当成硬模板。"
+    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，不为了结构完整硬加转折、总结句或解释句。方法、变量清单和统计术语只保留确实有助于理解的部分。"
+    "句式、句长和段落节奏参考style corpus自然变化；专业词在需要时顺手解释，避免连续堆缩写、模型名和参数，不把人工规则写成排比模板。"
     "每个beat必须按输入的固定blocks分别写作。Python已经决定每个block_id及其对应的科学证据边界；不得新增、删除、重排、合并或拆分block，不得分配或返回evidence_ids。"
     "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
     "本次只写当前story beat，按证据需要保持紧凑；全篇长度由Python汇总审计，不要把每个beat或block机械写成等长。"
@@ -3402,10 +3521,11 @@ PAPER_HUMANIZER_PROMPT = (
     "你是中文母语科学编辑，依据ai-zixun/humanizer-zh的原则，对Story Writer成稿做一次保守的人文化编辑。"
     "输入按beat再按paragraph block分组；每次只能修改当前block，可只读少量相邻block文本帮助衔接，但不能重写、合并或移动其他block的正文。"
     "每个block_id及其证据边界是Python设定的硬边界，不能合并block、拆出跨组句子、移动finding或把另一组Figure的结果带进来。"
-    "保持专业、直接、简洁的科研公众号中文，去掉翻译腔、空泛总结、机械连接、等长句式、术语堆积和不必要分号。"
-    "不要把正文改成论文Results转述；结论先于方法，方法和变量只保留帮助读者理解结果的部分。"
-    "标题应专业、直接、简洁，优先陈述科学结果，避免为何、线索、改写、同一片中国等媒体化措辞。"
-    "每句话只讲一个主要科学意思；关键专业词第一次出现时顺手解释，不连续堆缩写；句长和段落推进要有自然变化。"
+    "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE、humanizer、stop-slop、shuorenhua和人工规则都只是辅助校对；"
+    "优先模仿范文的句法、段落节奏、信息密度、叙事推进、术语解释和自然中文。"
+    "只做保守校对：修正明显翻译腔、作者式第一人称、AI套话、机械重复、方法/变量堆积和生硬衔接，不重新设计段落结构。"
+    "不要把正文改成论文Results转述，也不要为了‘像公众号’硬加结论、转折、总结或解释句；段落形状和句式以范文自然写法为准。"
+    "标题清楚、克制即可，不把长度或禁用词清单当成硬模板；专业词在需要时顺手解释，避免连续堆缩写。"
     "每个block对应的anchor必须原样保留，不能因润色而删除、改写、重复或移动。"
     "非anchor的细节可以删减，但不能新增事实、机制、意义或因果关系；不新增事实。"
     "若targeted_feedback指出技术密度或模板风险，优先删除方法、变量和公式清单，只保留当前block理解结论所需的信息。"
@@ -3413,6 +3533,18 @@ PAPER_HUMANIZER_PROMPT = (
     + PAPER_NARRATOR_CONTRACT
     + "只返回严格JSON：{\"block\":{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}}。"
 )
+
+PAPER_STYLE_REVIEWER_PROMPT = (
+    "你是只读的中文科学写作Style Reviewer。完整style_exemplar是主要参考，STYLE_GUIDE和人工规则只作辅助校对。"
+    "检查完整正文是否像自然的science news/explainer，而不是论文Results、摘要扩写或图注翻译。"
+    "只指出结果翻译腔、AI语气、机械对仗或转折、作者式第一人称、重复同构句式、方法/变量堆叠、生硬衔接，"
+    "以及与范文语法、段落节奏、信息密度和叙事推进明显偏离的问题。不要评价或改动科学事实。"
+    "不要移动证据、调整block或section、修改Figure和anchor、改变来源、重排章节或新增科学结论。"
+    "每个问题只指定一个已有block；没有明确问题就返回空issues。每个block最多一个问题。"
+    "返回严格JSON且只能包含issues字段："
+    '{"issues":[{"block_id":"beat-1-block-1","issue":"...","instruction":"..."}]}'
+)
+
 
 PAPER_PLANNER_PROMPT = (
     "你是Figure-first Scientific Planner，不写文章正文。根据Abstract、paper_text、source_paragraphs、selected_body_figures和figure_evidence_bundles，"
@@ -3994,6 +4126,59 @@ def _generate_paper_article_markdown(
     )
     logger.info("PAPER deterministic evidence validation passed")
 
+    style_review: dict[str, Any] = {"issues": [], "status": "skipped"}
+    try:
+        style_review = {
+            "status": "pass",
+            **_paper_style_review(
+                client,
+                style_exemplar,
+                plan["sections"],
+                markdown,
+                settings.model_name,
+            ),
+        }
+    except Exception as exc:
+        logger.warning("PAPER style reviewer returned unusable output; continuing without rewrite: %s", exc)
+        style_review = {"status": "warning", "issues": [], "error": str(exc)}
+    review_issues = style_review.get("issues") or []
+    if review_issues:
+        review_targets = {issue["block_id"] for issue in review_issues}
+        review_feedback = {
+            issue["block_id"]: {
+                "style_review": {
+                    "issue": issue["issue"],
+                    "instruction": issue["instruction"],
+                }
+            }
+            for issue in review_issues
+        }
+        reviewed_output = _paper_humanize_story(
+            client,
+            story_plan,
+            clean_evidence,
+            _paper_story_draft_blocks(plan["sections"]),
+            settings.model_name,
+            block_specs=block_specs,
+            style_exemplar=style_exemplar,
+            target_block_ids=review_targets,
+            feedback_by_block=review_feedback,
+        )
+        _paper_apply_story_output(
+            plan["sections"], reviewed_output, evidence_map, evidence_registry, block_specs
+        )
+        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
+        _validate_paper_evidence_plan(
+            plan,
+            markdown,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+            evidence_registry,
+        )
+        logger.info("PAPER deterministic evidence validation passed")
+        style_review["rewritten_block_ids"] = sorted(review_targets)
+    plan["style_review"] = style_review
+
     final_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
     final_humanizer_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
         humanizer_baseline,
@@ -4001,13 +4186,17 @@ def _generate_paper_article_markdown(
         plan,
     )
     humanizer_retry_count = 0
+    humanizer_targets = _paper_style_issue_block_ids(plan["sections"])
     if (
-        _paper_ai_style_lint_failed(_paper_ai_style_lint(markdown))
-        or final_humanizer_feedback["abstract_overlong"]
-        or final_humanizer_feedback["body_lengths"]["total_overlong"]
-        or final_humanizer_feedback["readability"]["issue_count"]
-        or final_humanizer_feedback["title_style"]["issue_count"]
-        or final_humanizer_feedback["anchor_preservation"]["issue_count"]
+        humanizer_targets
+        and (
+            _paper_ai_style_lint_failed(_paper_ai_style_lint(markdown))
+            or final_humanizer_feedback["abstract_overlong"]
+            or final_humanizer_feedback["body_lengths"]["total_overlong"]
+            or final_humanizer_feedback["readability"]["issue_count"]
+            or final_humanizer_feedback["title_style"]["issue_count"]
+            or final_humanizer_feedback["anchor_preservation"]["issue_count"]
+        )
     ):
         humanizer_retry_count = 1
         targeted_output = _paper_humanize_story(
@@ -4019,6 +4208,7 @@ def _generate_paper_article_markdown(
             {"readability": final_humanizer_feedback},
             block_specs=block_specs,
             style_exemplar=style_exemplar,
+            target_block_ids=humanizer_targets,
         )
         _paper_apply_story_output(
             plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
@@ -4042,7 +4232,8 @@ def _generate_paper_article_markdown(
     plan["humanizer_retry_count"] = humanizer_retry_count
     stop_slop_feedback = _paper_stop_slop_audit(markdown)
     stop_slop_retry_count = 0
-    if stop_slop_feedback["issue_count"]:
+    stop_slop_targets = _paper_style_issue_block_ids(plan["sections"])
+    if stop_slop_feedback["issue_count"] and stop_slop_targets:
         stop_slop_retry_count = 1
         targeted_output = _paper_humanize_story(
             client,
@@ -4053,6 +4244,7 @@ def _generate_paper_article_markdown(
             {"stop_slop": stop_slop_feedback},
             block_specs=block_specs,
             style_exemplar=style_exemplar,
+            target_block_ids=stop_slop_targets,
         )
         _paper_apply_story_output(
             plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
@@ -4110,6 +4302,7 @@ def _generate_paper_article_markdown(
             {"author_voice": final_lint},
             block_specs=block_specs,
             style_exemplar=style_exemplar,
+            target_block_ids=_paper_style_issue_block_ids(plan["sections"]),
         )
         _paper_apply_story_output(
             plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
