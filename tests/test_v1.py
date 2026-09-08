@@ -105,6 +105,8 @@ from writer.llm import (
     _paper_figure_evidence_bundles,
     _paper_readability_audit,
     _paper_stop_slop_audit,
+    _paper_style_exemplar,
+    _paper_style_fragments_for_prompt,
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
@@ -2829,6 +2831,88 @@ class V1Tests(unittest.TestCase):
         clean_counts = _paper_ai_style_lint("森林变化解释了模式差异。未来投影仍有不确定性。")
         self.assertFalse(_paper_ai_style_lint_failed(clean_counts))
 
+    def test_paper_style_exemplar_uses_curated_compact_package(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exemplar_dir = root / "writer" / "exemplars"
+            exemplar_dir.mkdir(parents=True)
+            (exemplar_dir / "STYLE_GUIDE.md").write_text(
+                "规则标记：只学习语言，不迁移事实。", encoding="utf-8"
+            )
+            for index in range(1, 6):
+                (exemplar_dir / f"exemplar_{index:02d}.md").write_text(
+                    f"# 范文{index}\n\n导语标记{index}。\n\n正文标记{index}。\n\n过渡标记{index}。",
+                    encoding="utf-8",
+                )
+            historical = root / "articles" / "paper" / "old"
+            historical.mkdir(parents=True)
+            (historical / "article.md").write_text(
+                "不应被读取的历史文章标记。", encoding="utf-8"
+            )
+            with patch("writer.llm.PROJECT_ROOT", root):
+                package = _paper_style_exemplar()
+        self.assertIn("规则标记", package)
+        for index in range(1, 6):
+            self.assertIn(f"exemplar_{index:02d}", package)
+            self.assertIn(f"导语标记{index}", package)
+        self.assertNotIn("不应被读取的历史文章标记", package)
+        self.assertLess(len(package), 4000)
+
+    def test_paper_style_exemplar_is_shorter_than_full_exemplars(self):
+        project_root = Path(__file__).resolve().parents[1]
+        exemplar_dir = project_root / "writer" / "exemplars"
+        package = _paper_style_exemplar()
+        full_size = sum(
+            path.stat().st_size
+            for path in exemplar_dir.glob("exemplar_*.md")
+        )
+        self.assertGreater(full_size, 0)
+        self.assertLess(len(package.encode("utf-8")), full_size)
+        self.assertIn("STYLE_GUIDE", package)
+
+    def test_paper_writer_style_payload_selects_only_two_excerpts(self):
+        package = _paper_style_exemplar()
+        selected = _paper_style_fragments_for_prompt(package, "beat-2")
+        self.assertIn("STYLE_GUIDE", selected)
+        self.assertEqual(
+            re.findall(r"(?m)^exemplar_\d+$", selected),
+            ["exemplar_02", "exemplar_03"],
+        )
+
+    def test_paper_ai_style_lint_covers_requested_templates(self):
+        phrases = (
+            "研究发现", "结果表明", "进一步分析", "值得注意的是",
+            "这意味着", "这一发现表明", "综上所述",
+        )
+        counts = _paper_ai_style_lint("。".join(phrases))
+        for phrase in phrases:
+            self.assertEqual(counts[phrase], 1)
+        self.assertTrue(_paper_ai_style_lint_failed(counts))
+
+    def test_paper_stop_slop_audit_catches_repeated_paragraph_openings(self):
+        markdown = (
+            "## 结果\n\n"
+            "这一结果说明了空间差异。后续证据支持这一判断。\n\n"
+            "这一结果说明了空间差异。另一组证据给出相同方向。"
+        )
+        audit = _paper_stop_slop_audit(markdown)
+        issue_types = {issue["type"] for issue in audit["issues"]}
+        self.assertIn("repeated_paragraph_opening", issue_types)
+
+    def test_paper_story_prompts_require_story_first_plain_language(self):
+        self.assertIn("结论先于方法", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("先说读者需要知道的结论", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("结论先于方法", PAPER_HUMANIZER_PROMPT)
+        self.assertIn("非本领域专家", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("跨专业科研读者", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("帮助读者理解结果", PAPER_HUMANIZER_PROMPT)
+        for prompt in (PAPER_STORY_WRITER_PROMPT, PAPER_HUMANIZER_PROMPT):
+            self.assertIn("专业词第一次", prompt)
+        self.assertIn("问题/现象→核心发现→为什么→进一步证据→意义", PAPER_STORY_PLANNER_PROMPT)
+        self.assertIn("不要写成论文Results", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("营销型自媒体", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("Results转述", PAPER_HUMANIZER_PROMPT)
+
     def test_paper_story_writer_audit_allows_one_retry(self):
         responses = [
             SimpleNamespace(
@@ -3233,7 +3317,8 @@ class V1Tests(unittest.TestCase):
         self.assertIn("350到500个中文字符", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
         self.assertIn("Story Planner", PAPER_STORY_PLANNER_PROMPT)
         self.assertIn("Story Writer", PAPER_STORY_WRITER_PROMPT)
-        self.assertIn("350到500个中文字符", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("按证据需要保持紧凑", PAPER_STORY_WRITER_PROMPT)
+        self.assertNotIn("每个beat固定", PAPER_STORY_WRITER_PROMPT)
 
     def test_paper_popular_editor_anchor_audit_preserves_section_mapping(self):
         plan = {

@@ -1221,54 +1221,66 @@ def prune_paper_sections_after_allocation(
 
 
 def _paper_style_exemplar() -> str:
-    paths = sorted(
-        PROJECT_ROOT.glob("articles/paper/*/article.md"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    preferred_tokens = (
-        "2026jd046858",
-        "s41467-026-77084-0",
-        "2026-09-01-005",
-    )
-    preferred: list[Path] = []
-    for token in preferred_tokens:
-        match = next(
-            (path for path in paths if token in path.parent.name.lower() and path not in preferred),
-            None,
-        )
-        if match is not None:
-            preferred.append(match)
-    paths = preferred + [path for path in paths if path not in preferred]
-    excerpts: list[str] = []
-    for path in paths[:3]:
+    """Load only the curated writing package, never generated PAPER articles."""
+    exemplar_dir = PROJECT_ROOT / "writer" / "exemplars"
+    try:
+        guide = (exemplar_dir / "STYLE_GUIDE.md").read_text(encoding="utf-8").strip()
+    except OSError:
+        guide = ""
+    fragments: list[str] = []
+    for path in sorted(exemplar_dir.glob("exemplar_*.md"))[:5]:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        sections = _paper_body_sections(text)
-        lines = text.splitlines()
-        first_section = next(
-            (index for index, line in enumerate(lines) if re.match(r"^##\s+", line.strip())),
-            len(lines),
+        paragraphs = []
+        for paragraph in re.split(r"\n\s*\n", text):
+            cleaned = paragraph.strip()
+            if not cleaned or cleaned.startswith(("#", "![", "*Fig.", "*图", "---")):
+                continue
+            if "![](" in cleaned or cleaned.startswith(("⬇️", "⬇")):
+                continue
+            if cleaned.startswith(("原文标题：", "作者：", "以下文章来源于：", "相关文献")):
+                continue
+            if re.fullmatch(r"\*{0,2}\s*\d+[.)。]?\s*\*{0,2}", cleaned):
+                continue
+            if re.fullmatch(r"\*{1,2}\s*(?:✓\s*)?(?:简报|摘要|仅供个人参考|相关文献)\s*\*{1,2}", cleaned):
+                continue
+            if re.fullmatch(r"\*{2}[^*]{1,60}\*{2}", cleaned):
+                continue
+            paragraphs.append(cleaned)
+        lead = paragraphs[0] if paragraphs else ""
+        body = paragraphs[1] if len(paragraphs) > 1 else lead
+        transition_source = paragraphs[2] if len(paragraphs) > 2 else body
+        transition = re.split(r"(?<=[。！？.!?])\s*", transition_source)[0]
+        excerpt = "\n".join(
+            part
+            for part in (
+                f"导语片段：{lead[:280]}" if lead else "",
+                f"正文片段：{body[:480]}" if body else "",
+                f"过渡片段：{transition[:240]}" if transition else "",
+            )
+            if part
         )
-        lead = "\n".join(
-            line.strip()
-            for line in lines[1:first_section]
-            if line.strip() and not line.strip().startswith(("![", "*Fig.", "*图"))
-        ).strip()
-        excerpt_parts = []
-        if lead:
-            excerpt_parts.append(f"导语\n{lead[:700]}")
-        excerpt_parts.extend(f"## {title}\n{body.strip()}" for title, body in sections[:2])
-        if sections:
-            transition = re.split(r"(?<=[。！？.!?])\s*", sections[min(1, len(sections) - 1)][1].strip())[0]
-            if transition:
-                excerpt_parts.append(f"自然过渡样例\n{transition}")
-        excerpt = "\n\n".join(excerpt_parts)
         if excerpt:
-            excerpts.append(excerpt[:1800])
-    return "\n\n---\n\n".join(excerpts)
+            fragments.append(f"{path.stem}\n{excerpt}")
+    parts = []
+    if guide:
+        parts.append("STYLE_GUIDE（必须遵守）\n" + guide[:3600])
+    parts.extend(fragments)
+    return "\n\n---\n\n".join(parts)
+
+
+def _paper_style_fragments_for_prompt(style_exemplar: str, beat_id: str) -> str:
+    parts = [part for part in style_exemplar.split("\n\n---\n\n") if part.strip()]
+    if len(parts) <= 1:
+        return style_exemplar
+    guide = parts[0]
+    examples = parts[1:]
+    match = re.search(r"(\d+)$", str(beat_id))
+    index = int(match.group(1)) - 1 if match else 0
+    chosen = [examples[index % len(examples)], examples[(index + 1) % len(examples)]]
+    return guide + "\n\n参考写法片段（只学习语言和结构，禁止借用事实）：\n" + "\n\n".join(chosen)
 
 
 def _paper_clean_story_text(text: str) -> str:
@@ -1888,7 +1900,9 @@ def _paper_story_writer(
                     "clean_evidence": [
                         _paper_clean_evidence_for_llm(record) for record in beat_evidence
                     ],
-                    "style_exemplar": style_exemplar,
+                    "style_exemplar": _paper_style_fragments_for_prompt(
+                        style_exemplar, beat_id
+                    ),
                     "targeted_feedback": beat_feedback,
                     "_model": model,
                     "_temperature": 0.25,
@@ -1932,6 +1946,7 @@ def _paper_humanize_story(
     model: str,
     feedback: dict[str, Any] | None = None,
     block_specs: dict[str, list[dict[str, Any]]] | None = None,
+    style_exemplar: str = "",
 ) -> list[dict[str, Any]]:
     """Humanize text for immutable Python-owned blocks."""
     evidence_by_id = {record["evidence_id"]: record for record in clean_evidence}
@@ -1953,11 +1968,22 @@ def _paper_humanize_story(
             if isinstance(block, dict)
         }
         humanized_blocks: list[dict[str, Any]] = []
-        for spec in block_specs.get(beat_id) or []:
+        beat_specs = block_specs.get(beat_id) or []
+        for block_index, spec in enumerate(beat_specs):
             block_id = spec["block_id"]
             current = current_by_id.get(block_id)
             if current is None:
                 raise RuntimeError(f"PAPER humanizer missing block: {block_id}")
+            adjacent_blocks: list[dict[str, str]] = []
+            for neighbor_index in (block_index - 1, block_index + 1):
+                if 0 <= neighbor_index < len(beat_specs):
+                    neighbor_id = beat_specs[neighbor_index]["block_id"]
+                    neighbor = current_by_id.get(neighbor_id)
+                    if neighbor is not None:
+                        adjacent_blocks.append({
+                            "block_id": neighbor_id,
+                            "text": str(neighbor.get("text") or "")[:240],
+                        })
             block_feedback = feedback or {}
             for attempt in range(2):
                 response = _paper_completion_json(
@@ -1978,6 +2004,10 @@ def _paper_humanize_story(
                             _paper_clean_evidence_for_llm(evidence_by_id[evidence_id])
                             for evidence_id in spec["evidence_ids"]
                         ],
+                        "adjacent_blocks": adjacent_blocks,
+                        "style_exemplar": _paper_style_fragments_for_prompt(
+                            style_exemplar, beat_id
+                        ),
                         "targeted_feedback": block_feedback,
                         "_model": model,
                         "_temperature": 0.2,
@@ -2393,11 +2423,16 @@ def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
         "也就是说": r"也就是说",
         "不只是": r"不只是",
         "不仅": r"不仅",
+        "研究发现": r"研究发现",
+        "结果表明": r"结果表明",
+        "进一步分析": r"进一步分析",
         "值得注意的是": r"值得注意的是",
         "进一步表明": r"进一步表明",
+        "这一发现表明": r"这一发现表明",
         "总体而言": r"总体而言",
         "由此可见": r"由此可见",
         "这意味着": r"这意味着",
+        "综上所述": r"综上所述",
     }
     return {name: len(re.findall(pattern, markdown)) for name, pattern in patterns.items()}
 
@@ -2552,6 +2587,21 @@ def _paper_stop_slop_audit(markdown: str) -> dict[str, Any]:
             first_sentences.append(_normalize_evidence_anchor(sentence))
     if len(first_sentences) >= 3 and len(set(first_sentences)) < len(first_sentences):
         issues.append({"type": "repeated_section_opening"})
+    paragraph_openings: list[str] = []
+    for _, body in sections:
+        for paragraph in re.split(r"\n\s*\n", body.strip()):
+            first_sentence = re.split(r"(?<=[。！？.!?])\s*", paragraph.strip(), maxsplit=1)[0]
+            opening = re.sub(r"\s+", "", first_sentence)[:16]
+            if opening:
+                paragraph_openings.append(opening)
+    repeated_paragraph_openings = {
+        opening for opening in paragraph_openings if paragraph_openings.count(opening) > 1
+    }
+    if repeated_paragraph_openings:
+        issues.append({
+            "type": "repeated_paragraph_opening",
+            "openings": sorted(repeated_paragraph_openings),
+        })
     sentence_lengths = [
         _paper_chinese_char_count(sentence.strip())
         for _, body in sections
@@ -3204,8 +3254,8 @@ PAPER_FIDELITY_CONTRACT = (
 
 PAPER_STORY_PLANNER_PROMPT = (
     "你是Story Planner，先读懂房间，再为已经通过Figure-first科学验证的证据设计自然的公众号故事线。"
-    "读者是跨专业、受过高等教育但非该领域专家的人；目的不是逐项汇报结果，而是用几分钟讲清论文最值得知道的发现。"
-    "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
+    "读者是对科学感兴趣但非本领域专家的普通读者；目的不是逐项汇报Results，而是像人在解释一个值得知道的科学发现。"
+    "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。故事按问题/现象→核心发现→为什么→进一步证据→意义推进，结论先于方法，方法只保留帮助理解结果的部分。"
     "再把clean_evidence组织成2到4个story beats，通常约3个但不要硬凑。每个beat包含id、title、reader_question、core_message、"
     "evidence_ids和transition_to_next。evidence_ids必须逐字复制输入registry中的真实ID，禁止编号、改写、合并或创造新ID。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
     "允许多个证据共同进入一个beat；标题必须专业、直接、简洁，优先10到22个中文字，直接陈述科学结果。避免为何、线索、改写、同一片中国、谁在主导、真正的答案、背后的秘密等媒体化措辞。不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
@@ -3220,22 +3270,23 @@ PAPER_STORY_WRITER_PROMPT = (
     "绝不能提及或猜测图号、Figure、panel、source id，也不要按证据编号或资料顺序逐项汇报。"
     "每个beat只能使用其对应的clean evidence，先回答读者问题，再给最重要的发现，随后用直接句解释如何理解；不要强行制造承上启下的金句。"
     "标题应专业、直接、简洁，优先10到22个中文字，直接陈述科学结果，不用为何、线索、改写、同一片中国等媒体化表达。"
-    "正文不要写成论文Results、摘要扩写、图注翻译或科普新闻稿。避免第一/第二/第三/第四、首先/其次/最后、模板化排比和不必要的分号。"
-    "每句话只讲一个主要科学意思，中文逗号和句号为主。保留必要专业词，第一次出现时用简短中文解释；不要为了通俗创造比喻或抽象术语。"
+    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体。先说读者需要知道的结论，再补充必要证据和解释；方法、变量清单和统计术语只保留帮助理解结果的部分。避免第一/第二/第三/第四、首先/其次/最后、模板化排比和不必要的分号。"
+    "每句话只讲一个主要科学意思，中文逗号和句号为主。关键专业词第一次出现时顺手用半句话解释，不连续堆缩写、模型名和参数；段落长短自然变化，每段推进一个主要意思。"
     "每个beat必须按输入的固定blocks分别写作。Python已经决定每个block_id及其对应的科学证据边界；不得新增、删除、重排、合并或拆分block，不得分配或返回evidence_ids。"
     "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
-    "正文总量以约350到500个中文字符为目标；按故事需要分配篇幅，不要把每个beat或block机械写成等长。"
+    "本次只写当前story beat，按证据需要保持紧凑；全篇长度由Python汇总审计，不要把每个beat或block机械写成等长。"
     + PAPER_FIDELITY_CONTRACT
     + "本次只写当前story beat，严格按输入blocks顺序返回；每个block只能包含block_id和text。返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}]}。"
 )
 
 PAPER_HUMANIZER_PROMPT = (
     "你是中文母语科学编辑，依据ai-zixun/humanizer-zh的原则，对Story Writer成稿做一次保守的人文化编辑。"
-    "输入按beat再按paragraph block分组；每次只能修改当前block，不能看到或重写其他block的正文。"
+    "输入按beat再按paragraph block分组；每次只能修改当前block，可只读少量相邻block文本帮助衔接，但不能重写、合并或移动其他block的正文。"
     "每个block_id及其证据边界是Python设定的硬边界，不能合并block、拆出跨组句子、移动finding或把另一组Figure的结果带进来。"
-    "保持专业、直接、简洁的科研公众号中文，去掉翻译腔、空泛总结、机械连接、过度修辞和不必要分号。"
+    "保持专业、直接、简洁的科研公众号中文，去掉翻译腔、空泛总结、机械连接、等长句式、术语堆积和不必要分号。"
+    "不要把正文改成论文Results转述；结论先于方法，方法和变量只保留帮助读者理解结果的部分。"
     "标题应专业、直接、简洁，优先陈述科学结果，避免为何、线索、改写、同一片中国等媒体化措辞。"
-    "每句话只讲一个主要科学意思；保留必要专业词并做简短解释，不为了通俗创造比喻、抽象术语或媒体式悬念。"
+    "每句话只讲一个主要科学意思；关键专业词第一次出现时顺手解释，不连续堆缩写；句长和段落推进要有自然变化。"
     "每个block对应的anchor必须原样保留，不能因润色而删除、改写、重复或移动。"
     "非anchor的细节可以删减，但不能新增事实、机制、意义或因果关系；不新增事实。"
     "若targeted_feedback指出技术密度或模板风险，优先删除方法、变量和公式清单，只保留当前block理解结论所需的信息。"
@@ -3807,6 +3858,7 @@ def _generate_paper_article_markdown(
         _paper_story_draft_blocks(plan["sections"]),
         settings.model_name,
         block_specs=block_specs,
+        style_exemplar=style_exemplar,
     )
     _paper_apply_story_output(
         plan["sections"], humanized_output, evidence_map, evidence_registry, block_specs
@@ -3845,6 +3897,7 @@ def _generate_paper_article_markdown(
             settings.model_name,
             {"readability": final_humanizer_feedback},
             block_specs=block_specs,
+            style_exemplar=style_exemplar,
         )
         _paper_apply_story_output(
             plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
@@ -3878,6 +3931,7 @@ def _generate_paper_article_markdown(
             settings.model_name,
             {"stop_slop": stop_slop_feedback},
             block_specs=block_specs,
+            style_exemplar=style_exemplar,
         )
         _paper_apply_story_output(
             plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
