@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -388,7 +389,7 @@ def _paper_canonical_evidence_registry(
     source_paragraphs: list[dict[str, Any]],
     figure_evidence_bundles: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Build immutable evidence/provenance records before any LLM planning."""
+    """Build immutable contextual and quantitative evidence records before planning."""
     registry: dict[str, dict[str, Any]] = {}
     for index, record in enumerate(source_paragraphs):
         source_id = str(record.get("id") or "")
@@ -413,8 +414,43 @@ def _paper_canonical_evidence_registry(
             "source_sentence": text,
             "scope": scope,
             "supported_figures": supported_figures,
-            "anchors": _paper_quantitative_anchors(text),
+            # Paragraph records provide context only. Quantitative ownership
+            # belongs to the atomic evidence-anchor records below.
+            "anchors": [],
         }
+
+    owner_keys: set[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = set()
+
+    def add_quantitative_owner(
+        value: str,
+        normalized: str,
+        source_ids: tuple[str, ...],
+        source_sentence: str,
+        scope: str,
+        supported_figures: tuple[str, ...],
+    ) -> None:
+        if not value or not normalized or not source_ids:
+            return
+        key = (normalized, source_ids, scope, supported_figures)
+        if key in owner_keys:
+            return
+        owner_keys.add(key)
+        evidence_id = _paper_stable_evidence_id(
+            "anchor", normalized, source_ids, scope, supported_figures
+        )
+        registry.setdefault(
+            evidence_id,
+            {
+                "evidence_id": evidence_id,
+                "value": value,
+                "normalized_value": normalized,
+                "source_paragraph_ids": list(source_ids),
+                "source_sentence": source_sentence or value,
+                "scope": scope,
+                "supported_figures": list(supported_figures),
+                "anchors": [value],
+            },
+        )
 
     for bundle in figure_evidence_bundles:
         for provenance in bundle.get("provenance") or []:
@@ -434,29 +470,41 @@ def _paper_canonical_evidence_registry(
             scope = str(provenance.get("scope") or "section_context")
             supported_figures = tuple(
                 dict.fromkeys(
-                    _paper_figure_id(value)
-                    for value in provenance.get("supported_figures") or []
-                    if str(value).strip()
+                    _paper_figure_id(figure)
+                    for figure in provenance.get("supported_figures") or []
+                    if str(figure).strip()
                 )
             )
-            if not value or not normalized or not source_ids:
+            add_quantitative_owner(
+                value,
+                normalized,
+                source_ids,
+                str(provenance.get("source_sentence") or value),
+                scope,
+                supported_figures,
+            )
+
+    # Bundle provenance is authoritative for Figure associations, but it does
+    # not cover source-only values or papers without selected Figures. Create a
+    # conservative contextual owner for every uncovered source occurrence.
+    represented_occurrences = {
+        (normalized, source_ids)
+        for normalized, source_ids, _scope, _supported_figures in owner_keys
+    }
+    for index, record in enumerate(source_paragraphs):
+        source_id = str(record.get("id") or "").strip()
+        text = str(record.get("text") or "").strip()
+        if not source_id or not text or source_id.startswith("source-figure-"):
+            continue
+        scope = "global_context" if index == 0 or source_id in {"abstract", "source-abstract"} else "section_context"
+        for value, sentence in _paper_anchor_sentences(text):
+            normalized = _normalize_evidence_anchor(value)
+            occurrence = (normalized, (source_id,))
+            if occurrence in represented_occurrences:
                 continue
-            evidence_id = _paper_stable_evidence_id(
-                "anchor", normalized, source_ids, scope, supported_figures
-            )
-            registry.setdefault(
-                evidence_id,
-                {
-                    "evidence_id": evidence_id,
-                    "value": value,
-                    "normalized_value": normalized,
-                    "source_paragraph_ids": list(source_ids),
-                    "source_sentence": str(provenance.get("source_sentence") or value),
-                    "scope": scope,
-                    "supported_figures": list(supported_figures),
-                    "anchors": [value],
-                },
-            )
+            add_quantitative_owner(value, normalized, (source_id,), sentence, scope, ())
+            represented_occurrences.add(occurrence)
+
     return list(registry.values())
 
 
@@ -676,7 +724,8 @@ def _paper_validate_story_blocks(
                 )
                 owning_blocks = blocks_by_evidence.get(evidence_id, [])
                 duplicate_anchor = len(anchor_evidence_ids.get(normalized_anchor, set())) > 1
-                if canonical_mode and (duplicate_anchor or figure_specific):
+                hard_anchor_owner = bool(evidence_record.get("anchors"))
+                if canonical_mode and (hard_anchor_owner or duplicate_anchor or figure_specific):
                     if len(owning_blocks) != 1:
                         raise RuntimeError(
                             "PAPER story block validation failed: evidence is not bound to one block: "
@@ -1852,6 +1901,82 @@ def _paper_apply_story_output(
         section["title"] = str(item.get("title") or section.get("title") or "")
         section["blocks"] = blocks
         section["body"] = "\n\n".join(block["text"] for block in blocks)
+
+
+def _paper_apply_story_candidate(
+    plan: dict[str, Any],
+    generated: list[dict[str, Any]],
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    evidence_registry: list[dict[str, Any]],
+    block_specs: dict[str, list[dict[str, Any]]],
+    display_title: str,
+    abstract_lead: str,
+    valid_source_ids: set[str],
+    figure_evidence_bundles: list[dict[str, Any]] | None,
+    current_markdown: str,
+    stage: str,
+    rollback_on_failure: bool = True,
+) -> tuple[bool, str]:
+    """Apply a story candidate on a copy and commit it only after hard validation."""
+    candidate_plan = copy.deepcopy(plan)
+    candidate_sections = candidate_plan.get("sections")
+    if not isinstance(candidate_sections, list):
+        raise RuntimeError("PAPER story candidate has no sections")
+    try:
+        _paper_apply_story_output(
+            candidate_sections,
+            generated,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+        )
+        candidate_markdown = _paper_assemble_markdown(
+            display_title, abstract_lead, candidate_sections
+        )
+        _validate_paper_evidence_plan(
+            candidate_plan,
+            candidate_markdown,
+            valid_source_ids,
+            figure_evidence_bundles,
+            evidence_registry,
+        )
+    except Exception as exc:
+        if not rollback_on_failure:
+            raise
+        diagnostics = []
+        evidence_by_id = _paper_evidence_by_id(evidence_registry)
+        for beat_specs in block_specs.values():
+            for spec in beat_specs:
+                diagnostics.append({
+                    "block_id": spec.get("block_id"),
+                    "evidence_ids": list(spec.get("evidence_ids") or []),
+                    "figure_ids": list(spec.get("figure_ids") or []),
+                    "source_paragraph_ids": list(spec.get("source_paragraph_ids") or []),
+                    "owners": [
+                        {
+                            "evidence_id": evidence_id,
+                            "owner_type": (
+                                "quantitative"
+                                if evidence_by_id.get(evidence_id, {}).get("anchors")
+                                else "contextual"
+                            ),
+                            "scope": evidence_by_id.get(evidence_id, {}).get("scope"),
+                            "source_paragraph_ids": evidence_by_id.get(evidence_id, {}).get("source_paragraph_ids"),
+                            "anchors": evidence_by_id.get(evidence_id, {}).get("anchors"),
+                        }
+                        for evidence_id in spec.get("evidence_ids") or []
+                        if evidence_id in evidence_by_id
+                    ],
+                })
+        logger.warning(
+            "PAPER %s rewrite rejected; retaining previous valid draft: %s; diagnostics=%s",
+            stage,
+            exc,
+            diagnostics,
+        )
+        return False, current_markdown
+    plan["sections"] = candidate_sections
+    return True, candidate_markdown
 
 
 def _paper_story_draft_blocks(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3539,7 +3664,7 @@ PAPER_STYLE_REVIEWER_PROMPT = (
     "检查完整正文是否像自然的science news/explainer，而不是论文Results、摘要扩写或图注翻译。"
     "只指出结果翻译腔、AI语气、机械对仗或转折、作者式第一人称、重复同构句式、方法/变量堆叠、生硬衔接，"
     "以及与范文语法、段落节奏、信息密度和叙事推进明显偏离的问题。不要评价或改动科学事实。"
-    "不要移动证据、调整block或section、修改Figure和anchor、改变来源、重排章节或新增科学结论。"
+    "不能移动证据、调整block或section、修改Figure和anchor、改变来源、重排章节或新增科学结论。"
     "每个问题只指定一个已有block；没有明确问题就返回空issues。每个block最多一个问题。"
     "返回严格JSON且只能包含issues字段："
     '{"issues":[{"block_id":"beat-1-block-1","issue":"...","instruction":"..."}]}'
@@ -3558,6 +3683,7 @@ PAPER_PLANNER_PROMPT = (
     "无独立主图的机制内容只能作为最相关Figure section中的2到3句解释，不要新建无图机制section；只有删除会造成明显科学逻辑断裂时才保留无图短过渡。"
     "role使用贴合论文的简洁自然标签，不要套固定taxonomy。只能引用输入registry中真实存在的evidence_id，不能生成或修改source provenance。"
     "每个finding都要有evidence_ids数组；不要返回anchors、source_paragraph_ids、source_sentence或scope，anchors和全部source provenance由Python registry推导。"
+    "涉及数字、百分比或统计量时，必须引用对应的quantitative evidence-anchor记录；evidence-source-source-*段落记录仅作上下文，anchors为空，不能替代数字owner。"
     "如果输入包含validation_feedback，必须优先修复其中指出的Figure、source或anchor归属，不能重复提交同一错误计划。"
     '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence_ids":["复制registry中的真实evidence_id"]}]}]}'
 )
@@ -3976,7 +4102,11 @@ def _generate_paper_article_markdown(
                     if str(value).strip()
                 )
             ),
-            "anchors": list(canonical.get("anchors") or finding.get("anchors") or []),
+            "anchors": [
+                str(anchor)
+                for anchor in canonical.get("anchors") or []
+                if str(anchor).strip()
+            ],
             "source_paragraph_ids": list(canonical.get("source_paragraph_ids") or []),
             "source_sentence": str(canonical.get("source_sentence") or ""),
             "scope": str(canonical.get("scope") or "section_context"),
@@ -3992,17 +4122,20 @@ def _generate_paper_article_markdown(
         settings.model_name,
         block_specs=block_specs,
     )
-    _paper_apply_story_output(
-        plan["sections"], story_output, evidence_map, evidence_registry, block_specs
-    )
-    draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
     try:
-        _validate_paper_evidence_plan(
+        _, draft = _paper_apply_story_candidate(
             plan,
-            draft,
+            story_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
-            evidence_registry,
+            "",
+            "story writer",
+            rollback_on_failure=False,
         )
     except RuntimeError as exc:
         if not any(
@@ -4027,16 +4160,19 @@ def _generate_paper_article_markdown(
             },
             block_specs=block_specs,
         )
-        _paper_apply_story_output(
-            plan["sections"], story_output, evidence_map, evidence_registry, block_specs
-        )
-        draft = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
-        _validate_paper_evidence_plan(
+        _, draft = _paper_apply_story_candidate(
             plan,
-            draft,
+            story_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
-            evidence_registry,
+            "",
+            "story writer retry",
+            rollback_on_failure=False,
         )
     logger.info("PAPER deterministic evidence validation passed")
     plan["story_writer_retry_count"] = story_writer_retry_count
@@ -4072,18 +4208,22 @@ def _generate_paper_article_markdown(
             {"style_lint": lint, **popular_feedback},
             block_specs=block_specs,
         )
-        _paper_apply_story_output(
-            plan["sections"], story_output, evidence_map, evidence_registry, block_specs
-        )
-        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
-        _validate_paper_evidence_plan(
+        accepted, candidate_markdown = _paper_apply_story_candidate(
             plan,
-            markdown,
+            story_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
-            evidence_registry,
+            markdown,
+            "popular style",
         )
-        logger.info("PAPER deterministic evidence validation passed")
+        if accepted:
+            markdown = candidate_markdown
+            logger.info("PAPER deterministic evidence validation passed")
         lint = _paper_ai_style_lint(markdown)
         popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
         popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
@@ -4104,7 +4244,15 @@ def _generate_paper_article_markdown(
         logger.warning("PAPER popular science audit unresolved after retry; continuing with warning")
 
     humanizer_baseline = markdown
-    humanized_output = _paper_humanize_story(
+
+    def safe_humanize(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        try:
+            return _paper_humanize_story(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("PAPER style rewrite generation failed; retaining prior draft: %s", exc)
+            return []
+
+    humanized_output = safe_humanize(
         client,
         story_plan,
         clean_evidence,
@@ -4113,18 +4261,49 @@ def _generate_paper_article_markdown(
         block_specs=block_specs,
         style_exemplar=style_exemplar,
     )
-    _paper_apply_story_output(
-        plan["sections"], humanized_output, evidence_map, evidence_registry, block_specs
-    )
-    markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
-    _validate_paper_evidence_plan(
+    accepted, candidate_markdown = _paper_apply_story_candidate(
         plan,
-        markdown,
+        humanized_output,
+        evidence_map,
+        evidence_registry,
+        block_specs,
+        display_title,
+        abstract_lead,
         valid_source_ids,
         figure_evidence_bundles if figure_first else None,
-        evidence_registry,
+        markdown,
+        "humanizer",
     )
-    logger.info("PAPER deterministic evidence validation passed")
+    if accepted:
+        markdown = candidate_markdown
+        logger.info("PAPER deterministic evidence validation passed")
+    else:
+        retry_output = safe_humanize(
+            client,
+            story_plan,
+            clean_evidence,
+            _paper_story_draft_blocks(plan["sections"]),
+            settings.model_name,
+            {"deterministic_validation": "The candidate dropped or changed a required hard anchor. Preserve every anchor exactly."},
+            block_specs=block_specs,
+            style_exemplar=style_exemplar,
+        )
+        accepted, candidate_markdown = _paper_apply_story_candidate(
+            plan,
+            retry_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+            markdown,
+            "humanizer retry",
+        )
+        if accepted:
+            markdown = candidate_markdown
+            logger.info("PAPER deterministic evidence validation passed")
 
     style_review: dict[str, Any] = {"issues": [], "status": "skipped"}
     try:
@@ -4153,7 +4332,7 @@ def _generate_paper_article_markdown(
             }
             for issue in review_issues
         }
-        reviewed_output = _paper_humanize_story(
+        reviewed_output = safe_humanize(
             client,
             story_plan,
             clean_evidence,
@@ -4164,19 +4343,52 @@ def _generate_paper_article_markdown(
             target_block_ids=review_targets,
             feedback_by_block=review_feedback,
         )
-        _paper_apply_story_output(
-            plan["sections"], reviewed_output, evidence_map, evidence_registry, block_specs
-        )
-        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
-        _validate_paper_evidence_plan(
+        accepted, candidate_markdown = _paper_apply_story_candidate(
             plan,
-            markdown,
+            reviewed_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
-            evidence_registry,
+            markdown,
+            "style reviewer",
         )
-        logger.info("PAPER deterministic evidence validation passed")
-        style_review["rewritten_block_ids"] = sorted(review_targets)
+        if not accepted:
+            reviewed_output = safe_humanize(
+                client,
+                story_plan,
+                clean_evidence,
+                _paper_story_draft_blocks(plan["sections"]),
+                settings.model_name,
+                {"style_review": review_feedback},
+                block_specs=block_specs,
+                style_exemplar=style_exemplar,
+                target_block_ids=review_targets,
+                feedback_by_block=review_feedback,
+            )
+            accepted, candidate_markdown = _paper_apply_story_candidate(
+                plan,
+                reviewed_output,
+                evidence_map,
+                evidence_registry,
+                block_specs,
+                display_title,
+                abstract_lead,
+                valid_source_ids,
+                figure_evidence_bundles if figure_first else None,
+                markdown,
+                "style reviewer retry",
+            )
+        if accepted:
+            markdown = candidate_markdown
+            logger.info("PAPER deterministic evidence validation passed")
+            style_review["rewritten_block_ids"] = sorted(review_targets)
+        else:
+            style_review["status"] = "warning"
+            style_review["rollback"] = True
     plan["style_review"] = style_review
 
     final_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
@@ -4199,7 +4411,7 @@ def _generate_paper_article_markdown(
         )
     ):
         humanizer_retry_count = 1
-        targeted_output = _paper_humanize_story(
+        targeted_output = safe_humanize(
             client,
             story_plan,
             clean_evidence,
@@ -4210,18 +4422,47 @@ def _generate_paper_article_markdown(
             style_exemplar=style_exemplar,
             target_block_ids=humanizer_targets,
         )
-        _paper_apply_story_output(
-            plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
-        )
-        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
-        _validate_paper_evidence_plan(
+        accepted, candidate_markdown = _paper_apply_story_candidate(
             plan,
-            markdown,
+            targeted_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
-            evidence_registry,
+            markdown,
+            "targeted humanizer",
         )
-        logger.info("PAPER deterministic evidence validation passed")
+        if not accepted:
+            targeted_output = safe_humanize(
+                client,
+                story_plan,
+                clean_evidence,
+                _paper_story_draft_blocks(plan["sections"]),
+                settings.model_name,
+                {"deterministic_validation": final_humanizer_feedback},
+                block_specs=block_specs,
+                style_exemplar=style_exemplar,
+                target_block_ids=humanizer_targets,
+            )
+            accepted, candidate_markdown = _paper_apply_story_candidate(
+                plan,
+                targeted_output,
+                evidence_map,
+                evidence_registry,
+                block_specs,
+                display_title,
+                abstract_lead,
+                valid_source_ids,
+                figure_evidence_bundles if figure_first else None,
+                markdown,
+                "targeted humanizer retry",
+            )
+        if accepted:
+            markdown = candidate_markdown
+            logger.info("PAPER deterministic evidence validation passed")
         final_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
         final_humanizer_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
             humanizer_baseline,
@@ -4235,7 +4476,7 @@ def _generate_paper_article_markdown(
     stop_slop_targets = _paper_style_issue_block_ids(plan["sections"])
     if stop_slop_feedback["issue_count"] and stop_slop_targets:
         stop_slop_retry_count = 1
-        targeted_output = _paper_humanize_story(
+        targeted_output = safe_humanize(
             client,
             story_plan,
             clean_evidence,
@@ -4246,18 +4487,47 @@ def _generate_paper_article_markdown(
             style_exemplar=style_exemplar,
             target_block_ids=stop_slop_targets,
         )
-        _paper_apply_story_output(
-            plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
-        )
-        markdown = _paper_assemble_markdown(display_title, abstract_lead, plan["sections"])
-        _validate_paper_evidence_plan(
+        accepted, candidate_markdown = _paper_apply_story_candidate(
             plan,
-            markdown,
+            targeted_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
-            evidence_registry,
+            markdown,
+            "stop-slop",
         )
-        logger.info("PAPER deterministic evidence validation passed")
+        if not accepted:
+            targeted_output = safe_humanize(
+                client,
+                story_plan,
+                clean_evidence,
+                _paper_story_draft_blocks(plan["sections"]),
+                settings.model_name,
+                {"stop_slop": stop_slop_feedback, "deterministic_validation": "Preserve every hard anchor exactly."},
+                block_specs=block_specs,
+                style_exemplar=style_exemplar,
+                target_block_ids=stop_slop_targets,
+            )
+            accepted, candidate_markdown = _paper_apply_story_candidate(
+                plan,
+                targeted_output,
+                evidence_map,
+                evidence_registry,
+                block_specs,
+                display_title,
+                abstract_lead,
+                valid_source_ids,
+                figure_evidence_bundles if figure_first else None,
+                markdown,
+                "stop-slop retry",
+            )
+        if accepted:
+            markdown = candidate_markdown
+            logger.info("PAPER deterministic evidence validation passed")
         stop_slop_feedback = _paper_stop_slop_audit(markdown)
     plan["stop_slop_audit"] = {
         **stop_slop_feedback,
@@ -4291,9 +4561,14 @@ def _generate_paper_article_markdown(
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)
     final_lint = _paper_ai_style_lint(markdown)
+    final_author_rewrite_rolled_back = False
     if final_lint.get("作者式第一人称", 0):
         logger.warning("PAPER final body contains author voice; triggering targeted rewrite")
-        targeted_output = _paper_humanize_story(
+        author_baseline_sections = copy.deepcopy(plan["sections"])
+        author_baseline_markdown = markdown
+        author_baseline_lint = dict(final_lint)
+        author_targets = _paper_style_issue_block_ids(plan["sections"])
+        targeted_output = safe_humanize(
             client,
             story_plan,
             clean_evidence,
@@ -4302,21 +4577,67 @@ def _generate_paper_article_markdown(
             {"author_voice": final_lint},
             block_specs=block_specs,
             style_exemplar=style_exemplar,
-            target_block_ids=_paper_style_issue_block_ids(plan["sections"]),
+            target_block_ids=author_targets,
         )
-        _paper_apply_story_output(
-            plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
-        )
-        markdown = _normalize_article_markdown(
-            _remove_unverified_paper_quotes(
-                _paper_assemble_markdown(display_title, abstract_lead, plan["sections"]),
-                paper_text,
-            ),
+        accepted, candidate_markdown = _paper_apply_story_candidate(
+            plan,
+            targeted_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
             display_title,
+            abstract_lead,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+            markdown,
+            "author-voice",
         )
-        final_lint = _paper_ai_style_lint(markdown)
+        if not accepted:
+            targeted_output = safe_humanize(
+                client,
+                story_plan,
+                clean_evidence,
+                _paper_story_draft_blocks(plan["sections"]),
+                settings.model_name,
+                {"author_voice": final_lint, "deterministic_validation": "Preserve every hard anchor exactly."},
+                block_specs=block_specs,
+                style_exemplar=style_exemplar,
+                target_block_ids=author_targets,
+            )
+            accepted, candidate_markdown = _paper_apply_story_candidate(
+                plan,
+                targeted_output,
+                evidence_map,
+                evidence_registry,
+                block_specs,
+                display_title,
+                abstract_lead,
+                valid_source_ids,
+                figure_evidence_bundles if figure_first else None,
+                markdown,
+                "author-voice retry",
+            )
+        if accepted:
+            candidate_markdown = _normalize_article_markdown(
+                _remove_unverified_paper_quotes(candidate_markdown, paper_text),
+                display_title,
+            )
+            candidate_lint = _paper_ai_style_lint(candidate_markdown)
+            if candidate_lint.get("作者式第一人称", 0):
+                logger.warning(
+                    "PAPER final author-voice rewrite did not clear author voice; rolling back"
+                )
+                plan["sections"] = author_baseline_sections
+                markdown = author_baseline_markdown
+                final_lint = author_baseline_lint
+                final_author_rewrite_rolled_back = True
+            else:
+                markdown = candidate_markdown
+                final_lint = candidate_lint
+        else:
+            final_author_rewrite_rolled_back = True
     plan["final_style_lint"] = final_lint
-    if final_lint.get("作者式第一人称", 0):
+    if final_lint.get("作者式第一人称", 0) and not final_author_rewrite_rolled_back:
         raise RuntimeError("PAPER author voice lint failed after targeted rewrite")
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")

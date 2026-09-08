@@ -91,6 +91,7 @@ from writer.llm import (
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
     _paper_apply_story_output,
+    _paper_apply_story_candidate,
     _paper_body_length_audit,
     _paper_chinese_char_count,
     _paper_canonical_evidence_registry,
@@ -106,6 +107,7 @@ from writer.llm import (
     _paper_figure_evidence_bundles,
     _paper_readability_audit,
     _paper_stop_slop_audit,
+    _paper_stable_evidence_id,
     _paper_style_exemplar,
     _paper_title_style_lint,
     _paper_story_sections,
@@ -2316,6 +2318,146 @@ class V1Tests(unittest.TestCase):
         self.assertIn("r = 0.73", records[0]["source_sentence"])
         self.assertEqual(records[0]["scope"], "section_context")
 
+    def test_paper_canonical_registry_assigns_quantitative_ownership_once(self):
+        source_paragraphs = [{"id": "source-52", "text": "The model agreement reaches 80 % in this case."}]
+        registry = _paper_canonical_evidence_registry(source_paragraphs, [])
+        generic = next(record for record in registry if record["evidence_id"] == "evidence-source-source-52")
+        owners = [record for record in registry if "80%" in record["normalized_value"] and record.get("anchors")]
+        self.assertEqual(generic["anchors"], [])
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(owners[0]["source_paragraph_ids"], ["source-52"])
+        self.assertEqual(owners[0]["anchors"], ["80 %"])
+
+    def test_paper_canonical_registry_deduplicates_same_provenance_owner(self):
+        source_paragraphs = [
+            {"id": "source-0", "text": "Abstract context."},
+            {"id": "source-52", "text": "The model agreement reaches 80 % in this case."},
+        ]
+        bundles = [{"provenance": [
+            {
+                "value": "80 %", "normalized_value": "80%",
+                "source_paragraph_ids": ["source-52"],
+                "source_sentence": "The model agreement reaches 80 % in this case.",
+                "scope": "figure_specific", "supported_figures": ["Fig. 2"],
+            },
+        ]}]
+        registry = _paper_canonical_evidence_registry(source_paragraphs, bundles)
+        owners = [record for record in registry if record.get("anchors")]
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(owners[0]["evidence_id"], _paper_stable_evidence_id("anchor", "80%", ("source-52",), "figure_specific", ("Fig. 2",)))
+
+    def test_paper_canonical_registry_keeps_same_value_from_distinct_sources(self):
+        source_paragraphs = [
+            {"id": "source-A", "text": "Evidence A reports 80 %."},
+            {"id": "source-B", "text": "Evidence B reports 80 %."},
+        ]
+        registry = _paper_canonical_evidence_registry(source_paragraphs, [])
+        owners = [record for record in registry if record.get("anchors")]
+        self.assertEqual({tuple(record["source_paragraph_ids"]) for record in owners}, {("source-A",), ("source-B",)})
+
+    def test_paper_style_candidate_rolls_back_anchor_loss_and_keeps_metadata(self):
+        registry = [{
+            "evidence_id": "evidence-anchor", "value": "80 %", "normalized_value": "80%",
+            "source_paragraph_ids": ["source-52"], "source_sentence": "Evidence reports 80 %.",
+            "scope": "section_context", "supported_figures": [], "anchors": ["80 %"],
+        }]
+        section = {
+            "id": "beat-1", "title": "结果", "role": "result", "figure_ids": [],
+            "source_paragraph_ids": ["source-52"],
+            "findings": [{"id": "finding-1", "evidence_ids": ["evidence-anchor"]}],
+            "story_beat": {"evidence_ids": ["evidence-anchor"]},
+            "blocks": [{"id": "beat-1-block-1", "evidence_ids": ["evidence-anchor"],
+                        "figure_ids": [], "source_paragraph_ids": ["source-52"],
+                        "text": "结果为80 %。"}],
+        }
+        plan = {"sections": [section], "story_evidence": {
+            "evidence-anchor": {"figure_ids": [], "anchors": ["80 %"], "source_paragraph_ids": ["source-52"]}
+        }}
+        evidence_map = {"evidence-anchor": (section, section["findings"][0])}
+        block_specs = {"beat-1": [{"block_id": "beat-1-block-1", "evidence_ids": ["evidence-anchor"], "figure_ids": [], "source_paragraph_ids": ["source-52"]}]}
+        baseline = copy.deepcopy(plan["sections"])
+        for candidate_text in ("结果显著增加。", "结果约八成。"):
+            accepted, markdown = _paper_apply_story_candidate(
+                plan,
+                [{"id": "beat-1", "title": "结果", "blocks": [{
+                    "block_id": "beat-1-block-1", "text": candidate_text,
+                }]}],
+                evidence_map, registry, block_specs, "标题", "摘要",
+                {"source-52"}, None, "# 标题\n\n## 结果\n\n结果为80 %。", "humanizer",
+            )
+            self.assertFalse(accepted)
+            self.assertEqual(markdown, "# 标题\n\n## 结果\n\n结果为80 %。")
+            self.assertEqual(plan["sections"], baseline)
+        accepted, markdown = _paper_apply_story_candidate(
+            plan,
+            [{"id": "beat-1", "title": "结果", "blocks": [{
+                "block_id": "wrong-block", "text": "结果为80 %。",
+            }]}],
+            evidence_map, registry, block_specs, "标题", "摘要",
+            {"source-52"}, None, "# 标题\n\n## 结果\n\n结果为80 %。", "style reviewer",
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(markdown, "# 标题\n\n## 结果\n\n结果为80 %。")
+        self.assertEqual(plan["sections"], baseline)
+
+    def test_paper_style_candidate_commits_valid_anchor_and_python_metadata(self):
+        registry = [{
+            "evidence_id": "evidence-anchor", "value": "80 %", "normalized_value": "80%",
+            "source_paragraph_ids": ["source-52"], "source_sentence": "Evidence reports 80 %.",
+            "scope": "section_context", "supported_figures": [], "anchors": ["80 %"],
+        }]
+        section = {
+            "id": "beat-1", "title": "结果", "role": "result", "figure_ids": [],
+            "source_paragraph_ids": ["source-52"],
+            "findings": [{"id": "finding-1", "evidence_ids": ["evidence-anchor"]}],
+            "story_beat": {"evidence_ids": ["evidence-anchor"]},
+            "blocks": [{"id": "beat-1-block-1", "evidence_ids": ["evidence-anchor"],
+                        "figure_ids": [], "source_paragraph_ids": ["source-52"],
+                        "text": "结果为80 %。"}],
+        }
+        plan = {"sections": [section], "story_evidence": {
+            "evidence-anchor": {"figure_ids": [], "anchors": ["80 %"], "source_paragraph_ids": ["source-52"]}
+        }}
+        accepted, markdown = _paper_apply_story_candidate(
+            plan,
+            [{"id": "beat-1", "title": "结果", "blocks": [{
+                "block_id": "beat-1-block-1", "text": "结果仍为80 %。",
+                # Model metadata must never override the Python-owned binding.
+                "evidence_ids": ["rogue-evidence"],
+                "figure_ids": ["Fig. 99"],
+                "source_paragraph_ids": ["source-rogue"],
+            }]}],
+            {"evidence-anchor": (section, section["findings"][0])}, registry,
+            {"beat-1": [{"block_id": "beat-1-block-1", "evidence_ids": ["evidence-anchor"], "figure_ids": [], "source_paragraph_ids": ["source-52"]}]},
+            "标题", "摘要", {"source-52"}, None, "# 标题\n\n## 结果\n\n结果为80 %。", "humanizer",
+        )
+        self.assertTrue(accepted)
+        self.assertIn("结果仍为80 %", markdown)
+        self.assertEqual(plan["sections"][0]["blocks"][0]["evidence_ids"], ["evidence-anchor"])
+        self.assertEqual(plan["sections"][0]["blocks"][0]["source_paragraph_ids"], ["source-52"])
+
+    def test_paper_canonical_owner_anchor_is_required_in_bound_block(self):
+        registry = [{
+            "evidence_id": "evidence-anchor", "value": "80 %", "normalized_value": "80%",
+            "source_paragraph_ids": ["source-52"], "source_sentence": "Evidence reports 80 %.",
+            "scope": "section_context", "supported_figures": [], "anchors": ["80 %"],
+        }]
+        section = {
+            "id": "beat-1", "title": "结果", "role": "result", "figure_ids": [],
+            "source_paragraph_ids": ["source-52"],
+            "findings": [{"id": "finding-1", "evidence_ids": ["evidence-anchor"]}],
+            "story_beat": {"evidence_ids": ["evidence-anchor"]},
+            "blocks": [{"id": "beat-1-block-1", "evidence_ids": ["evidence-anchor"],
+                        "source_paragraph_ids": ["source-52"], "text": "结果为80 %。"}],
+        }
+        plan = {"sections": [section], "story_evidence": {
+            "evidence-anchor": {"figure_ids": [], "anchors": ["80 %"], "source_paragraph_ids": ["source-52"]}
+        }}
+        _validate_paper_evidence_plan(plan, "# 标题\n\n## 结果\n\n结果为80 %。", {"source-52"}, evidence_registry=registry)
+        section["blocks"][0]["text"] = "结果显著增加。"
+        with self.assertRaisesRegex(RuntimeError, "anchor missing from bound block"):
+            _validate_paper_evidence_plan(plan, "# 标题\n\n## 结果\n\n结果显著增加。", {"source-52"}, evidence_registry=registry)
+
     def test_paper_caption_provenance_stays_out_of_source_paragraph_ids(self):
         source_paragraphs = [{
             "id": "source-figure-3",
@@ -3349,6 +3491,8 @@ class V1Tests(unittest.TestCase):
         self.assertIn("结论和方法的先后以自然表达为准", PAPER_STORY_PLANNER_PROMPT)
         self.assertIn("style_exemplar中的范文原文是主要写作参考", PAPER_STORY_PLANNER_PROMPT)
         self.assertIn("style corpus自然组织", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("quantitative evidence-anchor", PAPER_PLANNER_PROMPT)
+        self.assertIn("仅作上下文", PAPER_PLANNER_PROMPT)
         self.assertIn("style_exemplar中的范文原文是主要写作参考", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("style_exemplar中的范文原文是主要写作参考", PAPER_HUMANIZER_PROMPT)
         self.assertIn("非本领域专家", PAPER_STORY_PLANNER_PROMPT)
