@@ -2552,6 +2552,171 @@ class V1Tests(unittest.TestCase):
                 evidence_registry=registry,
             )
 
+    def test_paper_canonical_unique_anchor_without_bundle_metadata_has_no_unbound_local(self):
+        registry = [{
+            "evidence_id": "evidence-unique",
+            "value": "80 %",
+            "normalized_value": "80%",
+            "source_paragraph_ids": ["source-A"],
+            "source_sentence": "Evidence reports 80 %.",
+            "scope": "section_context",
+            "supported_figures": [],
+            "anchors": ["80 %"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-A",
+                "title": "结果A",
+                "role": "result",
+                "figure_ids": [],
+                "source_paragraph_ids": ["source-A"],
+                "findings": [{
+                    "id": "finding-A",
+                    "evidence_ids": ["evidence-unique"],
+                    "anchors": ["80 %"],
+                }],
+            }]
+        }
+        _validate_paper_evidence_plan(
+            plan,
+            "# 标题\n\n## 结果A\n\n结果为80 %。",
+            {"source-A"},
+            evidence_registry=registry,
+        )
+
+    def test_paper_canonical_section_context_anchor_uses_section_location(self):
+        registry = [
+            {
+                "evidence_id": "evidence-context",
+                "value": "80 %",
+                "normalized_value": "80%",
+                "source_paragraph_ids": ["source-A"],
+                "source_sentence": "Evidence reports 80 %.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": ["80 %"],
+            },
+            {
+                "evidence_id": "evidence-other",
+                "value": "other",
+                "normalized_value": "other",
+                "source_paragraph_ids": ["source-B"],
+                "source_sentence": "Other evidence.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": [],
+            },
+        ]
+        bundles = [{
+            "figure_id": "Fig. 1",
+            "provenance": [{
+                "normalized_value": "80%",
+                "value": "80 %",
+                "source_paragraph_ids": ["source-A"],
+                "scope": "section_context",
+                "supported_figures": [],
+            }],
+        }]
+
+        def make_plan(context_index):
+            evidence_by_section = (
+                [["evidence-context"], ["evidence-other"]]
+                if context_index == 0
+                else [["evidence-other"], ["evidence-context"]]
+            )
+            sections = []
+            for index, evidence_ids in enumerate(evidence_by_section):
+                sections.append({
+                    "id": f"section-{index + 1}",
+                    "title": f"结果{index + 1}",
+                    "role": "result",
+                    "figure_ids": ["Fig. 1"],
+                    "source_paragraph_ids": [
+                        "source-A" if "evidence-context" in evidence_ids else "source-B"
+                    ],
+                    "findings": [{
+                        "id": f"finding-{index + 1}",
+                        "evidence_ids": evidence_ids,
+                        "anchors": ["80 %"] if index == context_index else [],
+                    }],
+                })
+            return {"sections": sections}
+
+        markdown = "# 标题\n\n## 结果1\n\n结果为80 %。\n\n## 结果2\n\n其他证据。"
+        _validate_paper_evidence_plan(
+            make_plan(0), markdown, {"source-A", "source-B"}, bundles, registry
+        )
+        with self.assertRaisesRegex(RuntimeError, "evidence section mismatch"):
+            _validate_paper_evidence_plan(
+                make_plan(1), markdown, {"source-A", "source-B"}, bundles, registry
+            )
+
+    def test_paper_canonical_figure_anchor_keeps_block_and_figure_hard_failures(self):
+        registry = [{
+            "evidence_id": "evidence-figure",
+            "value": "80 %",
+            "normalized_value": "80%",
+            "source_paragraph_ids": ["source-F"],
+            "source_sentence": "Figure evidence reports 80 %.",
+            "scope": "figure_specific",
+            "supported_figures": ["Fig. 2"],
+            "anchors": ["80 %"],
+        }]
+        bundles = [{"figure_id": "Fig. 2", "quantitative_anchors": ["80 %"]}]
+
+        def make_plan(block_text, figure_id="Fig. 2"):
+            return {
+                "sections": [{
+                    "id": "section-1",
+                    "title": "结果",
+                    "role": "result",
+                    "figure_ids": ["Fig. 2"],
+                    "source_paragraph_ids": ["source-F"],
+                    "findings": [{
+                        "id": "finding-1",
+                        "figure_ids": ["Fig. 2"],
+                        "evidence_ids": ["evidence-figure"],
+                        "anchors": ["80 %"],
+                    }],
+                    "story_beat": {"evidence_ids": ["evidence-figure"]},
+                    "blocks": [{
+                        "id": "block-1",
+                        "evidence_ids": ["evidence-figure"],
+                        "figure_ids": [figure_id],
+                        "source_paragraph_ids": ["source-F"],
+                        "text": block_text,
+                    }],
+                }],
+                "story_evidence": {
+                    "evidence-figure": {
+                        "figure_ids": ["Fig. 2"],
+                        "anchors": ["80 %"],
+                        "source_paragraph_ids": ["source-F"],
+                    }
+                },
+            }
+
+        markdown = "# 标题\n\n## 结果\n\n结果为80 %。"
+        _validate_paper_evidence_plan(
+            make_plan("结果为80 %。"), markdown, {"source-F"}, bundles, registry
+        )
+        with self.assertRaisesRegex(RuntimeError, "anchor missing from bound block"):
+            _validate_paper_evidence_plan(
+                make_plan("结果待补充。"),
+                "# 标题\n\n## 结果\n\n结果待补充。",
+                {"source-F"},
+                bundles,
+                registry,
+            )
+        with self.assertRaisesRegex(RuntimeError, "evidence block figure mismatch"):
+            _validate_paper_evidence_plan(
+                make_plan("结果为80 %。", "Fig. 3"),
+                markdown,
+                {"source-F"},
+                bundles,
+                registry,
+            )
+
     def test_paper_canonical_section_source_order_is_registry_order(self):
         registry = [
             {

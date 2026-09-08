@@ -670,7 +670,8 @@ def _paper_validate_story_blocks(
                 ):
                     continue
                 anchor_records = provenance_by_anchor.get(normalized_anchor, [])
-                figure_specific = bool(supported_figures_by_anchor.get(normalized_anchor)) or any(
+                supported_figures = supported_figures_by_anchor.get(normalized_anchor, set())
+                figure_specific = bool(supported_figures) or any(
                     record.get("scope") == "figure_specific" for record in anchor_records
                 )
                 owning_blocks = blocks_by_evidence.get(evidence_id, [])
@@ -865,6 +866,8 @@ def _validate_paper_evidence_plan(
                 continue
             for anchor in anchors:
                 normalized_anchor = _normalize_evidence_anchor(str(anchor))
+                anchor_records = provenance_by_anchor.get(normalized_anchor, [])
+                supported_figures = supported_figures_by_anchor.get(normalized_anchor, set())
                 if (
                     not normalized_anchor
                     or re.fullmatch(r"[Pp][<>=]\d+(?:\.\d+)?", normalized_anchor)
@@ -872,7 +875,6 @@ def _validate_paper_evidence_plan(
                 ):
                     continue
                 if bundles_by_id:
-                    supported_figures = supported_figures_by_anchor.get(normalized_anchor, set())
                     if supported_figures:
                         if not set(finding_figure_ids).intersection(supported_figures):
                             raise RuntimeError(
@@ -883,7 +885,7 @@ def _validate_paper_evidence_plan(
                     else:
                         contextual_records = [
                             record
-                            for record in provenance_by_anchor.get(normalized_anchor, [])
+                            for record in anchor_records
                             if record.get("scope") == "section_context"
                         ]
                         if contextual_records:
@@ -910,7 +912,7 @@ def _validate_paper_evidence_plan(
                     duplicate_anchor = len(anchor_evidence_ids.get(normalized_anchor, set())) > 1
                     if bound_evidence_ids and (
                         duplicate_anchor
-                        or bool(supported_figures_by_anchor.get(normalized_anchor))
+                        or bool(supported_figures)
                         or any(record.get("scope") == "figure_specific" for record in anchor_records)
                     ):
                         # Block validation above has already checked the anchor
@@ -923,9 +925,8 @@ def _validate_paper_evidence_plan(
                     for index, (_, body) in enumerate(sections)
                     if normalized_anchor in _normalize_evidence_anchor(body)
                 ]
-                anchor_records = provenance_by_anchor.get(normalized_anchor, [])
                 if not actual_indexes:
-                    is_figure_specific = bool(supported_figures_by_anchor.get(normalized_anchor)) or any(
+                    is_figure_specific = bool(supported_figures) or any(
                         record.get("scope") == "figure_specific" for record in anchor_records
                     )
                     if is_figure_specific:
