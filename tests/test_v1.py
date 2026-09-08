@@ -106,7 +106,6 @@ from writer.llm import (
     _paper_readability_audit,
     _paper_stop_slop_audit,
     _paper_style_exemplar,
-    _paper_style_fragments_for_prompt,
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
@@ -2831,7 +2830,7 @@ class V1Tests(unittest.TestCase):
         clean_counts = _paper_ai_style_lint("森林变化解释了模式差异。未来投影仍有不确定性。")
         self.assertFalse(_paper_ai_style_lint_failed(clean_counts))
 
-    def test_paper_style_exemplar_uses_curated_compact_package(self):
+    def test_paper_style_exemplar_loads_every_arbitrary_markdown_document(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             exemplar_dir = root / "writer" / "exemplars"
@@ -2841,9 +2840,22 @@ class V1Tests(unittest.TestCase):
             )
             for index in range(1, 6):
                 (exemplar_dir / f"exemplar_{index:02d}.md").write_text(
-                    f"# 范文{index}\n\n导语标记{index}。\n\n正文标记{index}。\n\n过渡标记{index}。",
+                    f"# 范文{index}\n\n完整正文标记{index}。\n\n结尾标记{index}。",
                     encoding="utf-8",
                 )
+            (exemplar_dir / "new_voice.md").write_text(
+                "# 新增范文\n\n任意文件名也应自动进入语料库。\n\n新增结尾。",
+                encoding="utf-8",
+            )
+            nested = exemplar_dir / "archive"
+            nested.mkdir()
+            (nested / "field_notes.md").write_text(
+                "# 嵌套范文\n\n嵌套目录中的正文也应自动进入语料库。",
+                encoding="utf-8",
+            )
+            (exemplar_dir / "README.md").write_text(
+                "说明文件不属于正文语料。", encoding="utf-8"
+            )
             historical = root / "articles" / "paper" / "old"
             historical.mkdir(parents=True)
             (historical / "article.md").write_text(
@@ -2853,31 +2865,83 @@ class V1Tests(unittest.TestCase):
                 package = _paper_style_exemplar()
         self.assertIn("规则标记", package)
         for index in range(1, 6):
-            self.assertIn(f"exemplar_{index:02d}", package)
-            self.assertIn(f"导语标记{index}", package)
+            self.assertIn(f"范文文件：exemplar_{index:02d}.md", package)
+            self.assertIn(f"完整正文标记{index}", package)
+        self.assertIn("范文文件：new_voice.md", package)
+        self.assertIn("任意文件名也应自动进入语料库", package)
+        self.assertIn("嵌套范文", package)
+        self.assertIn("嵌套目录中的正文也应自动进入语料库", package)
+        self.assertNotIn("说明文件不属于正文语料", package)
         self.assertNotIn("不应被读取的历史文章标记", package)
-        self.assertLess(len(package), 4000)
 
-    def test_paper_style_exemplar_is_shorter_than_full_exemplars(self):
+    def test_paper_style_exemplar_passes_small_corpus_in_full(self):
         project_root = Path(__file__).resolve().parents[1]
         exemplar_dir = project_root / "writer" / "exemplars"
         package = _paper_style_exemplar()
-        full_size = sum(
-            path.stat().st_size
-            for path in exemplar_dir.glob("exemplar_*.md")
-        )
-        self.assertGreater(full_size, 0)
-        self.assertLess(len(package.encode("utf-8")), full_size)
-        self.assertIn("STYLE_GUIDE", package)
+        for path in sorted(exemplar_dir.glob("exemplar_*.md")):
+            text = path.read_text(encoding="utf-8").strip()
+            self.assertIn(text, package)
+        self.assertIn("STYLE_GUIDE（辅助规则", package)
+        self.assertIn("STYLE CORPUS（主要参考", package)
 
-    def test_paper_writer_style_payload_selects_only_two_excerpts(self):
+    def test_paper_style_exemplar_compresses_large_corpus_deterministically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exemplar_dir = root / "writer" / "exemplars"
+            exemplar_dir.mkdir(parents=True)
+            (exemplar_dir / "STYLE_GUIDE.md").write_text("辅助规则。", encoding="utf-8")
+            for index in range(6):
+                (exemplar_dir / f"voice_{index}.md").write_text(
+                    f"# 标题{index}\n\n开头标记{index}。\n\n"
+                    + (f"正文标记{index}。\n" * 20)
+                    + f"\n结尾标记{index}。",
+                    encoding="utf-8",
+                )
+            with patch("writer.llm.PROJECT_ROOT", root), patch(
+                "writer.llm._PAPER_STYLE_CORPUS_CHAR_BUDGET", 1200
+            ):
+                package = _paper_style_exemplar()
+        for index in range(6):
+            self.assertIn(f"范文文件：voice_{index}.md", package)
+            self.assertIn(f"标题{index}", package)
+            self.assertIn(f"开头标记{index}", package)
+            self.assertIn(f"结尾标记{index}", package)
+        self.assertLessEqual(package.count("范文文件："), 6)
+
+    def test_paper_style_payload_is_the_same_corpus_for_each_beat(self):
         package = _paper_style_exemplar()
-        selected = _paper_style_fragments_for_prompt(package, "beat-2")
-        self.assertIn("STYLE_GUIDE", selected)
-        self.assertEqual(
-            re.findall(r"(?m)^exemplar_\d+$", selected),
-            ["exemplar_02", "exemplar_03"],
-        )
+        client = MagicMock()
+        payloads = []
+        for beat_id in ("beat-1", "beat-2"):
+            story_plan = _story_plan_for_evidence(1)
+            story_plan["story_beats"][0]["id"] = beat_id
+            client.chat.completions.create.return_value = SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                    "sections": [{
+                        "id": beat_id,
+                        "title": "科学结果",
+                        "blocks": [{
+                            "block_id": f"{beat_id}-block-1",
+                            "text": "森林变化解释了模式差异。",
+                        }],
+                    }]
+                }, ensure_ascii=False)))]
+            )
+            _paper_story_writer(
+                client,
+                story_plan,
+                [{
+                    "evidence_id": "evidence-1",
+                    "evidence_group": "context",
+                    "anchors": [],
+                }],
+                package,
+                "test-model",
+            )
+            payloads.append(json.loads(
+                client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+            )["style_exemplar"])
+        self.assertEqual(payloads, [package, package])
 
     def test_paper_ai_style_lint_covers_requested_templates(self):
         phrases = (
@@ -2888,6 +2952,24 @@ class V1Tests(unittest.TestCase):
         for phrase in phrases:
             self.assertEqual(counts[phrase], 1)
         self.assertTrue(_paper_ai_style_lint_failed(counts))
+
+    def test_paper_ai_style_lint_flags_author_voice_only_in_body(self):
+        markdown = (
+            "# 我们发现了新的结果\n\n"
+            "## 科学结果\n\n我们展示了敏感性试验的结果。"
+        )
+        counts = _paper_ai_style_lint(markdown)
+        self.assertEqual(counts["作者式第一人称"], 1)
+        self.assertTrue(_paper_ai_style_lint_failed(counts))
+        quoted = (
+            "# 我们发现了新的结果\n\n"
+            "## 科学结果\n\n英文原文为: We show the result."
+        )
+        self.assertEqual(_paper_ai_style_lint(quoted)["作者式第一人称"], 0)
+
+    def test_paper_stop_slop_audit_reports_author_voice(self):
+        audit = _paper_stop_slop_audit("## 结果\n\n我们使用了敏感性试验。")
+        self.assertIn("author_voice", {issue["type"] for issue in audit["issues"]})
 
     def test_paper_stop_slop_audit_catches_repeated_paragraph_openings(self):
         markdown = (
@@ -2912,6 +2994,10 @@ class V1Tests(unittest.TestCase):
         self.assertIn("不要写成论文Results", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("营销型自媒体", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("Results转述", PAPER_HUMANIZER_PROMPT)
+        for prompt in (PAPER_STORY_WRITER_PROMPT, PAPER_HUMANIZER_PROMPT):
+            self.assertIn("第三方科学公众号编辑", prompt)
+            self.assertIn("我们展示", prompt)
+            self.assertIn("英文原文引用和论文题目保持原样", prompt)
 
     def test_paper_story_writer_audit_allows_one_retry(self):
         responses = [
@@ -3271,16 +3357,19 @@ class V1Tests(unittest.TestCase):
         story_plan = _story_plan_for_evidence(1)
         clean_evidence = [{"evidence_id": "evidence-1", "evidence_group": "evidence_group_A", "anchors": ["R = 0.71"]}]
         from writer.llm import _paper_humanize_story
+        package = _paper_style_exemplar()
         _paper_humanize_story(
             client,
             story_plan,
             clean_evidence,
             [{"beat_id": "beat-1", "blocks": [{"block_id": "beat-1-block-1", "text": "R = 0.71。"}]}],
             "test-model",
+            style_exemplar=package,
         )
         payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
         self.assertIn("current_block", payload)
         self.assertIn("clean_evidence", payload)
+        self.assertEqual(payload["style_exemplar"], package)
         self.assertNotIn("draft_blocks_by_beat", payload)
         self.assertNotIn("abstract", payload)
         self.assertNotIn("beat-2", json.dumps(payload, ensure_ascii=False))
@@ -3319,6 +3408,7 @@ class V1Tests(unittest.TestCase):
         self.assertIn("Story Writer", PAPER_STORY_WRITER_PROMPT)
         self.assertIn("按证据需要保持紧凑", PAPER_STORY_WRITER_PROMPT)
         self.assertNotIn("每个beat固定", PAPER_STORY_WRITER_PROMPT)
+        self.assertIn("第三方科学公众号编辑", PAPER_POPULAR_SCIENCE_EDITOR_PROMPT)
 
     def test_paper_popular_editor_anchor_audit_preserves_section_mapping(self):
         plan = {

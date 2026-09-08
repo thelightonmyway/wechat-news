@@ -1220,67 +1220,101 @@ def prune_paper_sections_after_allocation(
     return {"pruned": [section.get("id", "") for section in pruned_sections], "retained_without_figure": retained_without_figure}
 
 
+_PAPER_STYLE_CORPUS_CHAR_BUDGET = 30000
+_PAPER_STYLE_DOCUMENT_EXCLUSIONS = frozenset({
+    "readme.md",
+    "style_guide.md",
+    "guide.md",
+    "instructions.md",
+    "notes.md",
+    "manifest.md",
+    "index.md",
+})
+
+
+def _paper_style_corpus_paths(exemplar_dir: Path) -> list[Path]:
+    """Discover writing documents without coupling the loader to exemplar names."""
+    return sorted(
+        path
+        for path in exemplar_dir.rglob("*.md")
+        if path.is_file()
+        and path.name.lower() not in _PAPER_STYLE_DOCUMENT_EXCLUSIONS
+        and not path.name.startswith("_")
+    )
+
+
+def _paper_style_document_excerpt(text: str, budget: int, title: str) -> str:
+    """Compress one document while retaining its title, opening, middle, and ending."""
+    text = text.strip()
+    if len(text) <= budget:
+        return text
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", text)
+        if paragraph.strip()
+    ]
+    heading = next(
+        (paragraph for paragraph in paragraphs if paragraph.startswith("#")),
+        f"# {title}",
+    )
+    prose = [paragraph for paragraph in paragraphs if not paragraph.startswith("#")]
+    opening = prose[0] if prose else text
+    middle = prose[len(prose) // 2] if prose else opening
+    ending = prose[-1] if prose else opening
+    if len({opening, middle, ending}) == 1:
+        middle = ""
+    fixed = len(heading) + len("\n\n开头：\n\n正文代表段落：\n\n结尾：\n")
+    available = max(0, budget - fixed)
+    opening_budget = available * 3 // 8
+    middle_budget = available * 1 // 4
+    ending_budget = max(0, available - opening_budget - middle_budget)
+    return "\n\n".join(
+        part
+        for part in (
+            heading,
+            f"开头：\n{opening[:opening_budget]}" if opening_budget else "",
+            f"正文代表段落：\n{middle[:middle_budget]}" if middle and middle_budget else "",
+            f"结尾：\n{ending[:ending_budget]}" if ending_budget else "",
+        )
+        if part
+    )[:budget]
+
+
 def _paper_style_exemplar() -> str:
-    """Load only the curated writing package, never generated PAPER articles."""
+    """Load the full extensible writing corpus, never generated PAPER articles."""
     exemplar_dir = PROJECT_ROOT / "writer" / "exemplars"
     try:
         guide = (exemplar_dir / "STYLE_GUIDE.md").read_text(encoding="utf-8").strip()
     except OSError:
         guide = ""
-    fragments: list[str] = []
-    for path in sorted(exemplar_dir.glob("exemplar_*.md"))[:5]:
+    documents: list[tuple[str, str]] = []
+    for path in _paper_style_corpus_paths(exemplar_dir):
         try:
-            text = path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        paragraphs = []
-        for paragraph in re.split(r"\n\s*\n", text):
-            cleaned = paragraph.strip()
-            if not cleaned or cleaned.startswith(("#", "![", "*Fig.", "*图", "---")):
-                continue
-            if "![](" in cleaned or cleaned.startswith(("⬇️", "⬇")):
-                continue
-            if cleaned.startswith(("原文标题：", "作者：", "以下文章来源于：", "相关文献")):
-                continue
-            if re.fullmatch(r"\*{0,2}\s*\d+[.)。]?\s*\*{0,2}", cleaned):
-                continue
-            if re.fullmatch(r"\*{1,2}\s*(?:✓\s*)?(?:简报|摘要|仅供个人参考|相关文献)\s*\*{1,2}", cleaned):
-                continue
-            if re.fullmatch(r"\*{2}[^*]{1,60}\*{2}", cleaned):
-                continue
-            paragraphs.append(cleaned)
-        lead = paragraphs[0] if paragraphs else ""
-        body = paragraphs[1] if len(paragraphs) > 1 else lead
-        transition_source = paragraphs[2] if len(paragraphs) > 2 else body
-        transition = re.split(r"(?<=[。！？.!?])\s*", transition_source)[0]
-        excerpt = "\n".join(
-            part
-            for part in (
-                f"导语片段：{lead[:280]}" if lead else "",
-                f"正文片段：{body[:480]}" if body else "",
-                f"过渡片段：{transition[:240]}" if transition else "",
-            )
-            if part
-        )
-        if excerpt:
-            fragments.append(f"{path.stem}\n{excerpt}")
+        if text:
+            documents.append((path.relative_to(exemplar_dir).as_posix(), text))
+    corpus_size = sum(len(text) + len(name) + 20 for name, text in documents)
+    if corpus_size <= _PAPER_STYLE_CORPUS_CHAR_BUDGET:
+        corpus = [f"范文文件：{name}\n{text}" for name, text in documents]
+    else:
+        per_document = max(1, _PAPER_STYLE_CORPUS_CHAR_BUDGET // max(1, len(documents)))
+        corpus = [
+            f"范文文件：{name}\n{_paper_style_document_excerpt(text, per_document, name)}"
+            for name, text in documents
+        ]
     parts = []
     if guide:
-        parts.append("STYLE_GUIDE（必须遵守）\n" + guide[:3600])
-    parts.extend(fragments)
-    return "\n\n---\n\n".join(parts)
-
-
-def _paper_style_fragments_for_prompt(style_exemplar: str, beat_id: str) -> str:
-    parts = [part for part in style_exemplar.split("\n\n---\n\n") if part.strip()]
-    if len(parts) <= 1:
-        return style_exemplar
-    guide = parts[0]
-    examples = parts[1:]
-    match = re.search(r"(\d+)$", str(beat_id))
-    index = int(match.group(1)) - 1 if match else 0
-    chosen = [examples[index % len(examples)], examples[(index + 1) % len(examples)]]
-    return guide + "\n\n参考写法片段（只学习语言和结构，禁止借用事实）：\n" + "\n\n".join(chosen)
+        parts.append(
+            "STYLE_GUIDE（辅助规则；范文原文是主要风格参考）\n" + guide
+        )
+    parts.append(
+        "STYLE CORPUS（主要参考：学习句法、段落长度、信息密度、叙事推进、"
+        "术语解释和自然中文；禁止复制其中的事实、数字、人物、地点和结论）\n"
+        + "\n\n---\n\n".join(corpus)
+    )
+    return "\n\n=== STYLE PACKAGE ===\n\n".join(parts)
 
 
 def _paper_clean_story_text(text: str) -> str:
@@ -1900,9 +1934,7 @@ def _paper_story_writer(
                     "clean_evidence": [
                         _paper_clean_evidence_for_llm(record) for record in beat_evidence
                     ],
-                    "style_exemplar": _paper_style_fragments_for_prompt(
-                        style_exemplar, beat_id
-                    ),
+                    "style_exemplar": style_exemplar,
                     "targeted_feedback": beat_feedback,
                     "_model": model,
                     "_temperature": 0.25,
@@ -2005,9 +2037,7 @@ def _paper_humanize_story(
                             for evidence_id in spec["evidence_ids"]
                         ],
                         "adjacent_blocks": adjacent_blocks,
-                        "style_exemplar": _paper_style_fragments_for_prompt(
-                            style_exemplar, beat_id
-                        ),
+                        "style_exemplar": style_exemplar,
                         "targeted_feedback": block_feedback,
                         "_model": model,
                         "_temperature": 0.2,
@@ -2416,7 +2446,16 @@ def _paper_editorial_rewrite(
     return bodies
 
 
+def _paper_style_lint_text(markdown: str) -> str:
+    """Lint generated body prose, not metadata, titles, or English source quotes."""
+    sections = _paper_body_sections(markdown)
+    if sections:
+        return "\n\n".join(body for _, body in sections)
+    return markdown
+
+
 def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
+    prose = _paper_style_lint_text(markdown)
     patterns = {
         "并非而是": r"并非[^。！？\n]{0,50}而是",
         "其原因在于": r"其原因在于",
@@ -2433,12 +2472,20 @@ def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
         "由此可见": r"由此可见",
         "这意味着": r"这意味着",
         "综上所述": r"综上所述",
+        "作者式第一人称": (
+            r"(?:我室|本研究(?:发现|展示|使用|进一步分析|的结果)|"
+            r"本文(?:发现|展示|使用|进一步分析|的结果)|"
+            r"我们(?:发现|展示|使用|进一步分析|的结果|将|采用|指出|揭示|证明|"
+            r"在|通过|对|从|以|把|用|认为))"
+        ),
     }
-    return {name: len(re.findall(pattern, markdown)) for name, pattern in patterns.items()}
+    return {name: len(re.findall(pattern, prose)) for name, pattern in patterns.items()}
 
 
 def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
-    return any(count > 1 for count in counts.values()) or sum(counts.values()) > 4
+    return bool(counts.get("作者式第一人称")) or any(
+        count > 1 for count in counts.values()
+    ) or sum(counts.values()) > 4
 
 
 def _paper_chinese_char_count(text: str) -> int:
@@ -2572,6 +2619,11 @@ def _paper_stop_slop_audit(markdown: str) -> dict[str, Any]:
     if numbered:
         issues.append({"type": "numbered_structure", "terms": list(dict.fromkeys(numbered))})
     lint = _paper_ai_style_lint(markdown)
+    if lint.get("作者式第一人称", 0):
+        issues.append({
+            "type": "author_voice",
+            "count": lint["作者式第一人称"],
+        })
     if _paper_ai_style_lint_failed(lint):
         issues.append({"type": "ai_connective_template", "counts": lint})
     title_lint = _paper_title_style_lint(markdown)
@@ -3252,9 +3304,17 @@ PAPER_FIDELITY_CONTRACT = (
     "能用普通中文解释术语就解释，但不能为追求自然而牺牲科学准确性。"
 )
 
+PAPER_NARRATOR_CONTRACT = (
+    "叙述者契约：PAPER是第三方科学公众号编辑，不是论文作者。正文禁止使用作者身份的“我们发现”、"
+    "“我们展示”、“我们使用”、“我们进一步分析”、“我们的结果”、“我室”、“本研究发现”或“本文发现”。"
+    "应改为自然的第三方表达，例如“研究进一步比较了……”或“敏感性试验进一步检验了这一结果的稳健性”，"
+    "但不要因此反复制造“研究发现”或“结果表明”等模板句。英文原文引用和论文题目保持原样，不要改写其中的第一人称。"
+)
+
 PAPER_STORY_PLANNER_PROMPT = (
     "你是Story Planner，先读懂房间，再为已经通过Figure-first科学验证的证据设计自然的公众号故事线。"
     "读者是对科学感兴趣但非本领域专家的普通读者；目的不是逐项汇报Results，而是像人在解释一个值得知道的科学发现。"
+    "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
     "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。故事按问题/现象→核心发现→为什么→进一步证据→意义推进，结论先于方法，方法只保留帮助理解结果的部分。"
     "再把clean_evidence组织成2到4个story beats，通常约3个但不要硬凑。每个beat包含id、title、reader_question、core_message、"
     "evidence_ids和transition_to_next。evidence_ids必须逐字复制输入registry中的真实ID，禁止编号、改写、合并或创造新ID。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
@@ -3269,6 +3329,7 @@ PAPER_STORY_WRITER_PROMPT = (
     "你是Story Writer，为跨专业科研读者写专业、简洁、易懂的中文科学公众号正文。你只能看到按beat分组的clean evidence和story beats，"
     "绝不能提及或猜测图号、Figure、panel、source id，也不要按证据编号或资料顺序逐项汇报。"
     "每个beat只能使用其对应的clean evidence，先回答读者问题，再给最重要的发现，随后用直接句解释如何理解；不要强行制造承上启下的金句。"
+    "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
     "标题应专业、直接、简洁，优先10到22个中文字，直接陈述科学结果，不用为何、线索、改写、同一片中国等媒体化表达。"
     "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体。先说读者需要知道的结论，再补充必要证据和解释；方法、变量清单和统计术语只保留帮助理解结果的部分。避免第一/第二/第三/第四、首先/其次/最后、模板化排比和不必要的分号。"
     "每句话只讲一个主要科学意思，中文逗号和句号为主。关键专业词第一次出现时顺手用半句话解释，不连续堆缩写、模型名和参数；段落长短自然变化，每段推进一个主要意思。"
@@ -3276,6 +3337,7 @@ PAPER_STORY_WRITER_PROMPT = (
     "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
     "本次只写当前story beat，按证据需要保持紧凑；全篇长度由Python汇总审计，不要把每个beat或block机械写成等长。"
     + PAPER_FIDELITY_CONTRACT
+    + PAPER_NARRATOR_CONTRACT
     + "本次只写当前story beat，严格按输入blocks顺序返回；每个block只能包含block_id和text。返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}]}。"
 )
 
@@ -3291,6 +3353,7 @@ PAPER_HUMANIZER_PROMPT = (
     "非anchor的细节可以删减，但不能新增事实、机制、意义或因果关系；不新增事实。"
     "若targeted_feedback指出技术密度或模板风险，优先删除方法、变量和公式清单，只保留当前block理解结论所需的信息。"
     + PAPER_FIDELITY_CONTRACT
+    + PAPER_NARRATOR_CONTRACT
     + "只返回严格JSON：{\"block\":{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}}。"
 )
 
@@ -3340,6 +3403,7 @@ PAPER_POPULAR_SCIENCE_EDITOR_PROMPT = (
     '{"sections":[{"id":"section-1","title":"可选的通俗小标题","body":"..."}]}'
     + "\n\n"
     + PAPER_EDITORIAL_GUIDE
+    + PAPER_NARRATOR_CONTRACT
 )
 # Compatibility name for callers/tests that still refer to the old stage.
 PAPER_EDITOR_PROMPT = PAPER_POPULAR_SCIENCE_EDITOR_PROMPT
@@ -3664,7 +3728,7 @@ def _generate_paper_article_markdown(
 
     plan["scientific_review"] = scientific_review
 
-    style_exemplar = _paper_clean_story_text(_paper_style_exemplar())
+    style_exemplar = _paper_style_exemplar()
     clean_evidence, evidence_map = _paper_clean_story_evidence(
         plan,
         source_paragraphs,
@@ -3977,6 +4041,33 @@ def _generate_paper_article_markdown(
 
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)
+    final_lint = _paper_ai_style_lint(markdown)
+    if final_lint.get("作者式第一人称", 0):
+        logger.warning("PAPER final body contains author voice; triggering targeted rewrite")
+        targeted_output = _paper_humanize_story(
+            client,
+            story_plan,
+            clean_evidence,
+            _paper_story_draft_blocks(plan["sections"]),
+            settings.model_name,
+            {"author_voice": final_lint},
+            block_specs=block_specs,
+            style_exemplar=style_exemplar,
+        )
+        _paper_apply_story_output(
+            plan["sections"], targeted_output, evidence_map, evidence_registry, block_specs
+        )
+        markdown = _normalize_article_markdown(
+            _remove_unverified_paper_quotes(
+                _paper_assemble_markdown(display_title, abstract_lead, plan["sections"]),
+                paper_text,
+            ),
+            display_title,
+        )
+        final_lint = _paper_ai_style_lint(markdown)
+    plan["final_style_lint"] = final_lint
+    if final_lint.get("作者式第一人称", 0):
+        raise RuntimeError("PAPER author voice lint failed after targeted rewrite")
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
     plan["popular_science_audit"] = popular_science_audit
