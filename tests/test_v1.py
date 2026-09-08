@@ -36,6 +36,7 @@ from news.pipeline import (
     PRIMARY_SOURCES,
     SECONDARY_SOURCES,
     NewsPipeline,
+    PAPER_LOOKBACK_HOURS,
     _images_redundant,
     _insert_paper_figures,
     _paper_publication_within_window,
@@ -46,10 +47,12 @@ from news.pipeline import (
     content_type_for_date,
     deduplicate,
     deterministic_score,
+    is_broad_journal_first_paper,
     is_relevant_news_after_extraction,
     is_relevant_news_rss_prefilter,
     is_relevant_topic,
     merge_paper_candidate_pool,
+    paper_journal_tier,
     paper_relevance_score,
     prioritize_candidates,
     source_allowed_for_content,
@@ -125,6 +128,7 @@ from writer.llm import (
     generate_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
+    select_paper_ranked,
     select_paper_top_ten,
     select_top_ten,
     translate_paper_abstract,
@@ -997,9 +1001,7 @@ class V1Tests(unittest.TestCase):
             }
 
         windows = {
-            48: [item(1)],
-            168: [item(1), item(2)],
-            720: [item(1), item(2), item(3)],
+            PAPER_LOOKBACK_HOURS: [item(1), item(2), item(3)],
         }
         calls = []
 
@@ -1054,15 +1056,13 @@ class V1Tests(unittest.TestCase):
                 with patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch):
                     candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
 
-                self.assertEqual(calls, [48, 168, 720])
+                self.assertEqual(calls, [PAPER_LOOKBACK_HOURS])
                 self.assertEqual(len(candidates), 4)
-                self.assertEqual(pipeline.openalex.discover_recent_papers.call_count, 3)
+                self.assertEqual(pipeline.openalex.discover_recent_papers.call_count, 1)
                 self.assertEqual(
                     pipeline.openalex.discover_recent_papers.call_args_list,
                     [
-                        unittest.mock.call(date_type(2026, 8, 24), date_type(2026, 8, 26)),
-                        unittest.mock.call(date_type(2026, 8, 19), date_type(2026, 8, 26)),
-                        unittest.mock.call(date_type(2026, 7, 27), date_type(2026, 8, 26)),
+                        unittest.mock.call(date_type(2026, 5, 28), date_type(2026, 8, 26)),
                     ],
                 )
                 self.assertEqual(pipeline.last_paper_discovery_stats["rss_candidates"], 3)
@@ -6721,8 +6721,8 @@ class V1Tests(unittest.TestCase):
                 seen_ids = [pipeline.db.upsert_article(item) for item in seen_items]
                 pipeline.db.add_seen_candidates("2026-08-26", PAPER_CONTENT, seen_ids)
                 windows = {
-                    48: seen_items + [make_item(index) for index in range(2, 8)],
-                    168: [make_item(index) for index in range(8, 20)],
+                    PAPER_LOOKBACK_HOURS: seen_items
+                    + [make_item(index) for index in range(2, 20)],
                 }
                 calls = []
 
@@ -6740,7 +6740,7 @@ class V1Tests(unittest.TestCase):
                 with (
                     patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch),
                     patch(
-                        "news.pipeline.select_paper_top_ten",
+                        "news.pipeline.select_paper_ranked",
                         side_effect=lambda values, _settings: (
                             [dict(value, paper_relevance_score=3) for value in values[:10]],
                             True,
@@ -6763,7 +6763,7 @@ class V1Tests(unittest.TestCase):
                         exclude_seen=True,
                     )
 
-                self.assertEqual(calls, [48, 168])
+                self.assertEqual(calls, [PAPER_LOOKBACK_HOURS])
                 self.assertEqual(len(selected), 10)
                 self.assertTrue(
                     all(item["id"] not in set(seen_ids) for item in selected)
@@ -6818,7 +6818,7 @@ class V1Tests(unittest.TestCase):
 
                 with (
                     patch("news.pipeline.fetch_all_feeds", return_value=(items, [], {"test": 60})),
-                    patch("news.pipeline.select_paper_top_ten", side_effect=select_batch),
+                    patch("news.pipeline.select_paper_ranked", side_effect=select_batch),
                     patch(
                         "news.pipeline.translate_paper_titles",
                         side_effect=lambda values, _settings: (
@@ -6885,7 +6885,7 @@ class V1Tests(unittest.TestCase):
                 with (
                     patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch),
                     patch(
-                        "news.pipeline.select_paper_top_ten",
+                        "news.pipeline.select_paper_ranked",
                         side_effect=lambda values, _settings: (
                             [dict(value, paper_relevance_score=3) for value in values],
                             True,
@@ -6904,7 +6904,7 @@ class V1Tests(unittest.TestCase):
                 ):
                     selected = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
 
-                self.assertEqual(calls, [48, 168, 720])
+                self.assertEqual(calls, [PAPER_LOOKBACK_HOURS])
                 self.assertEqual(len(selected), 6)
                 self.assertEqual(pipeline.last_paper_discovery_stats["final"], 6)
 
@@ -6973,7 +6973,7 @@ class V1Tests(unittest.TestCase):
                         return_value=([new_item], [], {"test": 1}),
                     ),
                     patch(
-                        "news.pipeline.select_paper_top_ten",
+                        "news.pipeline.select_paper_ranked",
                         return_value=(
                             [dict(new_item, article_id=999, score=10)],
                             False,
@@ -7035,7 +7035,7 @@ class V1Tests(unittest.TestCase):
                         return_value=([item], [], {"test": 1}),
                     ),
                     patch(
-                        "news.pipeline.select_paper_top_ten",
+                        "news.pipeline.select_paper_ranked",
                         return_value=(
                             [dict(item, article_id=1, score=10, title_cn="")],
                             False,
@@ -7107,7 +7107,7 @@ class V1Tests(unittest.TestCase):
                         return_value=(items, [], {"test": 2}),
                     ),
                     patch(
-                        "news.pipeline.select_paper_top_ten",
+                        "news.pipeline.select_paper_ranked",
                         side_effect=fake_selection,
                     ),
                     patch(
@@ -7167,6 +7167,18 @@ class V1Tests(unittest.TestCase):
                     ],
                     PAPER_CONTENT,
                 )
+                pipeline.db.replace_paper_candidate_pool(
+                    "2026-08-26",
+                    [
+                        {
+                            "article_id": article_ids[index],
+                            "score": float(30 - index * 10),
+                            "title_cn": "已有标题" if index == 0 else "",
+                        }
+                        for index in range(3)
+                    ],
+                    PAPER_CONTENT,
+                )
                 pipeline.db.set_daily_run(
                     "2026-08-26",
                     content_type=PAPER_CONTENT,
@@ -7181,7 +7193,7 @@ class V1Tests(unittest.TestCase):
                             "",
                         ),
                     ) as translate,
-                    patch("news.pipeline.select_paper_top_ten") as select,
+                    patch("news.pipeline.select_paper_ranked") as select,
                 ):
                     candidates = await pipeline.get_or_refresh("2026-08-26", PAPER_CONTENT)
 
@@ -7371,14 +7383,14 @@ class V1Tests(unittest.TestCase):
                 )
 
                 def select_batch(values, _settings):
-                    return [dict(value) for value in values[:10]], True, ""
+                    return [dict(value) for value in values], True, ""
 
                 def translate_batch(values, _settings):
                     return [str(value.get("title_cn") or "") for value in values], True, ""
 
                 with (
                     patch("news.pipeline.fetch_all_feeds", return_value=(items, [], {"test": 24})),
-                    patch("news.pipeline.select_paper_top_ten", side_effect=select_batch),
+                    patch("news.pipeline.select_paper_ranked", side_effect=select_batch),
                     patch("news.pipeline.translate_paper_titles", side_effect=translate_batch),
                     patch("news.pipeline.deduplicate", side_effect=lambda values: values),
                 ):
@@ -7390,7 +7402,7 @@ class V1Tests(unittest.TestCase):
                 self.assertEqual([item["title"] for item in first], [f"Paper {i}" for i in range(1, 11)])
                 self.assertEqual([item["title"] for item in second], [f"Paper {i}" for i in range(11, 21)])
                 self.assertEqual([item["title"] for item in third], [f"Paper {i}" for i in range(21, 25)])
-                self.assertIn("本批次新增10篇，累计20篇", second_text)
+                self.assertIn("本批次新增10篇，已展示20/24篇", second_text)
                 self.assertIn("11.", second_text)
                 with patch(
                     "news.pipeline.translate_paper_titles",
@@ -7398,7 +7410,7 @@ class V1Tests(unittest.TestCase):
                 ):
                     all_current = await pipeline.get_or_refresh("2026-08-26", PAPER_CONTENT)
                 self.assertEqual(len(all_current), 24)
-                self.assertIn("今日已发表论文（共24篇）", pipeline.format_news(all_current))
+                self.assertIn("精选论文候选（近90天；已展示24/24篇）", pipeline.format_news(all_current))
                 self.assertEqual(
                     len(pipeline.db.get_seen_candidate_ids("2026-08-26", PAPER_CONTENT)),
                     24,
@@ -7422,7 +7434,7 @@ class V1Tests(unittest.TestCase):
                 with (
                     patch("news.pipeline.fetch_all_feeds", return_value=(items, [], {"test": 24})),
                     patch(
-                        "news.pipeline.select_paper_top_ten",
+                        "news.pipeline.select_paper_ranked",
                         return_value=([], False, "429 usage_limit_reached"),
                     ),
                     patch("news.pipeline.deduplicate", side_effect=lambda values: values),
@@ -7432,7 +7444,7 @@ class V1Tests(unittest.TestCase):
                     [item["title"] for item in failed],
                     [f"Paper {i}" for i in range(1, 25)],
                 )
-                self.assertIn("⚠ 换一批失败，继续保留当前论文列表", pipeline.format_news(failed))
+                self.assertIn("⚠ 已到最后一批，近90天候选池共 24 篇", pipeline.format_news(failed))
                 self.assertEqual(
                     len(pipeline.db.get_seen_candidate_ids("2026-08-26", PAPER_CONTENT)),
                     24,
@@ -7517,6 +7529,182 @@ class V1Tests(unittest.TestCase):
             self.assertFalse(used_model)
             self.assertEqual(len(selected), 10)
             self.assertIn("not configured", error)
+
+    def test_paper_uses_one_90_day_window_and_persists_full_pool(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "paper-90-day.db",
+                    model_base_url="",
+                    model_api_key="",
+                    model_name="",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+                items = [
+                    {
+                        "source": "Journal of Climate",
+                        "url": f"https://example.test/90-day-{index}",
+                        "canonical_url": f"https://example.test/90-day-{index}",
+                        "title": f"Distinct climate mechanism finding {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-06-01T00:00:00+00:00",
+                        "doi": f"10.1000/90-day-{index}",
+                        "journal": "Journal of Climate",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": "2026-09-08T00:00:00+00:00",
+                    }
+                    for index in range(12)
+                ]
+                calls = []
+
+                def fake_fetch(_path, hours):
+                    calls.append(hours)
+                    return copy.deepcopy(items), [], {"test": len(items)}
+
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(
+                    0, result=copy.deepcopy(values)
+                )
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0,
+                    result=[dict(value, paper_local_score=2) for value in values],
+                )
+                with (
+                    patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                ):
+                    first_page = await pipeline.refresh("2026-09-08", PAPER_CONTENT)
+
+                self.assertEqual(calls, [PAPER_LOOKBACK_HOURS])
+                self.assertEqual(len(first_page), 10)
+                self.assertEqual(
+                    pipeline.db.get_paper_candidate_pool_count("2026-09-08"),
+                    12,
+                )
+                self.assertEqual(
+                    pipeline.last_paper_discovery_stats["lookback_days"],
+                    90,
+                )
+
+        asyncio.run(check())
+
+    def test_journal_first_broad_prefilter_excludes_obvious_off_topic(self):
+        self.assertTrue(
+            is_broad_journal_first_paper(
+                {
+                    "title": "Aerosol forcing in the Earth system",
+                    "summary": "Atmospheric aerosol changes climate radiation",
+                    "journal": "Nature",
+                }
+            )
+        )
+        self.assertFalse(
+            is_broad_journal_first_paper(
+                {
+                    "title": "A new cancer treatment",
+                    "summary": "Clinical patient outcomes",
+                    "journal": "Nature",
+                }
+            )
+        )
+        self.assertEqual(
+            paper_journal_tier({"journal": "PNAS"}),
+            1,
+        )
+
+    def test_paper_next_reads_persisted_pool_without_network_or_model(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                database_path = Path(tmp) / "paper-pages.db"
+                settings = replace(load_settings(), database_path=database_path)
+                pipeline = NewsPipeline(settings)
+                pool = []
+                for index in range(22):
+                    item = {
+                        "source": "Nature",
+                        "url": f"https://example.test/page-{index}",
+                        "canonical_url": f"https://example.test/page-{index}",
+                        "title": f"Page paper {index}",
+                        "summary": "Climate",
+                        "doi": f"10.1000/page-{index}",
+                        "journal": "Nature",
+                    }
+                    article_id = pipeline.db.upsert_article(item)
+                    pool.append(
+                        {
+                            "article_id": article_id,
+                            "title_cn": f"论文{index}",
+                            "score": float(index),
+                        }
+                    )
+                pipeline.db.replace_paper_candidate_pool("2026-09-08", pool)
+                pipeline.db.replace_candidates(
+                    "2026-09-08", pool[:10], PAPER_CONTENT
+                )
+                pipeline.openalex.discover_recent_papers = MagicMock(
+                    side_effect=AssertionError("next must not discover")
+                )
+                with patch(
+                    "news.pipeline.select_paper_ranked",
+                    side_effect=AssertionError("next must not call AI"),
+                ):
+                    second = await pipeline.next_paper_batch("2026-09-08")
+                    third = await pipeline.next_paper_batch("2026-09-08")
+
+                self.assertEqual([item["rank"] for item in second], list(range(11, 21)))
+                self.assertEqual([item["rank"] for item in third], [21, 22])
+                restarted = NewsPipeline(settings)
+                exhausted = await restarted.next_paper_batch("2026-09-08")
+                self.assertIn("最后一批", restarted.last_paper_refresh_warning)
+                self.assertEqual(len(exhausted), 22)
+                pipeline.openalex.discover_recent_papers.assert_not_called()
+
+        asyncio.run(check())
+
+    def test_paper_ranked_selector_processes_all_candidates(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        candidates = [
+            {
+                "title": f"Climate mechanism paper {index}",
+                "summary": "Climate mechanism",
+                "paper_local_score": 2,
+            }
+            for index in range(35)
+        ]
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "items": [
+                                    {"index": index, "score": 2, "reason": "relevant"}
+                                    for index in range(1, 36)
+                                ]
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+        with patch("writer.llm.OpenAI", return_value=client):
+            selected, used_model, error = select_paper_ranked(candidates, settings)
+        payload = json.loads(
+            client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        )
+        self.assertTrue(used_model)
+        self.assertEqual(error, "")
+        self.assertEqual(len(payload), 35)
+        self.assertEqual(len(selected), 35)
 
 
 if __name__ == "__main__":

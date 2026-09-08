@@ -36,6 +36,19 @@ CREATE TABLE IF NOT EXISTS daily_candidates (
     PRIMARY KEY (date, content_type, rank)
 );
 
+CREATE TABLE IF NOT EXISTS paper_candidate_pool (
+    date TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'paper',
+    rank INTEGER NOT NULL,
+    article_id INTEGER NOT NULL REFERENCES articles(id),
+    title_cn TEXT NOT NULL DEFAULT '',
+    score REAL NOT NULL,
+    PRIMARY KEY (date, content_type, rank),
+    UNIQUE (date, content_type, article_id)
+);
+CREATE INDEX IF NOT EXISTS idx_paper_candidate_pool_page
+    ON paper_candidate_pool(date, content_type, rank);
+
 CREATE TABLE IF NOT EXISTS daily_seen_candidates (
     date TEXT NOT NULL,
     content_type TEXT NOT NULL,
@@ -248,6 +261,86 @@ class Database:
                         float(candidate.get("score") or 0),
                     ),
                 )
+
+    def replace_paper_candidate_pool(
+        self,
+        date: str,
+        candidates: Iterable[dict[str, Any]],
+        content_type: str = "paper",
+    ) -> None:
+        unique_candidates: list[dict[str, Any]] = []
+        seen_article_ids: set[int] = set()
+        for candidate in candidates:
+            article_id = int(candidate["article_id"])
+            if article_id in seen_article_ids:
+                continue
+            seen_article_ids.add(article_id)
+            unique_candidates.append(candidate)
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM paper_candidate_pool WHERE date=? AND content_type=?",
+                (date, content_type),
+            )
+            connection.executemany(
+                """INSERT INTO paper_candidate_pool
+                (date,content_type,rank,article_id,title_cn,score)
+                VALUES (?,?,?,?,?,?)""",
+                [
+                    (
+                        date,
+                        content_type,
+                        rank,
+                        int(candidate["article_id"]),
+                        str(candidate.get("title_cn") or ""),
+                        float(candidate.get("score") or 0),
+                    )
+                    for rank, candidate in enumerate(unique_candidates, start=1)
+                ],
+            )
+
+    def get_paper_candidate_pool(
+        self,
+        date: str,
+        content_type: str = "paper",
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT p.date,p.content_type,p.rank,p.title_cn,p.score,a.*
+                FROM paper_candidate_pool p JOIN articles a ON a.id=p.article_id
+                WHERE p.date=? AND p.content_type=? ORDER BY p.rank""",
+                (date, content_type),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_paper_candidate_page(
+        self,
+        date: str,
+        start_rank: int,
+        limit: int = 10,
+        content_type: str = "paper",
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT p.date,p.content_type,p.rank,p.title_cn,p.score,a.*
+                FROM paper_candidate_pool p JOIN articles a ON a.id=p.article_id
+                WHERE p.date=? AND p.content_type=? AND p.rank>=?
+                ORDER BY p.rank LIMIT ?""",
+                (date, content_type, int(start_rank), int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_paper_candidate_pool_count(
+        self,
+        date: str,
+        content_type: str = "paper",
+    ) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS count FROM paper_candidate_pool
+                WHERE date=? AND content_type=?""",
+                (date, content_type),
+            ).fetchone()
+        return int(row["count"] or 0)
 
     def append_candidates(
         self,

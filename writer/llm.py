@@ -3244,15 +3244,19 @@ def select_top_ten(
         return fallback, False, f"{type(exc).__name__}: {exc}"
 
 
-def select_paper_top_ten(
+def select_paper_ranked(
     candidates: list[dict[str, Any]],
     settings: Settings,
+    *,
+    limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], bool, str]:
     fallback = [
         dict(item, title_cn=str(item.get("title_cn") or ""))
         for item in candidates
         if int(item.get("paper_local_score") or 0) >= 2
-    ][:10]
+    ]
+    if limit is not None:
+        fallback = fallback[:limit]
     if not candidates:
         return [], False, "no candidates"
     if not settings.model_configured:
@@ -3268,7 +3272,7 @@ def select_paper_top_ten(
             "doi": item.get("doi", ""),
             "type": item.get("work_type", ""),
         }
-        for index, item in enumerate(candidates[:30], start=1)
+        for index, item in enumerate(candidates, start=1)
     ]
     client = OpenAI(
         api_key=settings.model_api_key,
@@ -3295,7 +3299,8 @@ def select_paper_top_ten(
                         "快速增强机制本身、眼墙、微物理、中尺度/风暴尺度动力学或无气候尺度联系的单次天气过程评为0。"
                         "排除没有气候机制的水文/大地测量、生态植被、生物地球化学或"
                         "海洋化学、泛环境变化、通用模型/软件benchmark，以及Reply、Correction、Editorial、"
-                        "Comment、Correspondence。只返回2或3分论文，3分优先；最多10篇，允许少于10篇，禁止凑数。"
+                        "Comment、Correspondence。只返回评分为2或3的论文，3分优先；返回所有符合条件的论文，"
+                        "不要截断为固定数量，也不要凑数。"
                         "只返回筛选结果，不负责中文标题翻译。返回严格JSON："
                         '{"items":[{"index":1,"score":3,"reason":"..."}]}。'
                     ),
@@ -3320,7 +3325,10 @@ def select_paper_top_ten(
                 continue
             scored.append((score, index, title_cn))
             seen.add(index)
-        for score, index, title_cn in sorted(scored, key=lambda value: (-value[0], value[1]))[:10]:
+        ranked = sorted(scored, key=lambda value: (-value[0], value[1]))
+        if limit is not None:
+            ranked = ranked[:limit]
+        for score, index, title_cn in ranked:
             selected.append(
                 dict(
                     candidates[index - 1],
@@ -3331,6 +3339,13 @@ def select_paper_top_ten(
         return selected, True, ""
     except Exception as exc:
         return fallback, False, f"{type(exc).__name__}: {exc}"
+
+
+def select_paper_top_ten(
+    candidates: list[dict[str, Any]],
+    settings: Settings,
+) -> tuple[list[dict[str, Any]], bool, str]:
+    return select_paper_ranked(candidates, settings, limit=10)
 
 
 def translate_paper_titles(

@@ -331,6 +331,7 @@ class OpenAlexAdapter:
             for work in works or []:
                 record = self._work_record(work, from_date, to_date, journal)
                 if record:
+                    record["discovery_origin"] = "journal-first"
                     discovered.append(record)
             metadata = getattr(works, "meta", {}) or {}
             next_cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
@@ -377,6 +378,7 @@ class OpenAlexAdapter:
             for work in works or []:
                 record = self._work_record(work, from_date, to_date)
                 if record:
+                    record["discovery_origin"] = "topic"
                     discovered.append(record)
         return discovered
 
