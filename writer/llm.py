@@ -581,6 +581,14 @@ def _paper_validate_story_blocks(
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
     canonical_mode = bool(evidence_registry)
     planned_sections = plan.get("sections") or []
+    anchor_evidence_ids: dict[str, set[str]] = {}
+    for evidence_id, evidence in story_evidence.items():
+        if not isinstance(evidence, dict):
+            continue
+        for anchor in evidence.get("anchors") or []:
+            normalized_anchor = _normalize_evidence_anchor(str(anchor))
+            if normalized_anchor:
+                anchor_evidence_ids.setdefault(normalized_anchor, set()).add(str(evidence_id))
     seen_block_ids: set[str] = set()
     if len(sections) != len(planned_sections):
         raise RuntimeError("PAPER story block validation failed: section count changed")
@@ -593,6 +601,7 @@ def _paper_validate_story_blocks(
         body_normalized = re.sub(r"\s+", "", sections[section_index][1])
         previous_position = -1
         normalized_blocks: list[tuple[dict[str, Any], str]] = []
+        blocks_by_evidence: dict[str, list[tuple[dict[str, Any], str]]] = {}
         for block in blocks:
             if not isinstance(block, dict):
                 raise RuntimeError("PAPER story block validation failed: invalid block")
@@ -637,6 +646,10 @@ def _paper_validate_story_blocks(
                 )
             previous_position = position
             normalized_blocks.append((block, block_normalized))
+            for evidence_id in evidence_ids:
+                blocks_by_evidence.setdefault(evidence_id, []).append(
+                    (block, block_normalized)
+                )
             seen_evidence.update(evidence_ids)
         if seen_evidence != beat_ids:
             raise RuntimeError("PAPER story block validation failed: omitted or duplicated evidence")
@@ -660,6 +673,22 @@ def _paper_validate_story_blocks(
                 figure_specific = bool(supported_figures_by_anchor.get(normalized_anchor)) or any(
                     record.get("scope") == "figure_specific" for record in anchor_records
                 )
+                owning_blocks = blocks_by_evidence.get(evidence_id, [])
+                duplicate_anchor = len(anchor_evidence_ids.get(normalized_anchor, set())) > 1
+                if canonical_mode and (duplicate_anchor or figure_specific):
+                    if len(owning_blocks) != 1:
+                        raise RuntimeError(
+                            "PAPER story block validation failed: evidence is not bound to one block: "
+                            f"evidence_id={evidence_id!r}"
+                        )
+                    if normalized_anchor not in _normalize_evidence_anchor(
+                        str(owning_blocks[0][0].get("text") or "")
+                    ):
+                        raise RuntimeError(
+                            "PAPER evidence anchor missing from bound block: "
+                            f"evidence_id={evidence_id!r}; anchor={anchor!r}; "
+                            f"block={owning_blocks[0][0].get('id')!r}"
+                        )
                 if not figure_specific:
                     continue
                 containing_blocks = [
@@ -733,6 +762,13 @@ def _validate_paper_evidence_plan(
             ).update(_paper_figure_id(value) for value in figures)
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
     canonical_mode = bool(evidence_registry)
+    anchor_evidence_ids: dict[str, set[str]] = {}
+    if canonical_mode:
+        for evidence_id, evidence in evidence_by_id.items():
+            for anchor in evidence.get("anchors") or []:
+                normalized_anchor = _normalize_evidence_anchor(str(anchor))
+                if normalized_anchor:
+                    anchor_evidence_ids.setdefault(normalized_anchor, set()).add(evidence_id)
     _paper_validate_story_blocks(
         plan,
         sections,
@@ -862,6 +898,26 @@ def _validate_paper_evidence_plan(
                                     f"evidence={anchor!r}; section={section.get('title')!r}; "
                                     f"source_paragraph_ids={sorted(provenance_ids)!r}"
                                 )
+                if canonical_mode:
+                    bound_evidence_ids = {
+                        evidence_id
+                        for evidence_id in section_evidence_ids
+                        if normalized_anchor in {
+                            _normalize_evidence_anchor(str(value))
+                            for value in evidence_by_id[evidence_id].get("anchors") or []
+                        }
+                    }
+                    duplicate_anchor = len(anchor_evidence_ids.get(normalized_anchor, set())) > 1
+                    if bound_evidence_ids and (
+                        duplicate_anchor
+                        or bool(supported_figures_by_anchor.get(normalized_anchor))
+                        or any(record.get("scope") == "figure_specific" for record in anchor_records)
+                    ):
+                        # Block validation above has already checked the anchor
+                        # against its immutable evidence binding. A global
+                        # string search is ambiguous when another evidence
+                        # record uses the same normalized value.
+                        continue
                 actual_indexes = [
                     index
                     for index, (_, body) in enumerate(sections)

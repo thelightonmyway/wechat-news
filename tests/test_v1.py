@@ -2449,6 +2449,109 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(sections[0]["source_paragraph_ids"], ["source-8"])
         self.assertEqual(sections[0]["findings"][0]["anchors"], ["r = 0.73"])
 
+    def test_paper_canonical_validation_allows_duplicate_anchors_in_bound_blocks(self):
+        registry = [
+            {
+                "evidence_id": "evidence-A",
+                "value": "80 %",
+                "normalized_value": "80%",
+                "source_paragraph_ids": ["source-A"],
+                "source_sentence": "Evidence A reports 80 %.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": ["80 %"],
+            },
+            {
+                "evidence_id": "evidence-B",
+                "value": "80 %",
+                "normalized_value": "80%",
+                "source_paragraph_ids": ["source-B"],
+                "source_sentence": "Evidence B reports 80 %.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": ["80 %"],
+            },
+        ]
+
+        def make_plan(a_text, b_text):
+            return {
+                "sections": [
+                    {
+                        "id": "section-A",
+                        "title": "结果A",
+                        "role": "result",
+                        "figure_ids": [],
+                        "source_paragraph_ids": ["source-A"],
+                        "findings": [{
+                            "id": "finding-A",
+                            "evidence_ids": ["evidence-A"],
+                            "anchors": ["80 %"],
+                        }],
+                        "story_beat": {"evidence_ids": ["evidence-A"]},
+                        "blocks": [{
+                            "id": "block-A",
+                            "evidence_ids": ["evidence-A"],
+                            "source_paragraph_ids": ["source-A"],
+                            "text": a_text,
+                        }],
+                    },
+                    {
+                        "id": "section-B",
+                        "title": "结果B",
+                        "role": "result",
+                        "figure_ids": [],
+                        "source_paragraph_ids": ["source-B"],
+                        "findings": [{
+                            "id": "finding-B",
+                            "evidence_ids": ["evidence-B"],
+                            "anchors": ["80 %"],
+                        }],
+                        "story_beat": {"evidence_ids": ["evidence-B"]},
+                        "blocks": [{
+                            "id": "block-B",
+                            "evidence_ids": ["evidence-B"],
+                            "source_paragraph_ids": ["source-B"],
+                            "text": b_text,
+                        }],
+                    },
+                ],
+                "story_evidence": {
+                    "evidence-A": {
+                        "figure_ids": [],
+                        "anchors": ["80 %"],
+                        "source_paragraph_ids": ["source-A"],
+                    },
+                    "evidence-B": {
+                        "figure_ids": [],
+                        "anchors": ["80 %"],
+                        "source_paragraph_ids": ["source-B"],
+                    },
+                },
+            }
+
+        valid_markdown = (
+            "# 标题\n\n## 结果A\n\nA结果为80 %。\n\n"
+            "## 结果B\n\nB结果为80 %。"
+        )
+        _validate_paper_evidence_plan(
+            make_plan("A结果为80 %。", "B结果为80 %。"),
+            valid_markdown,
+            {"source-A", "source-B"},
+            evidence_registry=registry,
+        )
+
+        moved_markdown = (
+            "# 标题\n\n## 结果A\n\nA结果待补充。\n\n"
+            "## 结果B\n\nB结果包含80 %。"
+        )
+        with self.assertRaisesRegex(RuntimeError, "anchor missing from bound block"):
+            _validate_paper_evidence_plan(
+                make_plan("A结果待补充。", "B结果包含80 %。"),
+                moved_markdown,
+                {"source-A", "source-B"},
+                evidence_registry=registry,
+            )
+
     def test_paper_canonical_section_source_order_is_registry_order(self):
         registry = [
             {
