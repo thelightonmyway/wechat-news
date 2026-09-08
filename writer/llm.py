@@ -1848,6 +1848,54 @@ def _paper_block_specs_by_id(
     return by_id
 
 
+def _paper_story_block_map(
+    raw_blocks: Any,
+    expected_ids: list[str],
+    stage: str,
+    beat_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Validate only the structural block contract and return blocks by id."""
+    missing = list(expected_ids)
+    unknown: list[str] = []
+    duplicate: list[str] = []
+    invalid_text: list[str] = []
+    returned_ids: list[str] = []
+    if not isinstance(raw_blocks, list):
+        invalid_text.append("<blocks>")
+    else:
+        seen_ids: set[str] = set()
+        for index, raw_block in enumerate(raw_blocks):
+            if not isinstance(raw_block, dict):
+                invalid_text.append(f"<index:{index}>")
+                continue
+            block_id = str(raw_block.get("block_id") or "").strip()
+            if not block_id:
+                invalid_text.append(f"<index:{index}>")
+            else:
+                returned_ids.append(block_id)
+                if block_id in seen_ids:
+                    if block_id not in duplicate:
+                        duplicate.append(block_id)
+                else:
+                    seen_ids.add(block_id)
+            text = raw_block.get("text")
+            if not isinstance(text, str) or not text.strip():
+                invalid_text.append(block_id or f"<index:{index}>")
+        expected_set = set(expected_ids)
+        unknown = list(dict.fromkeys(block_id for block_id in returned_ids if block_id not in expected_set))
+        missing = [block_id for block_id in expected_ids if block_id not in set(returned_ids)]
+    if missing or unknown or duplicate or invalid_text:
+        raise RuntimeError(
+            f"PAPER {stage} invalid blocks: "
+            f"missing={missing!r}; unknown={unknown!r}; duplicate={duplicate!r}; "
+            f"invalid_text={invalid_text!r}; beat_id={beat_id!r}"
+        )
+    return {
+        block_id: raw_block
+        for block_id, raw_block in zip(returned_ids, raw_blocks)
+    }
+
+
 def _paper_apply_story_output(
     sections: list[dict[str, Any]],
     generated: list[dict[str, Any]],
@@ -1868,23 +1916,12 @@ def _paper_apply_story_output(
             raise RuntimeError("PAPER story output omitted a planned section")
         expected_specs = block_specs.get(section_id) or []
         expected_ids = [str(spec.get("block_id") or "") for spec in expected_specs]
-        raw_blocks = item.get("blocks")
-        if not isinstance(raw_blocks, list) or not raw_blocks:
-            raise RuntimeError("PAPER story output returned no blocks")
-        returned_ids = [str(block.get("block_id") or "").strip() for block in raw_blocks if isinstance(block, dict)]
-        if (
-            len(returned_ids) != len(raw_blocks)
-            or len(set(returned_ids)) != len(returned_ids)
-            or returned_ids != expected_ids
-            or any(block_id not in specs_by_id for block_id in returned_ids)
-        ):
-            raise RuntimeError("PAPER story output returned invalid block structure")
+        raw_by_id = _paper_story_block_map(
+            item.get("blocks"), expected_ids, "story output", section_id
+        )
         blocks: list[dict[str, Any]] = []
-        for raw_block in raw_blocks:
-            block_id = str(raw_block.get("block_id") or "").strip()
-            text = raw_block.get("text")
-            if not isinstance(text, str) or not text.strip():
-                raise RuntimeError("PAPER story output returned an empty block")
+        for block_id in expected_ids:
+            raw_block = raw_by_id[block_id]
             if block_id in seen_block_ids:
                 raise RuntimeError(f"PAPER duplicate block_id: {block_id}")
             seen_block_ids.add(block_id)
@@ -1893,7 +1930,7 @@ def _paper_apply_story_output(
                 {
                     "id": block_id,
                     "evidence_ids": list(spec["evidence_ids"]),
-                    "text": text.strip(),
+                    "text": raw_block["text"].strip(),
                     "figure_ids": list(spec["figure_ids"]),
                     "source_paragraph_ids": list(spec["source_paragraph_ids"]),
                 }
@@ -2039,29 +2076,17 @@ def _paper_normalize_story_output(
         item = by_id.get(beat["id"])
         if item is None:
             raise RuntimeError(f"PAPER {stage} omitted a story beat")
-        raw_blocks = item.get("blocks")
         specs = block_specs.get(beat["id"]) or []
         expected_ids = [str(spec.get("block_id") or "") for spec in specs]
-        if not isinstance(raw_blocks, list) or not raw_blocks:
-            raise RuntimeError(f"PAPER {stage} returned invalid evidence blocks")
-        returned_ids: list[str] = []
+        raw_by_id = _paper_story_block_map(
+            item.get("blocks"), expected_ids, stage, beat["id"]
+        )
         blocks: list[dict[str, Any]] = []
-        for raw_block in raw_blocks:
-            if not isinstance(raw_block, dict) or set(raw_block) - {"block_id", "text"}:
-                raise RuntimeError(f"PAPER {stage} returned invalid evidence block fields")
-            block_id = str(raw_block.get("block_id") or "").strip()
-            text = raw_block.get("text")
-            if not block_id or not isinstance(text, str) or not text.strip():
-                raise RuntimeError(f"PAPER {stage} returned invalid evidence block fields")
-            returned_ids.append(block_id)
+        for block_id in expected_ids:
+            text = raw_by_id[block_id]["text"]
             clean_text = _paper_plain_language_cleanup(_paper_clean_story_text(text))
             clean_text = re.sub(r"\s*\n+\s*", " ", clean_text).strip()
             blocks.append({"block_id": block_id, "text": clean_text})
-        if (
-            len(set(returned_ids)) != len(returned_ids)
-            or returned_ids != expected_ids
-        ):
-            raise RuntimeError(f"PAPER {stage} returned invalid evidence block fields")
         title = _paper_clean_story_text(item.get("title") or beat["title"]) or beat["title"]
         output.append({
             "id": beat["id"],
@@ -2090,8 +2115,9 @@ def _paper_story_writer(
     for beat in story_plan["story_beats"]:
         beat_id = beat["id"]
         beat_specs = block_specs.get(beat_id) or []
-        beat_evidence = [evidence_by_id[evidence_id] for evidence_id in beat["evidence_ids"]]
+        expected_ids = [spec["block_id"] for spec in beat_specs]
         beat_feedback = feedback or {}
+        beat_error = ""
         for attempt in range(2):
             response = _paper_completion_json(
                 client,
@@ -2112,9 +2138,6 @@ def _paper_story_writer(
                             ],
                         }
                         for spec in beat_specs
-                    ],
-                    "clean_evidence": [
-                        _paper_clean_evidence_for_llm(record) for record in beat_evidence
                     ],
                     "style_exemplar": style_exemplar,
                     "targeted_feedback": beat_feedback,
@@ -2140,15 +2163,88 @@ def _paper_story_writer(
                 output.append(normalized[0])
                 break
             except RuntimeError as exc:
+                beat_error = str(exc)
                 if attempt:
-                    raise
+                    fallback_blocks: list[dict[str, str]] = []
+                    for spec in beat_specs:
+                        block_id = spec["block_id"]
+                        fallback_response = _paper_completion_json(
+                            client,
+                            PAPER_STORY_WRITER_PROMPT,
+                            {
+                                "editorial_brief": story_plan["editorial_brief"],
+                                "story_beat": {
+                                    key: value
+                                    for key, value in beat.items()
+                                    if key != "evidence_ids"
+                                },
+                                "block": {
+                                    "block_id": block_id,
+                                    "clean_evidence": [
+                                        _paper_clean_evidence_for_llm(evidence_by_id[evidence_id])
+                                        for evidence_id in spec["evidence_ids"]
+                                    ],
+                                },
+                                "style_exemplar": style_exemplar,
+                                "targeted_feedback": {
+                                    **(feedback or {}),
+                                    "structure": (
+                                        "The beat-level response was structurally invalid. "
+                                        f"Write only text for block_id={block_id!r}. "
+                                        f"Previous diagnostic: {beat_error}"
+                                    ),
+                                },
+                                "_model": model,
+                                "_temperature": 0.25,
+                            },
+                        )
+                        raw_block = fallback_response.get("block")
+                        if isinstance(raw_block, dict):
+                            text = raw_block.get("text")
+                        elif isinstance(fallback_response.get("blocks"), list):
+                            fallback_blocks_response = fallback_response["blocks"]
+                            text = (
+                                fallback_blocks_response[0].get("text")
+                                if fallback_blocks_response
+                                and isinstance(fallback_blocks_response[0], dict)
+                                else None
+                            )
+                        else:
+                            text = fallback_response.get("text")
+                        if not isinstance(text, str) or not text.strip():
+                            raise RuntimeError(
+                                "PAPER story writer per-block fallback invalid text: "
+                                f"block_id={block_id!r}"
+                            )
+                        clean_text = _paper_plain_language_cleanup(
+                            _paper_clean_story_text(text)
+                        )
+                        fallback_blocks.append({
+                            "block_id": block_id,
+                            "text": re.sub(r"\s*\n+\s*", " ", clean_text).strip(),
+                        })
+                    output.append({
+                        "id": beat_id,
+                        "title": _paper_plain_language_cleanup(
+                            _paper_clean_story_text(beat["title"])
+                        ),
+                        "blocks": fallback_blocks,
+                        "body": "\n\n".join(
+                            block["text"] for block in fallback_blocks
+                        ),
+                    })
+                    break
                 beat_feedback = {
                     "structure": (
-                        f"Return exactly these block_id values in this order: "
-                        f"{[spec['block_id'] for spec in beat_specs]!r}. "
-                        f"Return only block_id and text; do not return evidence_ids. Error: {exc}"
+                        f"Return these block_id values in any order; Python will restore order: "
+                        f"{expected_ids!r}. Return only block_id and text; do not return metadata. "
+                        f"Error: {beat_error}"
                     )
                 }
+        else:
+            raise RuntimeError(
+                f"PAPER story writer failed for beat={beat_id!r}"
+            )
     return output
 
 

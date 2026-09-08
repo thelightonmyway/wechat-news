@@ -112,6 +112,7 @@ from writer.llm import (
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
+    _paper_normalize_story_output,
     _paper_humanize_story,
     _paper_style_review,
     _paper_validate_story_plan,
@@ -3715,6 +3716,166 @@ class V1Tests(unittest.TestCase):
         lint = _paper_title_style_lint(markdown)
         self.assertEqual(lint["issue_count"], 3)
         self.assertTrue(all(item["term"] in {"同一片中国", "为何", "改写"} for item in lint["issues"]))
+
+    def test_paper_story_normalizer_ignores_extra_metadata_and_restores_order(self):
+        story_plan = {
+            "story_beats": [{
+                "id": "beat-1",
+                "title": "结果",
+                "reader_question": "问题？",
+                "core_message": "核心。",
+                "evidence_ids": ["e1", "e2"],
+            }]
+        }
+        block_specs = {"beat-1": [
+            {"block_id": "b1"},
+            {"block_id": "b2"},
+        ]}
+        normalized = _paper_normalize_story_output(
+            {"sections": [{
+                "id": "beat-1",
+                "blocks": [
+                    {
+                        "block_id": "b2",
+                        "text": "第二段。",
+                        "evidence_ids": ["rogue"],
+                        "figure_ids": ["Fig. 9"],
+                        "source_paragraph_ids": ["source-rogue"],
+                    },
+                    {"block_id": "b1", "text": "第一段。", "anchors": ["80 %"]},
+                ],
+            }]},
+            story_plan,
+            [],
+            "story writer",
+            block_specs,
+        )
+        self.assertEqual(
+            [block["block_id"] for block in normalized[0]["blocks"]], ["b1", "b2"]
+        )
+        self.assertEqual(
+            set(normalized[0]["blocks"][0]), {"block_id", "text"}
+        )
+
+    def test_paper_story_normalizer_reports_structural_diagnostics(self):
+        story_plan = {
+            "story_beats": [{
+                "id": "beat-1", "title": "结果", "reader_question": "问题？",
+                "core_message": "核心。", "evidence_ids": ["e1", "e2"],
+            }]
+        }
+        block_specs = {"beat-1": [{"block_id": "b1"}, {"block_id": "b2"}]}
+        cases = [
+            ([{"block_id": "b1", "text": "第一段。"}], "missing=['b2']"),
+            ([
+                {"block_id": "b1", "text": "第一段。"},
+                {"block_id": "foo", "text": "未知。"},
+            ], "unknown=['foo']"),
+            ([
+                {"block_id": "b1", "text": "第一段。"},
+                {"block_id": "b1", "text": "重复。"},
+            ], "duplicate=['b1']"),
+            ([
+                {"block_id": "b1", "text": ""},
+                {"block_id": "b2", "text": "第二段。"},
+            ], "invalid_text=['b1']"),
+        ]
+        for raw_blocks, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(RuntimeError, re.escape(expected)):
+                    _paper_normalize_story_output(
+                        {"sections": [{"id": "beat-1", "blocks": raw_blocks}]},
+                        story_plan,
+                        [],
+                        "story writer",
+                        block_specs,
+                    )
+
+    def test_paper_story_writer_uses_per_block_fallback_after_two_bad_beats(self):
+        client = MagicMock()
+        bad = {"sections": [{"id": "beat-1", "blocks": [
+            {"block_id": "b1", "text": "第一段。"},
+        ]}]}
+        client.chat.completions.create.side_effect = [
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(bad, ensure_ascii=False)))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(bad, ensure_ascii=False)))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"text": "第一段回退。"}, ensure_ascii=False)))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"text": "第二段回退。"}, ensure_ascii=False)))]),
+        ]
+        story_plan = {
+            "editorial_brief": {"audience": "读者", "purpose": "解释", "tone": "清楚"},
+            "story_beats": [{
+                "id": "beat-1", "title": "结果", "reader_question": "问题？",
+                "core_message": "核心。", "evidence_ids": ["e1", "e2"],
+            }],
+        }
+        clean_evidence = [
+            {"evidence_id": "e1", "evidence_group": "group-a", "anchors": []},
+            {"evidence_id": "e2", "evidence_group": "group-b", "anchors": []},
+        ]
+        block_specs = {"beat-1": [
+            {"block_id": "b1", "evidence_ids": ("e1",), "figure_ids": (), "source_paragraph_ids": ()},
+            {"block_id": "b2", "evidence_ids": ("e2",), "figure_ids": (), "source_paragraph_ids": ()},
+        ]}
+        output = _paper_story_writer(
+            client, story_plan, clean_evidence, "范文", "test-model", block_specs=block_specs
+        )
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+        self.assertEqual(
+            [(block["block_id"], block["text"]) for block in output[0]["blocks"]],
+            [("b1", "第一段回退。"), ("b2", "第二段回退。")],
+        )
+        first_payload = json.loads(client.chat.completions.create.call_args_list[0].kwargs["messages"][1]["content"])
+        self.assertIn("blocks", first_payload)
+        self.assertNotIn("clean_evidence", first_payload)
+        fallback_payload = json.loads(client.chat.completions.create.call_args_list[2].kwargs["messages"][1]["content"])
+        self.assertIn("block", fallback_payload)
+        self.assertNotIn("blocks", fallback_payload)
+
+    def test_paper_story_writer_fallback_still_hard_fails_scientific_anchor(self):
+        client = MagicMock()
+        bad = {"sections": [{"id": "beat-1", "blocks": []}]}
+        fallback = {"text": "没有数字的回退正文。"}
+        client.chat.completions.create.side_effect = [
+            *[
+                SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(bad, ensure_ascii=False)))])
+                for _ in range(2)
+            ],
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(fallback, ensure_ascii=False)))]),
+        ]
+        story_plan = {
+            "editorial_brief": {"audience": "读者", "purpose": "解释", "tone": "清楚"},
+            "story_beats": [{
+                "id": "beat-1", "title": "结果", "reader_question": "问题？",
+                "core_message": "核心。", "evidence_ids": ["e1"],
+            }],
+        }
+        clean_evidence = [{"evidence_id": "e1", "evidence_group": "context", "anchors": ["80 %"]}]
+        block_specs = {"beat-1": [{
+            "block_id": "b1", "evidence_ids": ("e1",), "figure_ids": (), "source_paragraph_ids": ("source-1",),
+        }]}
+        output = _paper_story_writer(
+            client, story_plan, clean_evidence, "范文", "test-model", block_specs=block_specs
+        )
+        registry = [{
+            "evidence_id": "e1", "source_paragraph_ids": ["source-1"],
+            "source_sentence": "Evidence reports 80 %.", "scope": "section_context",
+            "supported_figures": [], "anchors": ["80 %"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "beat-1", "title": "结果", "figure_ids": [],
+                "source_paragraph_ids": ["source-1"],
+                "findings": [{"id": "f1", "evidence_ids": ["e1"]}],
+                "story_beat": {"evidence_ids": ["e1"]},
+            }],
+            "story_evidence": {"e1": {"figure_ids": [], "anchors": ["80 %"]}},
+        }
+        with self.assertRaisesRegex(RuntimeError, "anchor missing"):
+            _paper_apply_story_candidate(
+                plan, output, {"e1": (plan["sections"][0], plan["sections"][0]["findings"][0])},
+                registry, block_specs, "标题", "摘要", {"source-1"}, None, "", "story writer", rollback_on_failure=False,
+            )
 
     def test_paper_story_writer_pre_splits_different_figure_groups(self):
         client = MagicMock()
