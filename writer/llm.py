@@ -647,6 +647,34 @@ def _paper_validate_story_blocks(
         beat_ids = set((section.get("story_beat") or {}).get("evidence_ids") or [])
         seen_evidence: set[str] = set()
         body_normalized = re.sub(r"\s+", "", sections[section_index][1])
+        paragraph_text_by_block: dict[str, str] = {}
+        planned_paragraphs = section.get("paragraphs")
+        if planned_paragraphs is not None:
+            if not isinstance(planned_paragraphs, list) or not planned_paragraphs:
+                raise RuntimeError("PAPER story block validation failed: invalid paragraphs")
+            paragraph_position = -1
+            for paragraph in planned_paragraphs:
+                if not isinstance(paragraph, dict):
+                    raise RuntimeError("PAPER story block validation failed: invalid paragraph")
+                paragraph_block_ids = paragraph.get("block_ids")
+                paragraph_text = str(paragraph.get("text") or "").strip()
+                if (
+                    not isinstance(paragraph_block_ids, list)
+                    or not paragraph_block_ids
+                    or not paragraph_text
+                    or any(not isinstance(block_id, str) or not block_id.strip() for block_id in paragraph_block_ids)
+                    or len({block_id for block_id in paragraph_block_ids if isinstance(block_id, str)}) != len(paragraph_block_ids)
+                    or any(block_id in paragraph_text_by_block for block_id in paragraph_block_ids)
+                ):
+                    raise RuntimeError("PAPER story block validation failed: invalid paragraph ownership")
+                normalized_paragraph = re.sub(r"\s+", "", paragraph_text)
+                paragraph_position = body_normalized.find(normalized_paragraph, paragraph_position + 1)
+                if paragraph_position < 0:
+                    raise RuntimeError(
+                        "PAPER story block validation failed: paragraph text is not in article"
+                    )
+                for block_id in paragraph_block_ids:
+                    paragraph_text_by_block[block_id] = normalized_paragraph
         previous_position = -1
         normalized_blocks: list[tuple[dict[str, Any], str]] = []
         blocks_by_evidence: dict[str, list[tuple[dict[str, Any], str]]] = {}
@@ -686,19 +714,24 @@ def _paper_validate_story_blocks(
             }
             if len(figure_groups) > 1:
                 raise RuntimeError("PAPER story block validation failed: mixed Figure evidence")
-            block_normalized = re.sub(r"\s+", "", text)
-            position = body_normalized.find(block_normalized, previous_position + 1)
-            if position < 0:
-                raise RuntimeError(
-                    "PAPER story block validation failed: block text is not in its planned paragraph"
-                )
-            previous_position = position
+            block_normalized = paragraph_text_by_block.get(block_id) or re.sub(r"\s+", "", text)
+            if block_id not in paragraph_text_by_block:
+                position = body_normalized.find(block_normalized, previous_position + 1)
+                if position < 0:
+                    raise RuntimeError(
+                        "PAPER story block validation failed: block text is not in its planned paragraph"
+                    )
+                previous_position = position
             normalized_blocks.append((block, block_normalized))
             for evidence_id in evidence_ids:
                 blocks_by_evidence.setdefault(evidence_id, []).append(
                     (block, block_normalized)
                 )
             seen_evidence.update(evidence_ids)
+        if planned_paragraphs is not None and set(paragraph_text_by_block) != {
+            str(block.get("id") or "") for block in blocks if isinstance(block, dict)
+        }:
+            raise RuntimeError("PAPER story block validation failed: paragraph block coverage changed")
         if seen_evidence != beat_ids:
             raise RuntimeError("PAPER story block validation failed: omitted or duplicated evidence")
 
@@ -739,9 +772,7 @@ def _paper_validate_story_blocks(
                             "PAPER story block validation failed: evidence is not bound to one block: "
                             f"evidence_id={evidence_id!r}"
                         )
-                    if normalized_anchor not in _normalize_evidence_anchor(
-                        str(owning_blocks[0][0].get("text") or "")
-                    ):
+                    if normalized_anchor not in _normalize_evidence_anchor(owning_blocks[0][1]):
                         raise RuntimeError(
                             "PAPER evidence anchor missing from bound block: "
                             f"evidence_id={evidence_id!r}; anchor={anchor!r}; "
@@ -1782,21 +1813,15 @@ def _paper_story_block_specs(
     for beat in story_plan.get("story_beats") or []:
         beat_id = str(beat.get("id") or "")
         runs: list[tuple[str, list[str]]] = []
-        current_group = ""
-        current_evidence: list[str] = []
         for evidence_id in beat.get("evidence_ids") or []:
             evidence_id = str(evidence_id).strip()
             record = clean_by_id.get(evidence_id)
             if record is None:
                 raise RuntimeError(f"PAPER unknown evidence_id: {evidence_id}")
             group = str(record.get("evidence_group") or "context")
-            if current_evidence and group != current_group:
-                runs.append((current_group, current_evidence))
-                current_evidence = []
-            current_group = group
-            current_evidence.append(evidence_id)
-        if current_evidence:
-            runs.append((current_group, current_evidence))
+            # Keep every immutable evidence item independently addressable so
+            # the Article Editor can later merge related blocks into prose.
+            runs.append((group, [evidence_id]))
 
         specs: list[dict[str, Any]] = []
         for index, (group, evidence_ids) in enumerate(runs, start=1):
@@ -2268,21 +2293,33 @@ def _paper_story_writer(
 
 
 def _paper_article_editor_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "section_id": str(section.get("id") or ""),
-            "title": str(section.get("title") or ""),
-            "blocks": [
+    output: list[dict[str, Any]] = []
+    for section in sections:
+        paragraphs = section.get("paragraphs") or []
+        if not paragraphs:
+            paragraphs = [
                 {
-                    "block_id": str(block.get("id") or block.get("block_id") or ""),
+                    "block_ids": [
+                        str(block.get("id") or block.get("block_id") or "")
+                    ],
                     "text": str(block.get("text") or ""),
                 }
                 for block in section.get("blocks") or []
                 if isinstance(block, dict)
+            ]
+        output.append({
+            "section_id": str(section.get("id") or ""),
+            "title": str(section.get("title") or ""),
+            "paragraphs": [
+                {
+                    "block_ids": list(paragraph.get("block_ids") or []),
+                    "text": str(paragraph.get("text") or ""),
+                }
+                for paragraph in paragraphs
+                if isinstance(paragraph, dict)
             ],
-        }
-        for section in sections
-    ]
+        })
+    return output
 
 
 def _paper_normalize_article_editor_output(
@@ -2292,58 +2329,66 @@ def _paper_normalize_article_editor_output(
 ) -> list[dict[str, Any]]:
     if set(response) != {"sections"} or not isinstance(response.get("sections"), list):
         raise RuntimeError("PAPER article editor returned invalid fields")
-    expected_sections = [str(section.get("id") or "") for section in plan.get("sections") or []]
-    expected_section_ids = set(expected_sections)
-    specs_by_id = _paper_block_specs_by_id(block_specs)
-    expected_block_ids = set(specs_by_id)
+    expected_section_ids = {
+        str(section.get("id") or "") for section in plan.get("sections") or []
+    }
+    expected_block_ids = set(_paper_block_specs_by_id(block_specs))
     seen_sections: set[str] = set()
     seen_blocks: set[str] = set()
     normalized: list[dict[str, Any]] = []
     for raw_section in response["sections"]:
-        if not isinstance(raw_section, dict):
-            raise RuntimeError("PAPER article editor returned an invalid section")
-        section_id = str(raw_section.get("section_id") or raw_section.get("id") or "").strip()
+        if not isinstance(raw_section, dict) or set(raw_section) != {"section_id", "title", "paragraphs"}:
+            raise RuntimeError("PAPER article editor returned invalid section fields")
+        section_id = str(raw_section.get("section_id") or "").strip()
         title = str(raw_section.get("title") or "").strip()
-        raw_blocks = raw_section.get("blocks")
+        raw_paragraphs = raw_section.get("paragraphs")
         if (
             not section_id
             or section_id not in expected_section_ids
             or section_id in seen_sections
             or not title
-            or not isinstance(raw_blocks, list)
-            or not raw_blocks
+            or "\n" in title
+            or title.startswith("#")
+            or any(_paper_metadata_leakage_lint(title).values())
+            or not isinstance(raw_paragraphs, list)
+            or not raw_paragraphs
         ):
             raise RuntimeError(
                 "PAPER article editor returned invalid section structure: "
                 f"section_id={section_id!r}"
             )
         seen_sections.add(section_id)
-        blocks: list[dict[str, str]] = []
-        for raw_block in raw_blocks:
-            if not isinstance(raw_block, dict):
-                raise RuntimeError("PAPER article editor returned an invalid block")
-            block_id = str(raw_block.get("block_id") or raw_block.get("id") or "").strip()
-            text = raw_block.get("text")
+        paragraphs: list[dict[str, Any]] = []
+        for raw_paragraph in raw_paragraphs:
+            if not isinstance(raw_paragraph, dict) or set(raw_paragraph) != {"block_ids", "text"}:
+                raise RuntimeError("PAPER article editor returned invalid paragraph fields")
+            block_ids = raw_paragraph.get("block_ids")
+            text = raw_paragraph.get("text")
+            normalized_ids = [block_id.strip() for block_id in block_ids] if isinstance(block_ids, list) and all(isinstance(block_id, str) for block_id in block_ids) else []
             if (
-                not block_id
-                or block_id not in expected_block_ids
-                or block_id in seen_blocks
+                not normalized_ids
+                or len(set(normalized_ids)) != len(normalized_ids)
+                or any(
+                    not block_id
+                    or block_id not in expected_block_ids
+                    or block_id in seen_blocks
+                    for block_id in normalized_ids
+                )
                 or not isinstance(text, str)
                 or not text.strip()
             ):
-                raise RuntimeError(
-                    "PAPER article editor returned invalid block structure: "
-                    f"block_id={block_id!r}"
-                )
-            seen_blocks.add(block_id)
+                raise RuntimeError("PAPER article editor returned invalid paragraph structure")
+            seen_blocks.update(normalized_ids)
             clean_text = _paper_plain_language_cleanup(_paper_clean_story_text(text)).strip()
-            if not clean_text:
-                raise RuntimeError(
-                    "PAPER article editor returned empty block text: "
-                    f"block_id={block_id!r}"
-                )
-            blocks.append({"block_id": block_id, "text": clean_text})
-        normalized.append({"id": section_id, "title": title, "blocks": blocks})
+            clean_text = re.sub(r"\s*\n+\s*", " ", clean_text)
+            if (
+                not clean_text
+                or re.search(r"(?m)^\s*(?:#{1,6}\s|>\s|!\[|[-*+]\s|<\/?[A-Za-z])", clean_text)
+                or any(_paper_metadata_leakage_lint(clean_text).values())
+            ):
+                raise RuntimeError("PAPER article editor returned non-prose or metadata text")
+            paragraphs.append({"block_ids": normalized_ids, "text": clean_text})
+        normalized.append({"id": section_id, "title": title, "paragraphs": paragraphs})
     if seen_sections != expected_section_ids:
         raise RuntimeError(
             "PAPER article editor omitted or duplicated sections: "
@@ -2369,13 +2414,11 @@ def _paper_article_editor(
     block_specs: dict[str, list[dict[str, Any]]],
     feedback: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    block_contract = [
+    writing_facts = [
         {
             "block_id": spec["block_id"],
-            "section_id": spec["beat_id"],
-            "evidence_ids": list(spec.get("evidence_ids") or []),
-            "mandatory_anchors": list(spec.get("anchors") or []),
-            "figure_ids": list(spec.get("figure_ids") or []),
+            "required_facts": list(spec.get("anchors") or []),
+            "has_figure": bool(spec.get("figure_ids")),
         }
         for specs in block_specs.values()
         for spec in specs
@@ -2387,7 +2430,7 @@ def _paper_article_editor(
             "abstract": abstract,
             "draft": draft,
             "sections": _paper_article_editor_sections(plan.get("sections") or []),
-            "block_contract": block_contract,
+            "writing_facts": writing_facts,
             "style_exemplar": style_exemplar,
             "article_feedback": feedback or {},
             "_model": model,
@@ -2421,23 +2464,49 @@ def _paper_article_editor_rebuild_sections(
     for item in generated:
         section_id = str(item.get("id") or "")
         section = copy.deepcopy(baseline_by_id[section_id])
+        paragraphs: list[dict[str, Any]] = []
         blocks: list[dict[str, Any]] = []
         evidence_ids: list[str] = []
-        for raw_block in item["blocks"]:
-            block_id = str(raw_block["block_id"])
-            spec = specs_by_id[block_id]
-            for evidence_id in spec.get("evidence_ids") or []:
-                if evidence_id not in evidence_ids:
-                    evidence_ids.append(evidence_id)
-            blocks.append({
-                "id": block_id,
-                "evidence_ids": list(spec.get("evidence_ids") or []),
-                "text": str(raw_block["text"]).strip(),
-                "figure_ids": list(spec.get("figure_ids") or []),
-                "source_paragraph_ids": list(spec.get("source_paragraph_ids") or []),
+        for raw_paragraph in item["paragraphs"]:
+            paragraph_block_ids = list(raw_paragraph["block_ids"])
+            paragraph_text = str(raw_paragraph["text"]).strip()
+            paragraph_evidence_ids: list[str] = []
+            paragraph_source_ids: list[str] = []
+            paragraph_figure_ids: list[str] = []
+            for block_id in paragraph_block_ids:
+                spec = specs_by_id[block_id]
+                for evidence_id in spec.get("evidence_ids") or []:
+                    if evidence_id not in evidence_ids:
+                        evidence_ids.append(evidence_id)
+                    if evidence_id not in paragraph_evidence_ids:
+                        paragraph_evidence_ids.append(evidence_id)
+                for source_id in spec.get("source_paragraph_ids") or []:
+                    source_id = str(source_id).strip()
+                    if source_id and source_id not in paragraph_source_ids:
+                        paragraph_source_ids.append(source_id)
+                for figure_id in spec.get("figure_ids") or []:
+                    figure_id = _paper_figure_id(figure_id)
+                    if figure_id and figure_id not in paragraph_figure_ids:
+                        paragraph_figure_ids.append(figure_id)
+            paragraphs.append({
+                "block_ids": paragraph_block_ids,
+                "text": paragraph_text,
+                "evidence_ids": paragraph_evidence_ids,
+                "source_paragraph_ids": paragraph_source_ids,
+                "figure_ids": paragraph_figure_ids,
             })
+            for block_id in paragraph_block_ids:
+                spec = specs_by_id[block_id]
+                blocks.append({
+                    "id": block_id,
+                    "evidence_ids": list(spec.get("evidence_ids") or []),
+                    "text": paragraph_text,
+                    "figure_ids": list(spec.get("figure_ids") or []),
+                    "source_paragraph_ids": list(spec.get("source_paragraph_ids") or []),
+                })
+        section["paragraphs"] = paragraphs
         section["blocks"] = blocks
-        section["body"] = "\n\n".join(block["text"] for block in blocks)
+        section["body"] = "\n\n".join(paragraph["text"] for paragraph in paragraphs)
         section["figure_ids"] = list(dict.fromkeys(
             figure_id
             for block in blocks
@@ -2689,24 +2758,50 @@ def _paper_style_review(
     feedback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Review prose only; never accept edits to text or scientific metadata."""
-    review_sections = [
-        {
-            "section_id": str(section.get("id") or ""),
-            "title": str(section.get("title") or ""),
-            "blocks": [
+    review_sections = []
+    for section in sections:
+        if article_level:
+            paragraphs = [
                 {
-                    "block_id": str(block.get("id") or block.get("block_id") or ""),
-                    "text": str(block.get("text") or ""),
+                    "block_ids": list(paragraph.get("block_ids") or []),
+                    "text": str(paragraph.get("text") or ""),
                 }
-                for block in section.get("blocks") or []
-                if isinstance(block, dict)
-            ],
-        }
-        for section in sections
-    ]
+                for paragraph in section.get("paragraphs") or []
+                if isinstance(paragraph, dict)
+            ]
+            if not paragraphs:
+                paragraphs = [
+                    {
+                        "block_ids": [str(block.get("id") or block.get("block_id") or "")],
+                        "text": str(block.get("text") or ""),
+                    }
+                    for block in section.get("blocks") or []
+                    if isinstance(block, dict)
+                ]
+            review_sections.append({
+                "section_id": str(section.get("id") or ""),
+                "title": str(section.get("title") or ""),
+                "paragraphs": paragraphs,
+            })
+        else:
+            review_sections.append({
+                "section_id": str(section.get("id") or ""),
+                "title": str(section.get("title") or ""),
+                "blocks": [
+                    {
+                        "block_id": str(block.get("id") or block.get("block_id") or ""),
+                        "text": str(block.get("text") or ""),
+                    }
+                    for block in section.get("blocks") or []
+                    if isinstance(block, dict)
+                ],
+            })
     article_body = "\n\n".join(
         f"## {section['title']}\n\n"
-        + "\n\n".join(block["text"] for block in section["blocks"])
+        + "\n\n".join(
+            item["text"]
+            for item in (section.get("paragraphs") or section.get("blocks") or [])
+        )
         for section in review_sections
     )
     response = _paper_completion_json(
@@ -2725,10 +2820,11 @@ def _paper_style_review(
         raise RuntimeError("PAPER style reviewer returned invalid fields")
     if article_level:
         valid_ids = {
-            block["block_id"]
+            block_id
             for section in review_sections
-            for block in section["blocks"]
-            if block["block_id"]
+            for paragraph in section["paragraphs"]
+            for block_id in paragraph["block_ids"]
+            if block_id
         }
         issues: list[dict[str, Any]] = []
         for issue in response["issues"]:
@@ -2934,8 +3030,14 @@ def _paper_write_section(
 def _paper_assemble_markdown(display_title: str, abstract_lead: str, sections: list[dict[str, Any]]) -> str:
     chunks = [f"# {display_title}", abstract_lead.strip()]
     for section in sections:
+        paragraphs = section.get("paragraphs") or []
         blocks = section.get("blocks") or []
-        if blocks:
+        if paragraphs:
+            body = "\n\n".join(
+                str(paragraph.get("text") or "").strip()
+                for paragraph in paragraphs
+            ).strip()
+        elif blocks:
             body = "\n\n".join(str(block.get("text") or "").strip() for block in blocks).strip()
         else:
             body = str(section.get("body") or "").strip()
@@ -3181,7 +3283,25 @@ _PAPER_SINGLE_HIT_STYLE_KEYS = frozenset({
     "真正不是而是",
     "与其说不如说",
     "roughly",
+    "metadata_leakage",
 })
+
+
+def _paper_metadata_leakage_lint(text: str) -> dict[str, int]:
+    patterns = {
+        "证据锚点": r"证据锚点",
+        "锚点为": r"锚点为",
+        "对应的锚点": r"对应的锚点",
+        "mandatory anchor": r"mandatory[_ ]+anchor",
+        "required fact": r"required[_ ]+fact",
+        "evidence_id": r"evidence_id",
+        "block_id": r"block_id",
+        "provenance": r"provenance",
+    }
+    return {
+        name: len(re.findall(pattern, str(text or ""), flags=re.IGNORECASE))
+        for name, pattern in patterns.items()
+    }
 
 
 def _paper_ai_style_lint(markdown: str, include_abstract: bool = False) -> dict[str, int]:
@@ -3213,12 +3333,22 @@ def _paper_ai_style_lint(markdown: str, include_abstract: bool = False) -> dict[
         "这意味着": r"这意味着",
         "综上所述": r"综上所述",
         "roughly": r"(?i)\broughly\b",
+        "metadata_leakage": (
+            r"(?:证据锚点|锚点为|对应的锚点|mandatory[_ ]?anchor|required[_ ]?fact|"
+            r"evidence_id|block_id|provenance)"
+        ),
         "作者式第一人称": (
             r"(?:我室|咱们|我们|本研究(?:发现|展示|使用|进一步分析|的结果)|"
             r"本文(?:发现|展示|使用|进一步分析|的结果))"
         ),
     }
-    return {name: len(re.findall(pattern, prose)) for name, pattern in patterns.items()}
+    counts = {name: len(re.findall(pattern, prose)) for name, pattern in patterns.items()}
+    if include_abstract:
+        title_text = "\n".join(title for title, _ in _paper_body_sections(markdown))
+        counts["metadata_leakage"] += len(
+            re.findall(patterns["metadata_leakage"], title_text)
+        )
+    return counts
 
 
 def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
@@ -3228,6 +3358,11 @@ def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
         count > 1 for key, count in counts.items()
         if key not in _PAPER_SINGLE_HIT_STYLE_KEYS and key != "作者式第一人称"
     ) or sum(counts.values()) > 4
+
+
+def _paper_require_clean_final_style_lint(counts: dict[str, int]) -> None:
+    if _paper_ai_style_lint_failed(counts):
+        raise RuntimeError("PAPER final style lint failed after local fallback")
 
 
 def _paper_chinese_char_count(text: str) -> int:
@@ -3449,13 +3584,6 @@ def _paper_editor_anchor_audit(
         ]
         if before_indexes and not after_indexes:
             issues.append({"type": "missing_anchor", "anchor": anchor})
-        elif before_indexes and before_indexes != after_indexes:
-            issues.append({
-                "type": "anchor_section_moved",
-                "anchor": anchor,
-                "before_sections": before_indexes,
-                "after_sections": after_indexes,
-            })
     return {"issues": issues, "issue_count": len(issues)}
 
 
@@ -4147,19 +4275,21 @@ PAPER_STORY_WRITER_PROMPT = (
 )
 
 PAPER_ARTICLE_EDITOR_PROMPT = (
-    "你是中文科学新闻的Article Editor。一次性阅读完整PAPER草稿、Abstract、全部sections和全部block，"
+    "你是中文科学新闻的Article Editor。一次性阅读完整PAPER草稿、Abstract、全部sections和全部自然段，"
     "并把五篇范文全文当作主要参考，学习整篇文章的组织、信息推进、段落节奏、句法和自然中文。"
-    "根据当前论文自己的证据重新组织叙事：可以重排sections和blocks、改写section标题、压缩后文对已解释机制的重复，"
-    "但不能把文章写成Figure目录，不能按Fig.1、Fig.2顺序汇报，也不能复制范文事实、数字、人物、地点或结论。"
-    "方法只保留帮助读者理解结论所需的部分，数字只保留有用且有证据支持的内容。"
-    "Python提供的block_contract是不可变科学边界：每个block_id必须原样返回一次；mandatory_anchors必须原样保留在对应block；"
-    "figure_ids和evidence_ids只可阅读，不能返回、修改、拆分、合并或重新归属。不得发明事实、因果、意义、数字或来源。"
-    "返回严格JSON且只能包含sections。每个section使用section_id、title和blocks；每个block只能使用block_id和text。"
-    "所有原有section_id和block_id必须各出现恰好一次，允许任意重排。"
+    "根据当前论文自己的科学内容重新组织叙事：可以重排sections和自然段，也可以把多个相邻或相关block合并到同一个自然段，"
+    "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。不要把文章写成Figure目录，不要按图号顺序汇报，"
+    "不要复制范文事实、数字、人物、地点或结论；方法只保留帮助理解结论所需的部分。"
+    "writing_facts中的required_facts只是必须保留的论文事实，has_figure只是附近需要承载图的提示；"
+    "不要在正文提到required fact、evidence、证据、锚点、约束、block、metadata、provenance或任何系统概念。"
+    "不得发明事实、因果、意义、数字或来源。每个原有block_id必须在全文一个且仅一个paragraph的block_ids中出现，"
+    "不得新增、删除或重复block_id；block_ids只用于Python恢复事实归属，不要把它们写进正文。"
+    "返回严格JSON且只能包含sections。每个section使用section_id、title和paragraphs；每个paragraph只能使用block_ids和text。"
+    "所有原有section_id和block_id必须各出现恰好一次，允许sections、paragraphs和block_ids任意重排。"
     + PAPER_FIDELITY_CONTRACT
     + PAPER_NARRATOR_CONTRACT
-    + "禁止明显AI或论文翻译腔，包括我们、咱们、并非、而不是、不是……而是、值得注意的是、这意味着、综上所述等。"
-    + "输出格式：{\"sections\":[{\"section_id\":\"...\",\"title\":\"...\",\"blocks\":[{\"block_id\":\"...\",\"text\":\"...\"}]}]}"
+    + "禁止明显AI或论文翻译腔，包括我们、咱们、并非、并不是、而不是、不是……而是、值得注意的是、这意味着、综上所述等。"
+    + "输出格式：{\"sections\":[{\"section_id\":\"...\",\"title\":\"...\",\"paragraphs\":[{\"block_ids\":[\"...\"],\"text\":\"...\"}]}]}"
 )
 
 
@@ -4168,7 +4298,7 @@ PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
     "检查整篇文章的组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
     "必须检查：跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
     "术语和地名是否一致、中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
-    "每个跨block问题必须一次性列出全部受影响的已有block_ids，并给出一条整篇revision_instruction；不要分别制造局部修句任务。"
+    "每个跨paragraph问题必须一次性列出全部受影响的已有block_ids，并给出一条整篇revision_instruction；不要分别制造局部修句任务。"
     "不要修改科学事实，不要发明证据，不要修改或返回evidence/source/Figure元数据。没有明确问题返回空issues。"
     "返回严格JSON且只能包含issues："
     "{\"issues\":[{\"block_ids\":[\"block-id\"],\"issue\":\"article-level issue\",\"instruction\":\"whole-article revision instruction\"}]}"
@@ -5251,7 +5381,10 @@ def _generate_paper_article_markdown(
                 _remove_unverified_paper_quotes(candidate_markdown, paper_text),
                 display_title,
             )
-            candidate_lint = _paper_ai_style_lint(candidate_markdown)
+            candidate_lint = _paper_ai_style_lint(
+                candidate_markdown,
+                include_abstract=True,
+            )
             if _paper_ai_style_lint_failed(candidate_lint):
                 logger.warning(
                     "PAPER local fallback did not clear final style lint; rolling back"
@@ -5266,8 +5399,7 @@ def _generate_paper_article_markdown(
         else:
             final_author_rewrite_rolled_back = True
     plan["final_style_lint"] = final_lint
-    if _paper_ai_style_lint_failed(final_lint) and not final_author_rewrite_rolled_back:
-        raise RuntimeError("PAPER final style lint failed after local fallback")
+    _paper_require_clean_final_style_lint(final_lint)
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
     plan["popular_science_audit"] = popular_science_audit

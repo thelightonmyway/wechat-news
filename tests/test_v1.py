@@ -94,8 +94,10 @@ from writer.llm import (
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_require_clean_final_style_lint,
     _paper_apply_article_editor_candidate,
     _paper_article_editor,
+    _paper_article_editor_rebuild_sections,
     _paper_deauthor_abstract,
     _paper_normalize_article_editor_output,
     _paper_apply_story_output,
@@ -110,6 +112,7 @@ from writer.llm import (
     _paper_story_sections,
     _paper_story_block_specs,
     _paper_plain_language_cleanup,
+    _paper_metadata_leakage_lint,
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
     _paper_figure_evidence_bundles,
@@ -3537,12 +3540,12 @@ class V1Tests(unittest.TestCase):
                     {
                         "section_id": "section-2",
                         "title": "机制如何接上结果",
-                        "blocks": [{"block_id": "section-2-block-1", "text": "第二段。"}],
+                        "paragraphs": [{"block_ids": ["section-2-block-1"], "text": "第二段。"}],
                     },
                     {
                         "section_id": "section-1",
                         "title": "先看现象",
-                        "blocks": [{"block_id": "section-1-block-1", "text": "第一段。"}],
+                        "paragraphs": [{"block_ids": ["section-1-block-1"], "text": "第一段。"}],
                     },
                 ]
             }, ensure_ascii=False)))]
@@ -3566,7 +3569,24 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(payload["style_exemplar"], corpus)
         self.assertEqual(payload["draft"].count("旧"), 2)
         self.assertEqual({item["section_id"] for item in payload["sections"]}, {"section-1", "section-2"})
-        self.assertEqual({item["block_id"] for item in payload["block_contract"]}, {"section-1-block-1", "section-2-block-1"})
+        self.assertEqual({item["block_id"] for item in payload["writing_facts"]}, {"section-1-block-1", "section-2-block-1"})
+        self.assertEqual(
+            next(item for item in payload["writing_facts"] if item["block_id"] == "section-1-block-1")["required_facts"],
+            ["80%"],
+        )
+        self.assertTrue(
+            next(item for item in payload["writing_facts"] if item["block_id"] == "section-1-block-1")["has_figure"]
+        )
+        self.assertNotIn("anchors", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("evidence_ids", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("mandatory_anchors", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("source_paragraph_ids", json.dumps(payload, ensure_ascii=False))
+        serialized_payload = json.dumps(payload, ensure_ascii=False)
+        for forbidden in (
+            "mandatory_anchors", "anchors", "source_paragraph_ids", "supported_figures",
+            "provenance", "mandatory anchor", "required fact",
+        ):
+            self.assertNotIn(forbidden, serialized_payload)
         self.assertEqual(payload["article_feedback"]["article_level"], "check cross-block repetition")
         self.assertIn("五篇范文全文", PAPER_ARTICLE_EDITOR_PROMPT)
 
@@ -3580,24 +3600,167 @@ class V1Tests(unittest.TestCase):
             "section-2": [{"block_id": "b2", "beat_id": "section-2"}],
         }
         responses = [
-            {"sections": [{"section_id": "section-1", "title": "一", "blocks": [{"block_id": "b1", "text": "一"}]}]},
+            {"sections": [{"section_id": "section-1", "title": "一", "paragraphs": [{"block_ids": ["b1"], "text": "一"}]}]},
             {"sections": [
-                {"section_id": "section-1", "title": "一", "blocks": [{"block_id": "b1", "text": "一"}]},
-                {"section_id": "section-1", "title": "重复", "blocks": [{"block_id": "b2", "text": "二"}]},
+                {"section_id": "section-1", "title": "一", "paragraphs": [{"block_ids": ["b1"], "text": "一"}]},
+                {"section_id": "section-1", "title": "重复", "paragraphs": [{"block_ids": ["b2"], "text": "二"}]},
             ]},
             {"sections": [
-                {"section_id": "unknown", "title": "未知", "blocks": [{"block_id": "b1", "text": "一"}]},
-                {"section_id": "section-2", "title": "二", "blocks": [{"block_id": "b2", "text": "二"}]},
+                {"section_id": "unknown", "title": "未知", "paragraphs": [{"block_ids": ["b1"], "text": "一"}]},
+                {"section_id": "section-2", "title": "二", "paragraphs": [{"block_ids": ["b2"], "text": "二"}]},
             ]},
             {"sections": [
-                {"section_id": "section-1", "title": "一", "blocks": [{"block_id": "b1", "text": "一"}]},
-                {"section_id": "section-2", "title": "二", "blocks": [{"block_id": "b1", "text": "二"}]},
+                {"section_id": "section-1", "title": "一", "paragraphs": [{"block_ids": ["b1"], "text": "一"}]},
+                {"section_id": "section-2", "title": "二", "paragraphs": [{"block_ids": ["b1"], "text": "二"}]},
             ]},
         ]
         for response in responses:
             with self.subTest(response=response):
                 with self.assertRaises(RuntimeError):
                     _paper_normalize_article_editor_output(response, plan, specs)
+
+    def test_paper_article_editor_accepts_merged_paragraph_and_unions_bindings(self):
+        section = {
+            "id": "section-1",
+            "title": "结果",
+            "role": "result",
+            "findings": [{"id": "finding-1", "evidence_ids": ["e1", "e2"]}],
+            "story_beat": {"evidence_ids": ["e1", "e2"]},
+        }
+        plan = {"sections": [section]}
+        specs = {
+            "section-1": [
+                {
+                    "block_id": "b1",
+                    "beat_id": "section-1",
+                    "evidence_ids": ("e1",),
+                    "anchors": ("68%",),
+                    "figure_ids": ("Fig. 1",),
+                    "source_paragraph_ids": ("source-1",),
+                },
+                {
+                    "block_id": "b2",
+                    "beat_id": "section-1",
+                    "evidence_ids": ("e2",),
+                    "anchors": ("49%",),
+                    "figure_ids": ("Fig. 2",),
+                    "source_paragraph_ids": ("source-2",),
+                },
+            ]
+        }
+        evidence_map = {
+            "e1": (section, section["findings"][0]),
+            "e2": (section, section["findings"][0]),
+        }
+        generated = [{
+            "id": "section-1",
+            "title": "结果如何连起来",
+            "paragraphs": [{
+                "block_ids": ["b1", "b2"],
+                "text": "结果覆盖约68%的区域，气候平均贡献约49%。",
+            }],
+        }]
+        registry = [
+            {"evidence_id": "e1", "source_paragraph_ids": ["source-1"], "source_sentence": "约68%。", "anchors": ["68%"]},
+            {"evidence_id": "e2", "source_paragraph_ids": ["source-2"], "source_sentence": "约49%。", "anchors": ["49%"]},
+        ]
+        rebuilt = _paper_article_editor_rebuild_sections(
+            generated, plan, evidence_map, registry, specs, {"source-1", "source-2"}
+        )
+        paragraph = rebuilt[0]["paragraphs"][0]
+        self.assertEqual(paragraph["block_ids"], ["b1", "b2"])
+        self.assertEqual(paragraph["evidence_ids"], ["e1", "e2"])
+        self.assertEqual(paragraph["source_paragraph_ids"], ["source-1", "source-2"])
+        self.assertEqual(paragraph["figure_ids"], ["Fig. 1", "Fig. 2"])
+        self.assertEqual(rebuilt[0]["blocks"][0]["evidence_ids"], ["e1"])
+        self.assertEqual(rebuilt[0]["blocks"][1]["evidence_ids"], ["e2"])
+
+    def test_paper_article_editor_rejects_duplicate_missing_and_unknown_block_ids(self):
+        plan = {"sections": [{"id": "section-1", "title": "一", "blocks": []}]}
+        specs = {"section-1": [
+            {"block_id": "b1", "beat_id": "section-1"},
+            {"block_id": "b2", "beat_id": "section-1"},
+        ]}
+        responses = (
+            {"sections": [{"section_id": "section-1", "title": "一", "paragraphs": [
+                {"block_ids": ["b1", "b1"], "text": "一。"},
+                {"block_ids": ["b2"], "text": "二。"},
+            ]}]},
+            {"sections": [{"section_id": "section-1", "title": "一", "paragraphs": [
+                {"block_ids": ["b1"], "text": "一。"},
+            ]}]},
+            {"sections": [{"section_id": "section-1", "title": "一", "paragraphs": [
+                {"block_ids": ["b1", "unknown"], "text": "一。"},
+                {"block_ids": ["b2"], "text": "二。"},
+            ]}]},
+            {"sections": [{"section_id": "section-1", "title": "一", "paragraphs": [
+                {"block_ids": ["b1"], "text": "一。", "evidence_ids": ["e1"]},
+                {"block_ids": ["b2"], "text": "二。"},
+            ]}]},
+        )
+        for response in responses:
+            with self.subTest(response=response):
+                with self.assertRaises(RuntimeError):
+                    _paper_normalize_article_editor_output(response, plan, specs)
+
+    def test_paper_article_editor_merged_paragraph_preserves_and_requires_each_anchor(self):
+        registry = [
+            {"evidence_id": "e1", "source_paragraph_ids": ["source-1"], "source_sentence": "约68%。", "scope": "section_context", "supported_figures": [], "anchors": ["68%"]},
+            {"evidence_id": "e2", "source_paragraph_ids": ["source-2"], "source_sentence": "约49%。", "scope": "section_context", "supported_figures": [], "anchors": ["49%"]},
+        ]
+        section = {
+            "id": "section-1", "title": "结果", "role": "result",
+            "source_paragraph_ids": ["source-1", "source-2"],
+            "findings": [{"id": "finding-1", "evidence_ids": ["e1", "e2"], "figure_ids": []}],
+            "story_beat": {"evidence_ids": ["e1", "e2"]},
+            "blocks": [
+                {"id": "b1", "evidence_ids": ["e1"], "source_paragraph_ids": ["source-1"], "figure_ids": [], "text": "结果覆盖约68%的区域，气候平均贡献约49%。"},
+                {"id": "b2", "evidence_ids": ["e2"], "source_paragraph_ids": ["source-2"], "figure_ids": [], "text": "结果覆盖约68%的区域，气候平均贡献约49%。"},
+            ],
+            "paragraphs": [{"block_ids": ["b1", "b2"], "text": "结果覆盖约68%的区域，气候平均贡献约49%。"}],
+        }
+        plan = {"sections": [section], "story_evidence": {
+            "e1": {"figure_ids": [], "anchors": ["68%"], "source_paragraph_ids": ["source-1"]},
+            "e2": {"figure_ids": [], "anchors": ["49%"], "source_paragraph_ids": ["source-2"]},
+        }}
+        _validate_paper_evidence_plan(
+            plan,
+            "# 标题\n\n## 结果\n\n结果覆盖约68%的区域，气候平均贡献约49%。",
+            {"source-1", "source-2"},
+            evidence_registry=registry,
+        )
+        section["paragraphs"][0]["text"] = "结果覆盖约68%的区域。"
+        section["blocks"][0]["text"] = section["paragraphs"][0]["text"]
+        section["blocks"][1]["text"] = section["paragraphs"][0]["text"]
+        with self.assertRaisesRegex(RuntimeError, "anchor missing from bound block"):
+            _validate_paper_evidence_plan(
+                plan,
+                "# 标题\n\n## 结果\n\n结果覆盖约68%的区域。",
+                {"source-1", "source-2"},
+                evidence_registry=registry,
+            )
+
+    def test_paper_final_style_lint_hard_fails_after_fallback_rollback(self):
+        counts = _paper_ai_style_lint("摘要中的我们仍然保留了metadata leakage。", include_abstract=True)
+        with self.assertRaisesRegex(RuntimeError, "PAPER final style lint failed after local fallback"):
+            _paper_require_clean_final_style_lint(counts)
+
+    def test_paper_metadata_leakage_lint_is_deterministic(self):
+        text = "证据锚点、锚点为、对应的锚点、mandatory anchor、required fact、evidence_id、block_id、provenance。"
+        counts = _paper_metadata_leakage_lint(text)
+        self.assertTrue(all(value > 0 for value in counts.values()))
+        lint = _paper_ai_style_lint(text)
+        self.assertGreater(lint["metadata_leakage"], 0)
+        self.assertTrue(_paper_ai_style_lint_failed(lint))
+
+    def test_paper_article_editor_rejects_metadata_in_paragraph_text(self):
+        plan = {"sections": [{"id": "section-1", "title": "一", "blocks": []}]}
+        specs = {"section-1": [{"block_id": "b1", "beat_id": "section-1"}]}
+        response = {"sections": [{"section_id": "section-1", "title": "一", "paragraphs": [
+            {"block_ids": ["b1"], "text": "对应的证据锚点为约68%。"},
+        ]}]}
+        with self.assertRaisesRegex(RuntimeError, "metadata text"):
+            _paper_normalize_article_editor_output(response, plan, specs)
 
     def test_paper_article_editor_reorders_without_changing_python_bindings(self):
         registry = [
@@ -3624,10 +3787,10 @@ class V1Tests(unittest.TestCase):
             "section-2": [{"block_id": "section-2-block-1", "beat_id": "section-2", "evidence_ids": ("e3",), "anchors": (), "figure_ids": (), "source_paragraph_ids": ("source-3",)}],
         }
         generated = [
-            {"id": "section-2", "title": "水汽如何接上增雪", "blocks": [{"block_id": "section-2-block-1", "text": "机制来自水汽输送。"}]},
-            {"id": "section-1", "title": "先看结果", "blocks": [
-                {"block_id": "section-1-block-2", "text": "结果持续三年。"},
-                {"block_id": "section-1-block-1", "text": "结果达到80%。"},
+            {"id": "section-2", "title": "水汽如何接上增雪", "paragraphs": [{"block_ids": ["section-2-block-1"], "text": "机制来自水汽输送。"}]},
+            {"id": "section-1", "title": "先看结果", "paragraphs": [
+                {"block_ids": ["section-1-block-2"], "text": "结果持续三年。"},
+                {"block_ids": ["section-1-block-1"], "text": "结果达到80%。"},
             ]},
         ]
         working = copy.deepcopy(plan)
@@ -4979,6 +5142,48 @@ class V1Tests(unittest.TestCase):
             self.assertLess(text.index("R = 0.71"), text.index("![Fig. 2]"))
             self.assertLess(text.index("![Fig. 2]"), text.index("R = -0.77"))
             self.assertLess(text.index("R = -0.77"), text.index("![Fig. 3]"))
+
+    def test_paper_merged_paragraph_inserts_all_python_bound_figures_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images_dir = root / "images"
+            images_dir.mkdir()
+            figure_one = images_dir / "figure-01.png"
+            figure_two = images_dir / "figure-02.png"
+            figure_one.write_bytes(b"png")
+            figure_two.write_bytes(b"png")
+            markdown = root / "article.md"
+            markdown.write_text(
+                "## 结果\n\n合并后的自然段同时解释约68%的区域和约49%的来源贡献。\n",
+                encoding="utf-8",
+            )
+            images = [
+                {"local_path": str(figure_one), "figure_number": 1, "caption": "Figure 1", "image_role": "figure"},
+                {"local_path": str(figure_two), "figure_number": 2, "caption": "Figure 2", "image_role": "figure"},
+            ]
+            dossier = {
+                "content_type": PAPER_CONTENT,
+                "paper_evidence_plan": {
+                    "sections": [{
+                        "title": "结果",
+                        "blocks": [
+                            {"id": "b1", "figure_ids": ["Fig. 1"]},
+                            {"id": "b2", "figure_ids": ["Fig. 2"]},
+                        ],
+                        "paragraphs": [{
+                            "block_ids": ["b1", "b2"],
+                            "text": "合并后的自然段同时解释约68%的区域和约49%的来源贡献。",
+                        }],
+                    }],
+                },
+            }
+            _insert_paper_figures(markdown, images, ["图1说明。", "图2说明。"], dossier)
+            text = markdown.read_text(encoding="utf-8")
+            paragraph_index = text.index("合并后的自然段")
+            self.assertLess(paragraph_index, text.index("![Fig. 1]"))
+            self.assertLess(text.index("![Fig. 1]"), text.index("![Fig. 2]"))
+            self.assertEqual(text.count("![Fig. 1]"), 1)
+            self.assertEqual(text.count("![Fig. 2]"), 1)
 
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(

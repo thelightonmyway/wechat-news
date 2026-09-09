@@ -2065,23 +2065,48 @@ def _insert_paper_figures(
             for slot_index, (end, section_index, context) in enumerate(slots)
         ]
         for section in evidence_plan.get("sections", []):
-            for block in section.get("blocks", []) if isinstance(section, dict) else []:
-                if not isinstance(block, dict):
+            if not isinstance(section, dict):
+                continue
+            blocks_by_id = {
+                str(block.get("id") or block.get("block_id") or ""): block
+                for block in section.get("blocks", [])
+                if isinstance(block, dict)
+            }
+            paragraphs = section.get("paragraphs") or []
+            if paragraphs:
+                paragraph_records = []
+                for paragraph in paragraphs:
+                    if not isinstance(paragraph, dict):
+                        continue
+                    paragraph_text = re.sub(r"\s+", "", str(paragraph.get("text") or ""))
+                    paragraph_figures = {
+                        str(figure)
+                        for block_id in paragraph.get("block_ids") or []
+                        for figure in blocks_by_id.get(str(block_id), {}).get("figure_ids") or []
+                    }
+                    paragraph_records.append((paragraph_text, paragraph_figures))
+            else:
+                paragraph_records = [
+                    (
+                        re.sub(r"\s+", "", str(block.get("text") or "")),
+                        {str(figure) for figure in block.get("figure_ids") or []},
+                    )
+                    for block in section.get("blocks", [])
+                    if isinstance(block, dict)
+                ]
+            for paragraph_text, paragraph_figures in paragraph_records:
+                if not paragraph_text:
                     continue
-                block_text = re.sub(r"\s+", "", str(block.get("text") or ""))
-                if not block_text:
-                    continue
-                for figure in block.get("figure_ids") or []:
-                    figure_key = str(figure)
+                for figure_key in paragraph_figures:
                     matches = []
                     for slot_index, end, section_index, context in normalized_slots:
-                        if block_text not in context:
+                        if paragraph_text not in context:
                             continue
                         major_section = next(
                             (
                                 major_index
                                 for major_index, major in enumerate(section_slots)
-                                if block_text in re.sub(r"\s+", "", major[3])
+                                if paragraph_text in re.sub(r"\s+", "", major[3])
                             ),
                             section_index,
                         )
