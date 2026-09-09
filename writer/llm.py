@@ -719,9 +719,17 @@ def _paper_validate_story_blocks(
                     or normalized_anchor in {"90%", "95%", "99%"}
                 ):
                     continue
-                figure_specific = bool(supported_figures) or any(
-                    record.get("scope") == "figure_specific" for record in anchor_records
+                owned_anchor_records = [
+                    record
+                    for record in anchor_records
+                    if str(record.get("evidence_id") or "") == evidence_id
+                ]
+                figure_specific = bool(evidence_figures) or any(
+                    record.get("scope") == "figure_specific"
+                    for record in owned_anchor_records
                 )
+                if not canonical_mode:
+                    figure_specific = figure_specific or bool(supported_figures)
                 owning_blocks = blocks_by_evidence.get(evidence_id, [])
                 duplicate_anchor = len(anchor_evidence_ids.get(normalized_anchor, set())) > 1
                 hard_anchor_owner = bool(evidence_record.get("anchors"))
@@ -741,25 +749,35 @@ def _paper_validate_story_blocks(
                         )
                 if not figure_specific:
                     continue
-                containing_blocks = [
-                    block for block, block_text in normalized_blocks
-                    if normalized_anchor in _normalize_evidence_anchor(block_text)
-                ]
-                if len(containing_blocks) != 1:
+                owner_blocks = owning_blocks
+                if not owner_blocks:
+                    owner_blocks = [
+                        (block, block_text)
+                        for block, block_text in normalized_blocks
+                        if normalized_anchor in _normalize_evidence_anchor(block_text)
+                    ]
+                if not owner_blocks:
                     raise RuntimeError(
-                        "PAPER story block validation failed: figure-specific anchor is not unique to one block: "
-                        f"{anchor!r}"
+                        "PAPER evidence anchor missing from bound block: "
+                        f"evidence_id={evidence_id!r}; anchor={anchor!r}"
                     )
-                block_figures = {
-                    _paper_figure_id(value)
-                    for value in containing_blocks[0].get("figure_ids") or evidence_figures
-                    if str(value).strip()
-                }
                 supported = supported_figures_by_anchor.get(normalized_anchor, set())
-                if supported and not block_figures.intersection(supported):
+                owner_figure_sets = [
+                    {
+                        _paper_figure_id(value)
+                        for value in owner_block.get("figure_ids") or evidence_figures
+                        if str(value).strip()
+                    }
+                    for owner_block, _ in owner_blocks
+                ]
+                if supported and not any(
+                    figure_ids.intersection(supported) for figure_ids in owner_figure_sets
+                ):
+                    owner_block = owner_blocks[0][0]
+                    block_figures = set().union(*owner_figure_sets)
                     raise RuntimeError(
                         "PAPER evidence block figure mismatch: "
-                        f"evidence={anchor!r}; block={containing_blocks[0].get('id')!r}; "
+                        f"evidence={anchor!r}; block={owner_block.get('id')!r}; "
                         f"figures={sorted(block_figures)!r}; supported_figures={sorted(supported)!r}"
                     )
 

@@ -2863,6 +2863,92 @@ class V1Tests(unittest.TestCase):
                 registry,
             )
 
+    def test_paper_repeated_figure_anchor_in_context_block_passes(self):
+        registry = [
+            {
+                "evidence_id": "evidence-figure",
+                "value": "1979–2024",
+                "normalized_value": "1979–2024",
+                "source_paragraph_ids": ["source-F"],
+                "source_sentence": "Figure evidence reports 1979–2024.",
+                "scope": "figure_specific",
+                "supported_figures": ["Fig. 2"],
+                "anchors": ["1979–2024"],
+            },
+            {
+                "evidence_id": "evidence-context",
+                "value": "1979–2024",
+                "normalized_value": "1979–2024",
+                "source_paragraph_ids": ["source-C"],
+                "source_sentence": "Context evidence reports 1979–2024.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": ["1979–2024"],
+            },
+        ]
+        bundles = [{"figure_id": "Fig. 2", "quantitative_anchors": ["1979–2024"]}]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "figure_ids": ["Fig. 2"],
+                "source_paragraph_ids": ["source-F", "source-C"],
+                "findings": [
+                    {
+                        "id": "finding-figure",
+                        "figure_ids": ["Fig. 2"],
+                        "evidence_ids": ["evidence-figure"],
+                        "anchors": ["1979–2024"],
+                    },
+                    {
+                        "id": "finding-context",
+                        "evidence_ids": ["evidence-context"],
+                        "anchors": ["1979–2024"],
+                    },
+                ],
+                "story_beat": {
+                    "evidence_ids": ["evidence-figure", "evidence-context"]
+                },
+                "blocks": [
+                    {
+                        "id": "block-figure",
+                        "evidence_ids": ["evidence-figure"],
+                        "figure_ids": ["Fig. 2"],
+                        "source_paragraph_ids": ["source-F"],
+                        "text": "图中时段为1979–2024。",
+                    },
+                    {
+                        "id": "block-context",
+                        "evidence_ids": ["evidence-context"],
+                        "figure_ids": [],
+                        "source_paragraph_ids": ["source-C"],
+                        "text": "研究背景也覆盖1979–2024。",
+                    },
+                ],
+            }],
+            "story_evidence": {
+                "evidence-figure": {
+                    "figure_ids": ["Fig. 2"],
+                    "anchors": ["1979–2024"],
+                    "source_paragraph_ids": ["source-F"],
+                },
+                "evidence-context": {
+                    "figure_ids": [],
+                    "anchors": ["1979–2024"],
+                    "source_paragraph_ids": ["source-C"],
+                },
+            },
+        }
+        markdown = "# 标题\n\n## 结果\n\n图中时段为1979–2024。\n\n研究背景也覆盖1979–2024。"
+        _validate_paper_evidence_plan(
+            plan,
+            markdown,
+            {"source-F", "source-C"},
+            bundles,
+            registry,
+        )
+
     def test_paper_canonical_section_source_order_is_registry_order(self):
         registry = [
             {
