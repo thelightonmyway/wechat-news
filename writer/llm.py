@@ -1513,7 +1513,8 @@ def _paper_plain_language_cleanup(text: str) -> str:
     cleaned = cleaned.replace("图中的", "其中")
     cleaned = cleaned.replace("陆地—大气通量", "陆面与大气之间的交换")
     cleaned = cleaned.replace("陆地-大气通量", "陆面与大气之间的交换")
-    cleaned = re.sub(r"(?i)(?<![A-Za-z])approximately\s+(?=\d+%)", "约", cleaned)
+    cleaned = re.sub(r"(?i)(?<![A-Za-z])(?:approximately|roughly|about|around)\s+(?=\d+%)", "约", cleaned)
+    cleaned = re.sub(r"约占([^。！？\n]{0,40})的约(?=\d+%)", r"约占\1的", cleaned)
     cleaned = re.sub(r"\b((?:19|20)\d{2})\s+to\s+((?:19|20)\d{2})\b", r"\1—\2", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*[；;]\s*", "。", cleaned)
     cleaned = re.sub(r"。+", "。", cleaned)
@@ -2266,6 +2267,276 @@ def _paper_story_writer(
     return output
 
 
+def _paper_article_editor_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "section_id": str(section.get("id") or ""),
+            "title": str(section.get("title") or ""),
+            "blocks": [
+                {
+                    "block_id": str(block.get("id") or block.get("block_id") or ""),
+                    "text": str(block.get("text") or ""),
+                }
+                for block in section.get("blocks") or []
+                if isinstance(block, dict)
+            ],
+        }
+        for section in sections
+    ]
+
+
+def _paper_normalize_article_editor_output(
+    response: dict[str, Any],
+    plan: dict[str, Any],
+    block_specs: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if set(response) != {"sections"} or not isinstance(response.get("sections"), list):
+        raise RuntimeError("PAPER article editor returned invalid fields")
+    expected_sections = [str(section.get("id") or "") for section in plan.get("sections") or []]
+    expected_section_ids = set(expected_sections)
+    specs_by_id = _paper_block_specs_by_id(block_specs)
+    expected_block_ids = set(specs_by_id)
+    seen_sections: set[str] = set()
+    seen_blocks: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for raw_section in response["sections"]:
+        if not isinstance(raw_section, dict):
+            raise RuntimeError("PAPER article editor returned an invalid section")
+        section_id = str(raw_section.get("section_id") or raw_section.get("id") or "").strip()
+        title = str(raw_section.get("title") or "").strip()
+        raw_blocks = raw_section.get("blocks")
+        if (
+            not section_id
+            or section_id not in expected_section_ids
+            or section_id in seen_sections
+            or not title
+            or not isinstance(raw_blocks, list)
+            or not raw_blocks
+        ):
+            raise RuntimeError(
+                "PAPER article editor returned invalid section structure: "
+                f"section_id={section_id!r}"
+            )
+        seen_sections.add(section_id)
+        blocks: list[dict[str, str]] = []
+        for raw_block in raw_blocks:
+            if not isinstance(raw_block, dict):
+                raise RuntimeError("PAPER article editor returned an invalid block")
+            block_id = str(raw_block.get("block_id") or raw_block.get("id") or "").strip()
+            text = raw_block.get("text")
+            if (
+                not block_id
+                or block_id not in expected_block_ids
+                or block_id in seen_blocks
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                raise RuntimeError(
+                    "PAPER article editor returned invalid block structure: "
+                    f"block_id={block_id!r}"
+                )
+            seen_blocks.add(block_id)
+            clean_text = _paper_plain_language_cleanup(_paper_clean_story_text(text)).strip()
+            if not clean_text:
+                raise RuntimeError(
+                    "PAPER article editor returned empty block text: "
+                    f"block_id={block_id!r}"
+                )
+            blocks.append({"block_id": block_id, "text": clean_text})
+        normalized.append({"id": section_id, "title": title, "blocks": blocks})
+    if seen_sections != expected_section_ids:
+        raise RuntimeError(
+            "PAPER article editor omitted or duplicated sections: "
+            f"missing={sorted(expected_section_ids - seen_sections)!r}; "
+            f"unknown={sorted(seen_sections - expected_section_ids)!r}"
+        )
+    if seen_blocks != expected_block_ids:
+        raise RuntimeError(
+            "PAPER article editor omitted or duplicated blocks: "
+            f"missing={sorted(expected_block_ids - seen_blocks)!r}; "
+            f"unknown={sorted(seen_blocks - expected_block_ids)!r}"
+        )
+    return normalized
+
+
+def _paper_article_editor(
+    client: OpenAI,
+    plan: dict[str, Any],
+    draft: str,
+    abstract: str,
+    style_exemplar: str,
+    model: str,
+    block_specs: dict[str, list[dict[str, Any]]],
+    feedback: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    block_contract = [
+        {
+            "block_id": spec["block_id"],
+            "section_id": spec["beat_id"],
+            "evidence_ids": list(spec.get("evidence_ids") or []),
+            "mandatory_anchors": list(spec.get("anchors") or []),
+            "figure_ids": list(spec.get("figure_ids") or []),
+        }
+        for specs in block_specs.values()
+        for spec in specs
+    ]
+    response = _paper_completion_json(
+        client,
+        PAPER_ARTICLE_EDITOR_PROMPT,
+        {
+            "abstract": abstract,
+            "draft": draft,
+            "sections": _paper_article_editor_sections(plan.get("sections") or []),
+            "block_contract": block_contract,
+            "style_exemplar": style_exemplar,
+            "article_feedback": feedback or {},
+            "_model": model,
+            "_temperature": 0.2,
+        },
+    )
+    return _paper_normalize_article_editor_output(response, plan, block_specs)
+
+
+def _paper_article_editor_rebuild_sections(
+    generated: list[dict[str, Any]],
+    plan: dict[str, Any],
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    evidence_registry: list[dict[str, Any]],
+    block_specs: dict[str, list[dict[str, Any]]],
+    valid_source_ids: set[str],
+) -> list[dict[str, Any]]:
+    baseline_by_id = {
+        str(section.get("id") or ""): section
+        for section in plan.get("sections") or []
+    }
+    specs_by_id = _paper_block_specs_by_id(block_specs)
+    spec_by_evidence: dict[str, dict[str, Any]] = {}
+    for spec in specs_by_id.values():
+        for evidence_id in spec.get("evidence_ids") or []:
+            if evidence_id in spec_by_evidence:
+                raise RuntimeError(f"PAPER duplicate evidence ownership: {evidence_id}")
+            spec_by_evidence[evidence_id] = spec
+    evidence_by_id = _paper_evidence_by_id(evidence_registry)
+    rebuilt: list[dict[str, Any]] = []
+    for item in generated:
+        section_id = str(item.get("id") or "")
+        section = copy.deepcopy(baseline_by_id[section_id])
+        blocks: list[dict[str, Any]] = []
+        evidence_ids: list[str] = []
+        for raw_block in item["blocks"]:
+            block_id = str(raw_block["block_id"])
+            spec = specs_by_id[block_id]
+            for evidence_id in spec.get("evidence_ids") or []:
+                if evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+            blocks.append({
+                "id": block_id,
+                "evidence_ids": list(spec.get("evidence_ids") or []),
+                "text": str(raw_block["text"]).strip(),
+                "figure_ids": list(spec.get("figure_ids") or []),
+                "source_paragraph_ids": list(spec.get("source_paragraph_ids") or []),
+            })
+        section["blocks"] = blocks
+        section["body"] = "\n\n".join(block["text"] for block in blocks)
+        section["figure_ids"] = list(dict.fromkeys(
+            figure_id
+            for block in blocks
+            for figure_id in block.get("figure_ids") or []
+        ))
+        section["source_paragraph_ids"] = _paper_derived_source_ids(
+            evidence_ids, evidence_by_id, valid_source_ids
+        )
+        finding_groups: dict[int, dict[str, Any]] = {}
+        finding_order: list[int] = []
+        for evidence_id in evidence_ids:
+            original_section, original_finding = evidence_map[evidence_id]
+            marker = id(original_finding)
+            if marker not in finding_groups:
+                finding_groups[marker] = {
+                    "finding": copy.deepcopy(original_finding),
+                    "evidence_ids": [],
+                }
+                finding_order.append(marker)
+            finding_groups[marker]["evidence_ids"].append(evidence_id)
+        findings: list[dict[str, Any]] = []
+        for marker in finding_order:
+            grouped = finding_groups[marker]
+            finding = grouped["finding"]
+            grouped_ids = grouped["evidence_ids"]
+            finding["evidence_ids"] = grouped_ids
+            finding["figure_ids"] = list(dict.fromkeys(
+                figure_id
+                for evidence_id in grouped_ids
+                for figure_id in spec_by_evidence[evidence_id].get("figure_ids") or []
+            )) or list(finding.get("figure_ids") or [])
+            finding["source_paragraph_ids"] = _paper_derived_source_ids(
+                grouped_ids, evidence_by_id, valid_source_ids
+            )
+            if evidence_registry:
+                records = [evidence_by_id[evidence_id] for evidence_id in grouped_ids]
+                finding["evidence"] = " ".join(
+                    str(record.get("source_sentence") or record.get("value") or "").strip()
+                    for record in records
+                ).strip()
+                finding["source_sentence"] = [
+                    str(record.get("source_sentence") or "") for record in records
+                ]
+                finding["anchors"] = list(dict.fromkeys(
+                    str(anchor)
+                    for record in records
+                    for anchor in record.get("anchors") or []
+                    if str(anchor).strip()
+                ))
+            findings.append(finding)
+        section["findings"] = findings
+        story_beat = dict(section.get("story_beat") or {})
+        story_beat["evidence_ids"] = evidence_ids
+        section["story_beat"] = story_beat
+        section["title"] = str(item["title"]).strip()
+        rebuilt.append(section)
+    return rebuilt
+
+
+def _paper_apply_article_editor_candidate(
+    plan: dict[str, Any],
+    generated: list[dict[str, Any]],
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    evidence_registry: list[dict[str, Any]],
+    block_specs: dict[str, list[dict[str, Any]]],
+    display_title: str,
+    abstract_lead: str,
+    valid_source_ids: set[str],
+    figure_evidence_bundles: list[dict[str, Any]] | None,
+    current_markdown: str,
+    stage: str,
+) -> tuple[bool, str]:
+    candidate_plan = copy.deepcopy(plan)
+    try:
+        candidate_plan["sections"] = _paper_article_editor_rebuild_sections(
+            generated,
+            plan,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            valid_source_ids,
+        )
+        candidate_markdown = _paper_assemble_markdown(
+            display_title, abstract_lead, candidate_plan["sections"]
+        )
+        _validate_paper_evidence_plan(
+            candidate_plan,
+            candidate_markdown,
+            valid_source_ids,
+            figure_evidence_bundles,
+            evidence_registry,
+        )
+    except Exception as exc:
+        logger.warning("PAPER %s rewrite rejected; retaining prior draft: %s", stage, exc)
+        return False, current_markdown
+    plan["sections"] = candidate_plan["sections"]
+    return True, candidate_markdown
+
+
 def _paper_humanize_story(
     client: OpenAI,
     story_plan: dict[str, Any],
@@ -2414,6 +2685,8 @@ def _paper_style_review(
     sections: list[dict[str, Any]],
     _markdown: str,
     model: str,
+    article_level: bool = False,
+    feedback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Review prose only; never accept edits to text or scientific metadata."""
     review_sections = [
@@ -2438,17 +2711,49 @@ def _paper_style_review(
     )
     response = _paper_completion_json(
         client,
-        PAPER_STYLE_REVIEWER_PROMPT,
+        PAPER_ARTICLE_STYLE_REVIEWER_PROMPT if article_level else PAPER_STYLE_REVIEWER_PROMPT,
         {
             "style_exemplar": style_exemplar,
             "article_body": article_body,
             "sections": review_sections,
+            **({"article_feedback": feedback or {}} if article_level else {}),
             "_model": model,
             "_temperature": 0.1,
         },
     )
     if set(response) != {"issues"} or not isinstance(response.get("issues"), list):
         raise RuntimeError("PAPER style reviewer returned invalid fields")
+    if article_level:
+        valid_ids = {
+            block["block_id"]
+            for section in review_sections
+            for block in section["blocks"]
+            if block["block_id"]
+        }
+        issues: list[dict[str, Any]] = []
+        for issue in response["issues"]:
+            if not isinstance(issue, dict) or set(issue) != {"block_ids", "issue", "instruction"}:
+                raise RuntimeError("PAPER article style reviewer returned invalid issue fields")
+            block_ids = issue.get("block_ids")
+            problem = issue.get("issue")
+            instruction = issue.get("instruction")
+            if (
+                not isinstance(block_ids, list)
+                or not block_ids
+                or len(set(block_ids)) != len(block_ids)
+                or any(not isinstance(block_id, str) or block_id not in valid_ids for block_id in block_ids)
+                or not isinstance(problem, str)
+                or not problem.strip()
+                or not isinstance(instruction, str)
+                or not instruction.strip()
+            ):
+                raise RuntimeError("PAPER article style reviewer returned invalid block issue")
+            issues.append({
+                "block_ids": block_ids,
+                "issue": problem.strip(),
+                "instruction": instruction.strip(),
+            })
+        return {"issues": issues}
     valid_ids = {
         block["block_id"]
         for section in review_sections
@@ -2851,32 +3156,43 @@ def _paper_editorial_rewrite(
     return bodies
 
 
-def _paper_style_lint_text(markdown: str) -> str:
-    """Lint generated body prose, not metadata, titles, or English source quotes."""
+def _paper_style_lint_text(markdown: str, include_abstract: bool = False) -> str:
+    """Lint generated prose while keeping metadata, titles, and source quotes out."""
     sections = _paper_body_sections(markdown)
-    if sections:
-        return "\n\n".join(body for _, body in sections)
-    return markdown
+    body = "\n\n".join(body for _, body in sections)
+    if not include_abstract:
+        return body or markdown
+    first_section = re.search(r"(?m)^##\s+", markdown)
+    lead = markdown[: first_section.start()] if first_section else markdown
+    lead = re.sub(r"(?m)^#\s+.*?$", "", lead).strip()
+    return "\n\n".join(part for part in (lead, body) if part) or markdown
 
 
 _PAPER_SINGLE_HIT_STYLE_KEYS = frozenset({
     "不是而是",
     "并不是而是",
     "并非而是",
+    "并非",
+    "并不是",
+    "而不是",
     "不在而在",
     "不只是更是",
     "不仅更",
     "真正不是而是",
     "与其说不如说",
+    "roughly",
 })
 
 
-def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
-    prose = _paper_style_lint_text(markdown)
+def _paper_ai_style_lint(markdown: str, include_abstract: bool = False) -> dict[str, int]:
+    prose = _paper_style_lint_text(markdown, include_abstract=include_abstract)
     patterns = {
         "不是而是": r"不是[^。！？\n]{0,50}而是",
         "并不是而是": r"并不是[^。！？\n]{0,50}而是",
         "并非而是": r"并非[^。！？\n]{0,50}而是",
+        "并非": r"并非",
+        "并不是": r"并不是",
+        "而不是": r"而不是",
         "不在而在": r"不在[^。！？\n]{0,50}而在",
         "不只是更是": r"不只是[^。！？\n]{0,50}更是",
         "不仅更": r"不仅[^。！？\n]{0,50}更",
@@ -2896,6 +3212,7 @@ def _paper_ai_style_lint(markdown: str) -> dict[str, int]:
         "由此可见": r"由此可见",
         "这意味着": r"这意味着",
         "综上所述": r"综上所述",
+        "roughly": r"(?i)\broughly\b",
         "作者式第一人称": (
             r"(?:我室|咱们|我们|本研究(?:发现|展示|使用|进一步分析|的结果)|"
             r"本文(?:发现|展示|使用|进一步分析|的结果))"
@@ -3458,8 +3775,33 @@ def translate_paper_titles(
         return titles, False, f"{type(exc).__name__}: {exc}"
 
 
+def _paper_deauthor_abstract(text: str) -> str:
+    """Remove first-person author voice without changing Abstract information."""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    replacements = (
+        (r"在此[，,]\s*我们", "研究"),
+        (r"我们的结果", "研究结果"),
+        (r"我们的研究", "该研究"),
+        (r"我们的分析", "研究分析"),
+        (r"我们发现", "结果显示"),
+        (r"我们表明", "研究显示"),
+        (r"我们显示", "结果显示"),
+        (r"我们观察到", "观察结果显示"),
+        (r"我们使用", "研究使用"),
+        (r"我们分析", "研究分析"),
+        (r"我们估计", "研究估计"),
+        (r"我们提出", "研究提出"),
+        (r"我们认为", "研究认为"),
+        (r"在此，我们", "研究"),
+        (r"我们", "研究团队"),
+    )
+    for pattern, replacement in replacements:
+        cleaned = re.sub(pattern, replacement, cleaned)
+    return cleaned
+
+
 def translate_paper_abstract(abstract: str, settings: Settings) -> str:
-    """Translate the original paper Abstract faithfully and lock its structure."""
+    """Translate the original paper Abstract faithfully and remove author voice."""
     source = re.sub(r"\s+", " ", str(abstract or "")).strip()
     if not source:
         return ""
@@ -3494,7 +3836,7 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
     translated = re.sub(r"\s+", " ", str(parsed.get("abstract_cn") or "")).strip()
     if not translated:
         raise RuntimeError("model returned empty Chinese Abstract translation")
-    return translated
+    return _paper_deauthor_abstract(translated)
 
 
 def _replace_paper_lead(markdown: str, abstract_lead: str) -> str:
@@ -3803,6 +4145,35 @@ PAPER_STORY_WRITER_PROMPT = (
     + PAPER_NARRATOR_CONTRACT
     + "本次只写当前story beat，严格按输入blocks顺序返回；每个block只能包含block_id和text。返回严格JSON：{\"title\":\"...\",\"blocks\":[{\"block_id\":\"beat-1-block-1\",\"text\":\"...\"}]}。"
 )
+
+PAPER_ARTICLE_EDITOR_PROMPT = (
+    "你是中文科学新闻的Article Editor。一次性阅读完整PAPER草稿、Abstract、全部sections和全部block，"
+    "并把五篇范文全文当作主要参考，学习整篇文章的组织、信息推进、段落节奏、句法和自然中文。"
+    "根据当前论文自己的证据重新组织叙事：可以重排sections和blocks、改写section标题、压缩后文对已解释机制的重复，"
+    "但不能把文章写成Figure目录，不能按Fig.1、Fig.2顺序汇报，也不能复制范文事实、数字、人物、地点或结论。"
+    "方法只保留帮助读者理解结论所需的部分，数字只保留有用且有证据支持的内容。"
+    "Python提供的block_contract是不可变科学边界：每个block_id必须原样返回一次；mandatory_anchors必须原样保留在对应block；"
+    "figure_ids和evidence_ids只可阅读，不能返回、修改、拆分、合并或重新归属。不得发明事实、因果、意义、数字或来源。"
+    "返回严格JSON且只能包含sections。每个section使用section_id、title和blocks；每个block只能使用block_id和text。"
+    "所有原有section_id和block_id必须各出现恰好一次，允许任意重排。"
+    + PAPER_FIDELITY_CONTRACT
+    + PAPER_NARRATOR_CONTRACT
+    + "禁止明显AI或论文翻译腔，包括我们、咱们、并非、而不是、不是……而是、值得注意的是、这意味着、综上所述等。"
+    + "输出格式：{\"sections\":[{\"section_id\":\"...\",\"title\":\"...\",\"blocks\":[{\"block_id\":\"...\",\"text\":\"...\"}]}]}"
+)
+
+
+PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
+    "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的五篇范文原文是主要参考。"
+    "检查整篇文章的组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
+    "必须检查：跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
+    "术语和地名是否一致、中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
+    "每个跨block问题必须一次性列出全部受影响的已有block_ids，并给出一条整篇revision_instruction；不要分别制造局部修句任务。"
+    "不要修改科学事实，不要发明证据，不要修改或返回evidence/source/Figure元数据。没有明确问题返回空issues。"
+    "返回严格JSON且只能包含issues："
+    "{\"issues\":[{\"block_ids\":[\"block-id\"],\"issue\":\"article-level issue\",\"instruction\":\"whole-article revision instruction\"}]}"
+)
+
 
 PAPER_HUMANIZER_PROMPT = (
     "你是中文母语科学编辑，依据ai-zixun/humanizer-zh的原则，对Story Writer成稿做一次保守的人文化编辑。"
@@ -4340,7 +4711,36 @@ def _generate_paper_article_markdown(
     plan["story_writer_retry_count"] = story_writer_retry_count
 
     markdown = draft
-    lint = _paper_ai_style_lint(markdown)
+    article_editor_succeeded = False
+    try:
+        editor_output = _paper_article_editor(
+            client,
+            plan,
+            markdown,
+            abstract_lead,
+            style_exemplar,
+            settings.model_name,
+            block_specs,
+        )
+        article_editor_succeeded, candidate_markdown = _paper_apply_article_editor_candidate(
+            plan,
+            editor_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+            markdown,
+            "article editor",
+        )
+        if article_editor_succeeded:
+            markdown = candidate_markdown
+            logger.info("PAPER article-level editor validation passed")
+    except Exception as exc:
+        logger.warning("PAPER article-level editor unavailable; retaining Story Writer draft: %s", exc)
+    lint = _paper_ai_style_lint(markdown, include_abstract=True)
     popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
     popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
         draft,
@@ -4359,7 +4759,7 @@ def _generate_paper_article_markdown(
         )
 
     popular_retry_count = 0
-    if popular_audit_failed():
+    if not article_editor_succeeded and popular_audit_failed():
         popular_retry_count = 1
         story_output = _paper_story_writer(
             client,
@@ -4386,7 +4786,7 @@ def _generate_paper_article_markdown(
         if accepted:
             markdown = candidate_markdown
             logger.info("PAPER deterministic evidence validation passed")
-        lint = _paper_ai_style_lint(markdown)
+        lint = _paper_ai_style_lint(markdown, include_abstract=True)
         popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
         popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
             draft,
@@ -4414,14 +4814,18 @@ def _generate_paper_article_markdown(
             logger.warning("PAPER style rewrite generation failed; retaining prior draft: %s", exc)
             return []
 
-    humanized_output = safe_humanize(
-        client,
-        story_plan,
-        clean_evidence,
-        _paper_story_draft_blocks(plan["sections"]),
-        settings.model_name,
-        block_specs=block_specs,
-        style_exemplar=style_exemplar,
+    humanized_output = (
+        safe_humanize(
+            client,
+            story_plan,
+            clean_evidence,
+            _paper_story_draft_blocks(plan["sections"]),
+            settings.model_name,
+            block_specs=block_specs,
+            style_exemplar=style_exemplar,
+        )
+        if not article_editor_succeeded
+        else []
     )
     accepted, candidate_markdown = _paper_apply_story_candidate(
         plan,
@@ -4439,7 +4843,7 @@ def _generate_paper_article_markdown(
     if accepted:
         markdown = candidate_markdown
         logger.info("PAPER deterministic evidence validation passed")
-    else:
+    elif not article_editor_succeeded:
         retry_output = safe_humanize(
             client,
             story_plan,
@@ -4468,21 +4872,83 @@ def _generate_paper_article_markdown(
             logger.info("PAPER deterministic evidence validation passed")
 
     style_review: dict[str, Any] = {"issues": [], "status": "skipped"}
-    try:
-        style_review = {
-            "status": "pass",
-            **_paper_style_review(
-                client,
-                style_exemplar,
-                plan["sections"],
-                markdown,
-                settings.model_name,
-            ),
+    review_issues: list[dict[str, Any]] = []
+    if article_editor_succeeded:
+        article_feedback = {
+            "style_lint": lint,
+            "editor_feedback": popular_feedback,
+            "stop_slop": _paper_stop_slop_audit(markdown),
         }
-    except Exception as exc:
-        logger.warning("PAPER style reviewer returned unusable output; continuing without rewrite: %s", exc)
-        style_review = {"status": "warning", "issues": [], "error": str(exc)}
-    review_issues = style_review.get("issues") or []
+        try:
+            style_review = {
+                "status": "pass",
+                **_paper_style_review(
+                    client,
+                    style_exemplar,
+                    plan["sections"],
+                    markdown,
+                    settings.model_name,
+                    article_level=True,
+                    feedback=article_feedback,
+                ),
+            }
+            review_issues = style_review.get("issues") or []
+        except Exception as exc:
+            logger.warning("PAPER article style reviewer returned unusable output; continuing without revision: %s", exc)
+            style_review = {"status": "warning", "issues": [], "error": str(exc)}
+        if review_issues:
+            try:
+                editor_revision = _paper_article_editor(
+                    client,
+                    plan,
+                    markdown,
+                    abstract_lead,
+                    style_exemplar,
+                    settings.model_name,
+                    block_specs,
+                    {"style_review": review_issues, **article_feedback},
+                )
+                accepted, candidate_markdown = _paper_apply_article_editor_candidate(
+                    plan,
+                    editor_revision,
+                    evidence_map,
+                    evidence_registry,
+                    block_specs,
+                    display_title,
+                    abstract_lead,
+                    valid_source_ids,
+                    figure_evidence_bundles if figure_first else None,
+                    markdown,
+                    "article style revision",
+                )
+                if accepted:
+                    markdown = candidate_markdown
+                    style_review["revised"] = True
+                    logger.info("PAPER article-level style revision validation passed")
+                else:
+                    style_review["status"] = "warning"
+                    style_review["rollback"] = True
+            except Exception as exc:
+                style_review["status"] = "warning"
+                style_review["error"] = str(exc)
+                logger.warning("PAPER article style revision failed; retaining prior draft: %s", exc)
+            review_issues = []
+    else:
+        try:
+            style_review = {
+                "status": "pass",
+                **_paper_style_review(
+                    client,
+                    style_exemplar,
+                    plan["sections"],
+                    markdown,
+                    settings.model_name,
+                ),
+            }
+            review_issues = style_review.get("issues") or []
+        except Exception as exc:
+            logger.warning("PAPER style reviewer returned unusable output; continuing without rewrite: %s", exc)
+            style_review = {"status": "warning", "issues": [], "error": str(exc)}
     if review_issues:
         review_targets = {issue["block_id"] for issue in review_issues}
         review_feedback = {
@@ -4562,7 +5028,8 @@ def _generate_paper_article_markdown(
     humanizer_retry_count = 0
     humanizer_targets = _paper_style_issue_block_ids(plan["sections"])
     if (
-        humanizer_targets
+        not article_editor_succeeded
+        and humanizer_targets
         and (
             _paper_ai_style_lint_failed(_paper_ai_style_lint(markdown))
             or final_humanizer_feedback["abstract_overlong"]
@@ -4636,7 +5103,7 @@ def _generate_paper_article_markdown(
     stop_slop_feedback = _paper_stop_slop_audit(markdown)
     stop_slop_retry_count = 0
     stop_slop_targets = _paper_style_issue_block_ids(plan["sections"])
-    if stop_slop_feedback["issue_count"] and stop_slop_targets:
+    if not article_editor_succeeded and stop_slop_feedback["issue_count"] and stop_slop_targets:
         stop_slop_retry_count = 1
         targeted_output = safe_humanize(
             client,
@@ -4698,7 +5165,7 @@ def _generate_paper_article_markdown(
     if stop_slop_feedback["issue_count"]:
         logger.warning("PAPER stop-slop style audit unresolved after retry; continuing with warning")
 
-    lint = _paper_ai_style_lint(markdown)
+    lint = _paper_ai_style_lint(markdown, include_abstract=True)
     popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
     popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
         humanizer_baseline,
@@ -4722,10 +5189,10 @@ def _generate_paper_article_markdown(
 
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)
-    final_lint = _paper_ai_style_lint(markdown)
+    final_lint = _paper_ai_style_lint(markdown, include_abstract=True)
     final_author_rewrite_rolled_back = False
-    if final_lint.get("作者式第一人称", 0):
-        logger.warning("PAPER final body contains author voice; triggering targeted rewrite")
+    if _paper_ai_style_lint_failed(final_lint):
+        logger.warning("PAPER final prose style lint remains; triggering local fallback rewrite")
         author_baseline_sections = copy.deepcopy(plan["sections"])
         author_baseline_markdown = markdown
         author_baseline_lint = dict(final_lint)
@@ -4785,9 +5252,9 @@ def _generate_paper_article_markdown(
                 display_title,
             )
             candidate_lint = _paper_ai_style_lint(candidate_markdown)
-            if candidate_lint.get("作者式第一人称", 0):
+            if _paper_ai_style_lint_failed(candidate_lint):
                 logger.warning(
-                    "PAPER final author-voice rewrite did not clear author voice; rolling back"
+                    "PAPER local fallback did not clear final style lint; rolling back"
                 )
                 plan["sections"] = author_baseline_sections
                 markdown = author_baseline_markdown
@@ -4799,8 +5266,8 @@ def _generate_paper_article_markdown(
         else:
             final_author_rewrite_rolled_back = True
     plan["final_style_lint"] = final_lint
-    if final_lint.get("作者式第一人称", 0) and not final_author_rewrite_rolled_back:
-        raise RuntimeError("PAPER author voice lint failed after targeted rewrite")
+    if _paper_ai_style_lint_failed(final_lint) and not final_author_rewrite_rolled_back:
+        raise RuntimeError("PAPER final style lint failed after local fallback")
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
     plan["popular_science_audit"] = popular_science_audit

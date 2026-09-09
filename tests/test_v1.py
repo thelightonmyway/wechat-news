@@ -88,11 +88,16 @@ from writer.llm import (
     PAPER_STORY_PLANNER_PROMPT,
     PAPER_STORY_WRITER_PROMPT,
     PAPER_HUMANIZER_PROMPT,
+    PAPER_ARTICLE_EDITOR_PROMPT,
     PAPER_STYLE_REVIEWER_PROMPT,
     PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_apply_article_editor_candidate,
+    _paper_article_editor,
+    _paper_deauthor_abstract,
+    _paper_normalize_article_editor_output,
     _paper_apply_story_output,
     _paper_apply_story_candidate,
     _paper_body_length_audit,
@@ -3485,12 +3490,170 @@ class V1Tests(unittest.TestCase):
                 self.assertTrue(_paper_ai_style_lint_failed(counts))
         self.assertFalse(_paper_ai_style_lint_failed(_paper_ai_style_lint("但是结果仍然稳定，因此可以继续比较。")))
 
+    def test_paper_ai_style_lint_covers_standalone_article_expressions_and_abstract(self):
+        for key, text in (
+            ("并非", "并非来自当地蒸发。"),
+            ("并不是", "并不是来自当地蒸发。"),
+            ("而不是", "主要来自远洋输送，而不是当地蒸发。"),
+            ("roughly", "roughly 68% 的区域出现变化。"),
+            ("作者式第一人称", "我们发现结果仍然稳定。"),
+        ):
+            with self.subTest(key=key):
+                counts = _paper_ai_style_lint(text)
+                self.assertEqual(counts[key], 1)
+                self.assertTrue(_paper_ai_style_lint_failed(counts))
+        full_article = "# 标题\\n\\n研究发现我们发现结果。\\n\\n## 结果\\n\\n并非来自当地蒸发，而不是别的过程。"
+        counts = _paper_ai_style_lint(full_article, include_abstract=True)
+        self.assertEqual(counts["作者式第一人称"], 1)
+        self.assertEqual(counts["并非"], 1)
+        self.assertEqual(counts["而不是"], 1)
+
+    def test_paper_plain_language_cleanup_translates_english_qualifiers(self):
+        cleaned = _paper_plain_language_cleanup("roughly 68% and about 9% of the area changed")
+        self.assertNotIn("roughly", cleaned)
+        self.assertNotIn("about", cleaned)
+        self.assertIn("约68%", cleaned)
+        self.assertIn("约9%", cleaned)
+
+    def test_paper_abstract_deauthoring_preserves_scientific_content(self):
+        source = "我们的结果表明变化可能来自远洋输送；我们发现约74%的区域受影响。"
+        cleaned = _paper_deauthor_abstract(source)
+        self.assertNotIn("我们", cleaned)
+        self.assertIn("研究结果表明变化可能来自远洋输送", cleaned)
+        self.assertIn("约74%的区域受影响", cleaned)
+
     def test_paper_ai_style_lint_flags_broad_body_author_voice(self):
         for phrase in ("我们可以看到", "我们看到", "我们注意到", "咱们"):
             with self.subTest(phrase=phrase):
                 counts = _paper_ai_style_lint(f"{phrase}结果仍然稳定。")
                 self.assertEqual(counts["作者式第一人称"], 1)
                 self.assertTrue(_paper_ai_style_lint_failed(counts))
+
+    def test_paper_article_editor_receives_full_article_and_corpus(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "sections": [
+                    {
+                        "section_id": "section-2",
+                        "title": "机制如何接上结果",
+                        "blocks": [{"block_id": "section-2-block-1", "text": "第二段。"}],
+                    },
+                    {
+                        "section_id": "section-1",
+                        "title": "先看现象",
+                        "blocks": [{"block_id": "section-1-block-1", "text": "第一段。"}],
+                    },
+                ]
+            }, ensure_ascii=False)))]
+        )
+        plan = {"sections": [
+            {"id": "section-1", "title": "现象", "blocks": [{"id": "section-1-block-1", "text": "旧一。"}]},
+            {"id": "section-2", "title": "机制", "blocks": [{"id": "section-2-block-1", "text": "旧二。"}]},
+        ]}
+        specs = {
+            "section-1": [{"block_id": "section-1-block-1", "beat_id": "section-1", "evidence_ids": ("e1",), "anchors": ("80%",), "figure_ids": ("Fig. 1",)}],
+            "section-2": [{"block_id": "section-2-block-1", "beat_id": "section-2", "evidence_ids": ("e2",), "anchors": (), "figure_ids": ()}],
+        }
+        corpus = "范文文件：exemplar_01.md\\n完整范文全文"
+        result = _paper_article_editor(
+            client, plan, "# 标题\\n\\n摘要\\n\\n## 现象\\n\\n旧一。\\n\\n## 机制\\n\\n旧二。",
+            "摘要", corpus, "test-model", specs,
+            {"article_level": "check cross-block repetition"},
+        )
+        self.assertEqual([item["id"] for item in result], ["section-2", "section-1"])
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["style_exemplar"], corpus)
+        self.assertEqual(payload["draft"].count("旧"), 2)
+        self.assertEqual({item["section_id"] for item in payload["sections"]}, {"section-1", "section-2"})
+        self.assertEqual({item["block_id"] for item in payload["block_contract"]}, {"section-1-block-1", "section-2-block-1"})
+        self.assertEqual(payload["article_feedback"]["article_level"], "check cross-block repetition")
+        self.assertIn("五篇范文全文", PAPER_ARTICLE_EDITOR_PROMPT)
+
+    def test_paper_article_editor_rejects_section_and_block_id_contract_breaks(self):
+        plan = {"sections": [
+            {"id": "section-1", "title": "一", "blocks": []},
+            {"id": "section-2", "title": "二", "blocks": []},
+        ]}
+        specs = {
+            "section-1": [{"block_id": "b1", "beat_id": "section-1"}],
+            "section-2": [{"block_id": "b2", "beat_id": "section-2"}],
+        }
+        responses = [
+            {"sections": [{"section_id": "section-1", "title": "一", "blocks": [{"block_id": "b1", "text": "一"}]}]},
+            {"sections": [
+                {"section_id": "section-1", "title": "一", "blocks": [{"block_id": "b1", "text": "一"}]},
+                {"section_id": "section-1", "title": "重复", "blocks": [{"block_id": "b2", "text": "二"}]},
+            ]},
+            {"sections": [
+                {"section_id": "unknown", "title": "未知", "blocks": [{"block_id": "b1", "text": "一"}]},
+                {"section_id": "section-2", "title": "二", "blocks": [{"block_id": "b2", "text": "二"}]},
+            ]},
+            {"sections": [
+                {"section_id": "section-1", "title": "一", "blocks": [{"block_id": "b1", "text": "一"}]},
+                {"section_id": "section-2", "title": "二", "blocks": [{"block_id": "b1", "text": "二"}]},
+            ]},
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                with self.assertRaises(RuntimeError):
+                    _paper_normalize_article_editor_output(response, plan, specs)
+
+    def test_paper_article_editor_reorders_without_changing_python_bindings(self):
+        registry = [
+            {"evidence_id": "e1", "source_paragraph_ids": ["source-1"], "source_sentence": "结果为80%。", "scope": "section_context", "supported_figures": [], "anchors": ["80%"]},
+            {"evidence_id": "e2", "source_paragraph_ids": ["source-2"], "source_sentence": "结果持续三年。", "scope": "section_context", "supported_figures": [], "anchors": []},
+            {"evidence_id": "e3", "source_paragraph_ids": ["source-3"], "source_sentence": "机制来自水汽输送。", "scope": "section_context", "supported_figures": [], "anchors": []},
+        ]
+        section_one = {"id": "section-1", "title": "现象", "role": "result", "source_paragraph_ids": ["source-1", "source-2"], "findings": [{"id": "f1", "evidence_ids": ["e1", "e2"], "figure_ids": []}]}
+        section_two = {"id": "section-2", "title": "机制", "role": "mechanism", "source_paragraph_ids": ["source-3"], "findings": [{"id": "f2", "evidence_ids": ["e3"], "figure_ids": []}]}
+        plan = {
+            "sections": [section_one, section_two],
+            "story_evidence": {
+                "e1": {"figure_ids": [], "anchors": ["80%"], "source_paragraph_ids": ["source-1"], "scope": "section_context", "supported_figures": []},
+                "e2": {"figure_ids": [], "anchors": [], "source_paragraph_ids": ["source-2"], "scope": "section_context", "supported_figures": []},
+                "e3": {"figure_ids": [], "anchors": [], "source_paragraph_ids": ["source-3"], "scope": "section_context", "supported_figures": []},
+            },
+        }
+        evidence_map = {"e1": (section_one, section_one["findings"][0]), "e2": (section_one, section_one["findings"][0]), "e3": (section_two, section_two["findings"][0])}
+        specs = {
+            "section-1": [
+                {"block_id": "section-1-block-1", "beat_id": "section-1", "evidence_ids": ("e1",), "anchors": ("80%",), "figure_ids": (), "source_paragraph_ids": ("source-1",)},
+                {"block_id": "section-1-block-2", "beat_id": "section-1", "evidence_ids": ("e2",), "anchors": (), "figure_ids": (), "source_paragraph_ids": ("source-2",)},
+            ],
+            "section-2": [{"block_id": "section-2-block-1", "beat_id": "section-2", "evidence_ids": ("e3",), "anchors": (), "figure_ids": (), "source_paragraph_ids": ("source-3",)}],
+        }
+        generated = [
+            {"id": "section-2", "title": "水汽如何接上增雪", "blocks": [{"block_id": "section-2-block-1", "text": "机制来自水汽输送。"}]},
+            {"id": "section-1", "title": "先看结果", "blocks": [
+                {"block_id": "section-1-block-2", "text": "结果持续三年。"},
+                {"block_id": "section-1-block-1", "text": "结果达到80%。"},
+            ]},
+        ]
+        working = copy.deepcopy(plan)
+        accepted, markdown = _paper_apply_article_editor_candidate(
+            working, generated, evidence_map, registry, specs, "标题", "摘要", {"source-1", "source-2", "source-3"}, None, "旧稿", "test editor",
+        )
+        self.assertTrue(accepted)
+        self.assertEqual([section["id"] for section in working["sections"]], ["section-2", "section-1"])
+        self.assertEqual([block["id"] for block in working["sections"][1]["blocks"]], ["section-1-block-2", "section-1-block-1"])
+        self.assertEqual(working["sections"][1]["blocks"][1]["evidence_ids"], ["e1"])
+        self.assertEqual(working["sections"][1]["blocks"][1]["source_paragraph_ids"], ["source-1"])
+        self.assertIn("结果达到80%", markdown)
+
+    def test_paper_article_style_review_reports_cross_block_issue(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "issues": [{"block_ids": ["b1", "b2"], "issue": "机制重复", "instruction": "整篇只解释一次，后文改为承接。"}]
+            }, ensure_ascii=False)))]
+        )
+        sections = [{"id": "s1", "title": "结果", "blocks": [{"id": "b1", "text": "第一段。"}, {"id": "b2", "text": "第二段。"}]}]
+        result = _paper_style_review(client, "完整五篇范文", sections, "## 结果\\n\\n第一段。\\n\\n第二段。", "test-model", article_level=True, feedback={"style_lint": {"roughly": 1}})
+        self.assertEqual(result["issues"][0]["block_ids"], ["b1", "b2"])
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["article_feedback"]["style_lint"]["roughly"], 1)
+        self.assertIn("第一段。", payload["article_body"])
 
     def test_paper_style_reviewer_accepts_only_known_block_issues(self):
         client = MagicMock()
