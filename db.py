@@ -342,6 +342,32 @@ class Database:
             ).fetchone()
         return int(row["count"] or 0)
 
+    def update_paper_candidate_titles(
+        self,
+        date: str,
+        titles_by_article_id: dict[int, str],
+        content_type: str = "paper",
+    ) -> None:
+        """Update translated titles without changing pool rank or score."""
+        values = [
+            (str(title).strip(), date, content_type, int(article_id))
+            for article_id, title in titles_by_article_id.items()
+            if str(title).strip()
+        ]
+        if not values:
+            return
+        with self.connect() as connection:
+            connection.executemany(
+                """UPDATE paper_candidate_pool SET title_cn=?
+                WHERE date=? AND content_type=? AND article_id=?""",
+                values,
+            )
+            connection.executemany(
+                """UPDATE daily_candidates SET title_cn=?
+                WHERE date=? AND content_type=? AND article_id=?""",
+                values,
+            )
+
     def append_candidates(
         self,
         date: str,

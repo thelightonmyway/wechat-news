@@ -2453,6 +2453,68 @@ class NewsPipeline:
         self.last_paper_batch_only = False
         self.last_paper_pool_total = 0
 
+    async def _translate_paper_page(
+        self,
+        run_date: str,
+        page: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Translate only the page that is about to be shown."""
+        visible_page = list(page[:PAPER_PAGE_SIZE])
+        if not visible_page or not any(
+            not str(item.get("title_cn") or "").strip() for item in visible_page
+        ):
+            return visible_page
+
+        rank_values = [int(item.get("rank") or 0) for item in visible_page]
+        first_rank = min(rank_values, default=0)
+        last_rank = max(rank_values, default=0)
+        for attempt in range(1, 3):
+            try:
+                translated, used_model, error = await asyncio.to_thread(
+                    translate_paper_titles,
+                    visible_page,
+                    self.settings,
+                )
+                if not used_model:
+                    if attempt == 1:
+                        continue
+                    self.logger.warning(
+                        "PAPER page title translation date=%s ranks=%s-%s attempt=%s error=%s",
+                        run_date,
+                        first_rank,
+                        last_rank,
+                        attempt,
+                        error or "title translation unavailable",
+                    )
+                    return visible_page
+                translated_page: list[dict[str, Any]] = []
+                updates: dict[int, str] = {}
+                for index, item in enumerate(visible_page):
+                    title_cn = str(item.get("title_cn") or "").strip()
+                    if index < len(translated) and str(translated[index] or "").strip():
+                        title_cn = str(translated[index]).strip()
+                    translated_item = dict(item, title_cn=title_cn)
+                    translated_page.append(translated_item)
+                    article_id = item.get("article_id", item.get("id"))
+                    if title_cn and article_id is not None:
+                        updates[int(article_id)] = title_cn
+                self.db.update_paper_candidate_titles(
+                    run_date,
+                    updates,
+                    PAPER_CONTENT,
+                )
+                return translated_page
+            except Exception as exc:
+                self.logger.warning(
+                    "PAPER page title translation date=%s ranks=%s-%s attempt=%s error=%s",
+                    run_date,
+                    first_rank,
+                    last_rank,
+                    attempt,
+                    f"{type(exc).__name__}: {exc}",
+                )
+        return visible_page
+
     async def _extract_shortlist(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         preliminary = sorted(items, key=deterministic_score, reverse=True)[:40]
         semaphore = asyncio.Semaphore(5)
@@ -2807,18 +2869,6 @@ class NewsPipeline:
                                 "final": len(selected),
                             }
                         )
-                    if used_model and selected:
-                        translated, _, title_error = await asyncio.to_thread(
-                            translate_paper_titles,
-                            selected,
-                            self.settings,
-                        )
-                        selected = [
-                            dict(item, title_cn=translated[index] or str(item.get("title_cn") or ""))
-                            for index, item in enumerate(selected)
-                        ]
-                        if self.last_paper_discovery_stats:
-                            self.last_paper_discovery_stats["final"] = len(selected)
                 else:
                     prioritized = prioritize_candidates(enriched)
                     selected, used_model, llm_error = await asyncio.to_thread(
@@ -2849,13 +2899,6 @@ class NewsPipeline:
                     return existing_paper_candidates
                 if self.settings.model_configured and llm_error:
                     errors.append(f"LLM selection fallback: {llm_error}")
-                if title_error:
-                    errors.append(f"LLM title translation warning: {title_error}")
-                    self.logger.warning(
-                        "PAPER title translation unavailable date=%s error=%s",
-                        run_date,
-                        title_error,
-                    )
                 if run_type == PAPER_CONTENT and not used_model:
                     self.last_paper_refresh_warning = (
                         "⚠ AI 筛选暂时不可用，当前显示本地筛选结果"
@@ -2867,13 +2910,23 @@ class NewsPipeline:
                     )
                     if self.last_paper_discovery_stats:
                         self.last_paper_discovery_stats["pool_total"] = self.last_paper_pool_total
-                    first_page = selected[:PAPER_PAGE_SIZE]
-                    self.db.replace_candidates(run_date, first_page, run_type)
+                    first_page = self.db.get_paper_candidate_page(
+                        run_date,
+                        1,
+                        PAPER_PAGE_SIZE,
+                        run_type,
+                    )
+                    first_page = await self._translate_paper_page(run_date, first_page)
+                    self.db.replace_candidates(
+                        run_date,
+                        [dict(item, article_id=int(item["id"])) for item in first_page],
+                        run_type,
+                    )
                     if first_page:
                         self.db.add_seen_candidates(
                             run_date,
                             PAPER_CONTENT,
-                            [int(item["article_id"]) for item in first_page],
+                            [int(item["id"]) for item in first_page],
                         )
                 elif append:
                     self.db.append_candidates(run_date, selected, run_type)
@@ -2948,40 +3001,20 @@ class NewsPipeline:
             if pool_total:
                 self.last_paper_pool_total = pool_total
                 if existing:
-                    if self.settings.model_configured and any(
-                        not str(item.get("title_cn") or "").strip()
-                        for item in existing
-                    ):
-                        titled, used_model, title_error = await asyncio.to_thread(
-                            translate_paper_titles,
-                            existing,
-                            self.settings,
-                        )
-                        if used_model:
-                            titled_candidates = [
-                                dict(
-                                    item,
-                                    article_id=int(item["id"]),
-                                    title_cn=titled[index] or str(item.get("title_cn") or ""),
-                                )
-                                for index, item in enumerate(existing)
-                            ]
-                            self.db.replace_candidates(
-                                run_date,
-                                titled_candidates,
-                                run_type,
-                            )
-                            return self.db.get_candidates(run_date, run_type)
-                        self.logger.warning(
-                            "PAPER title translation unavailable date=%s error=%s",
-                            run_date,
-                            title_error,
-                        )
-                    return existing
+                    await self._translate_paper_page(
+                        run_date,
+                        existing[:PAPER_PAGE_SIZE],
+                    )
+                    return self.db.get_candidates(run_date, run_type)
                 first_page = self.db.get_paper_candidate_page(
                     run_date, 1, PAPER_PAGE_SIZE, run_type
                 )
-                self.db.replace_candidates(run_date, first_page, run_type)
+                first_page = await self._translate_paper_page(run_date, first_page)
+                self.db.replace_candidates(
+                    run_date,
+                    [dict(item, article_id=int(item["id"])) for item in first_page],
+                    run_type,
+                )
                 return self.db.get_candidates(run_date, run_type)
             if existing:
                 published = self.db.published_article_identifiers()
@@ -3073,6 +3106,7 @@ class NewsPipeline:
             PAPER_CONTENT,
         )
         if page:
+            page = await self._translate_paper_page(run_date, page)
             self.db.append_candidates(
                 run_date,
                 [dict(item, article_id=int(item["id"])) for item in page],

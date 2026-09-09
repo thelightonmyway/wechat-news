@@ -3161,6 +3161,39 @@ def _paper_completion_with_retry(client: OpenAI, **kwargs: Any) -> Any:
     raise RuntimeError("unreachable paper completion retry state")
 
 
+def _is_title_translation_retryable(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    try:
+        if int(status_code) == 429 or int(status_code) >= 500:
+            return True
+    except (TypeError, ValueError):
+        pass
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        isinstance(exc, TimeoutError)
+        or "timeout" in name
+        or "timed out" in name
+        or "timeout" in message
+        or "timed out" in message
+    )
+
+
+def _paper_title_completion_with_retry(client: OpenAI, **kwargs: Any) -> Any:
+    for attempt in range(2):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if attempt == 0 and _is_title_translation_retryable(exc):
+                time.sleep(3)
+                continue
+            raise
+    raise RuntimeError("unreachable paper title translation retry state")
+
+
 def select_top_ten(
     candidates: list[dict[str, Any]],
     settings: Settings,
@@ -3375,7 +3408,7 @@ def translate_paper_titles(
         max_retries=0,
     )
     try:
-        response = _paper_completion_with_retry(
+        response = _paper_title_completion_with_retry(
             client,
             model=settings.model_name,
             temperature=0.1,

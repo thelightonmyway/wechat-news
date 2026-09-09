@@ -7117,7 +7117,7 @@ class V1Tests(unittest.TestCase):
                 ):
                     candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
 
-                self.assertEqual(translate.call_count, 1)
+                self.assertEqual(translate.call_count, 2)
                 self.assertEqual(
                     [value["title"] for value in candidates],
                     [
@@ -7202,6 +7202,19 @@ class V1Tests(unittest.TestCase):
                 self.assertEqual(
                     [(value["rank"], value["title_cn"]) for value in candidates],
                     [(1, "已有标题"), (2, "补充标题2"), (3, "补充标题3")],
+                )
+                pool = pipeline.db.get_paper_candidate_pool("2026-08-26", PAPER_CONTENT)
+                self.assertEqual(
+                    [value["title_cn"] for value in pool],
+                    ["已有标题", "补充标题2", "补充标题3"],
+                )
+                restarted = NewsPipeline(settings)
+                with patch("news.pipeline.translate_paper_titles") as retry_translate:
+                    restarted_result = await restarted.get_or_refresh("2026-08-26", PAPER_CONTENT)
+                retry_translate.assert_not_called()
+                self.assertEqual(
+                    [value["title_cn"] for value in restarted_result],
+                    ["已有标题", "补充标题2", "补充标题3"],
                 )
 
         asyncio.run(check())
@@ -7705,6 +7718,254 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(len(payload), 35)
         self.assertEqual(len(selected), 35)
+
+
+    def test_paper_refresh_translates_only_first_ten_of_large_pool(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "large-title-page.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+                items = [
+                    {
+                        "source": "Nature",
+                        "url": f"https://example.test/large-title-{index}",
+                        "canonical_url": f"https://example.test/large-title-{index}",
+                        "title": f"Large title paper {index} with distinct subject {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": "2026-09-09T00:00:00+00:00",
+                        "doi": f"10.1000/large-title-{index}",
+                        "journal": "Nature",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": "2026-09-09T00:00:00+00:00",
+                    }
+                    for index in range(842)
+                ]
+                translation_sizes = []
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(0, result=copy.deepcopy(values))
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0, result=[dict(value, paper_local_score=2) for value in values]
+                )
+                with (
+                    patch("news.pipeline.fetch_all_feeds", return_value=(items, [], {"test": 842})),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                    patch(
+                        "news.pipeline.select_paper_ranked",
+                        side_effect=lambda values, _settings: (
+                            [dict(value, paper_relevance_score=3) for value in values],
+                            True,
+                            "",
+                        ),
+                    ),
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        side_effect=lambda values, _settings: (
+                            translation_sizes.append(len(values)) or [f"中文标题{index}" for index, _ in enumerate(values)],
+                            True,
+                            "",
+                        ),
+                    ),
+                ):
+                    first_page = await pipeline.refresh("2026-09-09", PAPER_CONTENT)
+                pool = pipeline.db.get_paper_candidate_pool("2026-09-09", PAPER_CONTENT)
+                self.assertEqual(len(first_page), 10)
+                self.assertEqual(translation_sizes, [10])
+                self.assertEqual(len(pool), 842)
+                self.assertTrue(all(value["title_cn"] for value in pool[:10]))
+                self.assertTrue(all(not value["title_cn"] for value in pool[10:]))
+
+        asyncio.run(check())
+
+    def test_paper_next_translates_page_and_keeps_pool_order(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "next-title-page.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                )
+                pipeline = NewsPipeline(settings)
+                pool = []
+                for index in range(22):
+                    article_id = pipeline.db.upsert_article(
+                        {
+                            "source": "Nature",
+                            "url": f"https://example.test/page-title-{index}",
+                            "canonical_url": f"https://example.test/page-title-{index}",
+                            "title": f"Page title paper {index}",
+                            "summary": "Climate",
+                            "doi": f"10.1000/page-title-{index}",
+                            "journal": "Nature",
+                            "word_count": 800,
+                        }
+                    )
+                    pool.append({"article_id": article_id, "score": float(100 - index), "title_cn": ""})
+                pipeline.db.replace_paper_candidate_pool("2026-09-09", pool, PAPER_CONTENT)
+                pipeline.db.replace_candidates("2026-09-09", pool[:10], PAPER_CONTENT)
+                seen_pages = []
+
+                def translate_page(values, _settings):
+                    seen_pages.append([value["rank"] for value in values])
+                    return [f"页标题{value['rank']}" for value in values], True, ""
+
+                pipeline.openalex.discover_recent_papers = MagicMock(
+                    side_effect=AssertionError("OpenAlex called")
+                )
+                with (
+                    patch("news.pipeline.fetch_all_feeds", side_effect=AssertionError("feeds called")),
+                    patch("news.pipeline.select_paper_ranked", side_effect=AssertionError("ranking called")),
+                    patch("news.pipeline.translate_paper_titles", side_effect=translate_page),
+                ):
+                    page = await pipeline.next_paper_batch("2026-09-09")
+                self.assertEqual([value["rank"] for value in page], list(range(11, 21)))
+                self.assertEqual(seen_pages, [list(range(11, 21))])
+                stored = pipeline.db.get_paper_candidate_pool("2026-09-09", PAPER_CONTENT)
+                self.assertEqual([value["title_cn"] for value in stored[10:20]], [f"页标题{rank}" for rank in range(11, 21)])
+                self.assertEqual([value["score"] for value in stored], [float(100 - index) for index in range(22)])
+                pipeline.openalex.discover_recent_papers.assert_not_called()
+
+        asyncio.run(check())
+
+    def test_paper_page_translation_retries_timeout_and_falls_back_without_mutation(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "title-timeout.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                )
+                pipeline = NewsPipeline(settings)
+                article_id = pipeline.db.upsert_article(
+                    {
+                        "source": "Nature",
+                        "url": "https://example.test/title-timeout",
+                        "canonical_url": "https://example.test/title-timeout",
+                        "title": "Timeout paper",
+                        "summary": "Climate",
+                        "doi": "10.1000/title-timeout",
+                        "journal": "Nature",
+                        "word_count": 800,
+                    }
+                )
+                candidate = {"article_id": article_id, "score": 42.0, "title_cn": ""}
+                pipeline.db.replace_paper_candidate_pool("2026-09-09", [candidate], PAPER_CONTENT)
+                page = pipeline.db.get_paper_candidate_page("2026-09-09", 1, 10, PAPER_CONTENT)
+                with patch(
+                    "news.pipeline.translate_paper_titles",
+                    side_effect=[
+                        TimeoutError("Request timed out"),
+                        (["重试成功"], True, ""),
+                    ],
+                ) as translate:
+                    result = await pipeline._translate_paper_page("2026-09-09", page)
+                self.assertEqual(translate.call_count, 2)
+                self.assertEqual(result[0]["title_cn"], "重试成功")
+                before = pipeline.db.get_paper_candidate_pool("2026-09-09", PAPER_CONTENT)
+                with patch(
+                    "news.pipeline.translate_paper_titles",
+                    side_effect=[TimeoutError("Request timed out"), TimeoutError("Request timed out")],
+                ) as translate_failed:
+                    result = await pipeline._translate_paper_page("2026-09-09", page)
+                self.assertEqual(translate_failed.call_count, 2)
+                self.assertEqual(result[0]["title_cn"], "")
+                after = pipeline.db.get_paper_candidate_pool("2026-09-09", PAPER_CONTENT)
+                self.assertEqual([(value["rank"], value["score"]) for value in before], [(value["rank"], value["score"]) for value in after])
+
+        asyncio.run(check())
+
+
+    def test_paper_title_translation_retries_timeout_rate_limit_and_5xx(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"items": [{"index": 1, "title_cn": "中文标题"}]})
+                    )
+                )
+            ]
+        )
+
+        class HttpError(Exception):
+            def __init__(self, status_code):
+                super().__init__(f"HTTP {status_code}")
+                self.status_code = status_code
+
+        class APITimeoutError(Exception):
+            pass
+
+        for failure in (HttpError(429), HttpError(504), APITimeoutError("timed out")):
+            client = MagicMock()
+            client.chat.completions.create.side_effect = [failure, response]
+            with (
+                patch("writer.llm.OpenAI", return_value=client),
+                patch("writer.llm.time.sleep"),
+            ):
+                titles, used_model, error = translate_paper_titles(
+                    [{"title": "English title", "title_cn": ""}],
+                    settings,
+                )
+            self.assertTrue(used_model)
+            self.assertEqual(error, "")
+            self.assertEqual(titles, ["中文标题"])
+            self.assertEqual(client.chat.completions.create.call_count, 2)
+
+
+    def test_paper_partial_page_translation_keeps_english_fallback(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "partial-title-page.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                )
+                pipeline = NewsPipeline(settings)
+                pool = []
+                for index in range(3):
+                    article_id = pipeline.db.upsert_article(
+                        {
+                            "source": "Nature",
+                            "url": f"https://example.test/partial-title-{index}",
+                            "canonical_url": f"https://example.test/partial-title-{index}",
+                            "title": f"Partial title paper {index}",
+                            "summary": "Climate",
+                            "doi": f"10.1000/partial-title-{index}",
+                            "journal": "Nature",
+                        }
+                    )
+                    pool.append({"article_id": article_id, "score": float(index), "title_cn": ""})
+                pipeline.db.replace_paper_candidate_pool("2026-09-09", pool, PAPER_CONTENT)
+                page = pipeline.db.get_paper_candidate_page("2026-09-09", 1, 10, PAPER_CONTENT)
+                with patch(
+                    "news.pipeline.translate_paper_titles",
+                    return_value=(["中文标题", "", ""], True, ""),
+                ):
+                    result = await pipeline._translate_paper_page("2026-09-09", page)
+                self.assertEqual([item["title_cn"] for item in result], ["中文标题", "", ""])
+                self.assertIn("Partial title paper 1", pipeline.format_news(result))
+                stored = pipeline.db.get_paper_candidate_pool("2026-09-09", PAPER_CONTENT)
+                self.assertEqual(stored[0]["title_cn"], "中文标题")
+                self.assertEqual(stored[1]["title_cn"], "")
+
+        asyncio.run(check())
 
 
 if __name__ == "__main__":
