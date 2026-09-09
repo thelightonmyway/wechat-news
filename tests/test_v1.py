@@ -89,13 +89,16 @@ from writer.llm import (
     PAPER_STORY_WRITER_PROMPT,
     PAPER_HUMANIZER_PROMPT,
     PAPER_ARTICLE_EDITOR_PROMPT,
+    PAPER_ARTICLE_STYLE_REVIEWER_PROMPT,
     PAPER_STYLE_REVIEWER_PROMPT,
     PAPER_STYLE_GUIDE,
     _extract_paper_evidence_plan,
     _paper_ai_style_lint,
     _paper_ai_style_lint_failed,
+    _paper_abstract_grammar_cleanup,
     _paper_require_clean_final_style_lint,
     _paper_apply_article_editor_candidate,
+    _paper_bounded_article_review,
     _paper_article_editor,
     _paper_article_editor_rebuild_sections,
     _paper_deauthor_abstract,
@@ -113,6 +116,7 @@ from writer.llm import (
     _paper_story_skeleton,
     _paper_story_block_specs,
     _paper_plain_language_cleanup,
+    _paper_safe_caption,
     _paper_metadata_leakage_lint,
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
@@ -3584,6 +3588,7 @@ class V1Tests(unittest.TestCase):
             ("并不是", "并不是来自当地蒸发。"),
             ("而不是", "主要来自远洋输送，而不是当地蒸发。"),
             ("roughly", "roughly 68% 的区域出现变化。"),
+            ("由此可见", "由此可见，结果仍然稳定。"),
             ("作者式第一人称", "我们发现结果仍然稳定。"),
         ):
             with self.subTest(key=key):
@@ -3602,6 +3607,36 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("about", cleaned)
         self.assertIn("约68%", cleaned)
         self.assertIn("约9%", cleaned)
+
+    def test_paper_abstract_deauthoring_handles_inversion_and_author_voice(self):
+        for source in (
+            "我们在此表明，增温会影响降雪。",
+            "我们在此显示，环流发生变化。",
+            "我们在此发现，水汽来自印度洋。",
+            "在此，我们表明，增重是暂时性的。",
+            "在此，我们发现，降水增加。",
+        ):
+            with self.subTest(source=source):
+                cleaned = _paper_deauthor_abstract(source)
+                self.assertNotIn("研究团队", cleaned)
+                self.assertNotIn("我们", cleaned)
+        self.assertEqual(
+            _paper_abstract_grammar_cleanup("在2021—2023年间，然而，趋势发生变化。"),
+            "然而，在2021—2023年间，趋势发生变化。",
+        )
+
+    def test_paper_plain_language_cleanup_normalizes_pressure_units(self):
+        cleaned = _paper_plain_language_cleanup("300百帕、500 百帕和850百帕。")
+        self.assertEqual(cleaned, "300 hPa、500 hPa和850 hPa。")
+        self.assertNotIn("300百帕", cleaned)
+
+    def test_paper_safe_caption_keeps_complete_sentences(self):
+        caption = "这是一个超过八十字的完整图注句子，用于说明环流、降水和质量变化之间的关系，不应在句子中间被截断，同时交代图中不同区域的空间差异、时间变化以及资料之间的一致性信息。"
+        self.assertEqual(_paper_safe_caption(caption), caption)
+        long_caption = caption + "第二句继续提供补充信息。"
+        shortened = _paper_safe_caption(long_caption)
+        self.assertTrue(shortened.endswith("。"))
+        self.assertNotEqual(shortened[-1], "不")
 
     def test_paper_abstract_deauthoring_preserves_scientific_content(self):
         source = "我们的结果表明变化可能来自远洋输送；我们发现约74%的区域受影响。"
@@ -3674,6 +3709,8 @@ class V1Tests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized_payload)
         self.assertEqual(payload["article_feedback"]["article_level"], "check cross-block repetition")
         self.assertIn("五篇范文全文", PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertIn("Abstract已经采用的中文译名优先沿用", PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertIn("后文只应补充recurrence", PAPER_ARTICLE_STYLE_REVIEWER_PROMPT)
 
     def test_paper_article_editor_rejects_section_and_block_id_contract_breaks(self):
         plan = {"sections": [
@@ -3902,6 +3939,50 @@ class V1Tests(unittest.TestCase):
         payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
         self.assertEqual(payload["article_feedback"]["style_lint"]["roughly"], 1)
         self.assertIn("第一段。", payload["article_body"])
+
+    def test_paper_article_review_rechecks_after_revision_and_stops_on_pass(self):
+        reviews = [
+            {"issues": [{"block_ids": ["b1"], "issue": "机制重复", "instruction": "删去重复。"}]},
+            {"issues": []},
+        ]
+        review_calls = []
+        revision_calls = []
+
+        def review():
+            review_calls.append(len(review_calls) + 1)
+            return reviews[len(review_calls) - 1]
+
+        def revise(issues):
+            revision_calls.append(issues)
+            return True
+
+        result, issues, review_count, revision_count = _paper_bounded_article_review(review, revise)
+        self.assertEqual(review_count, 2)
+        self.assertEqual(revision_count, 1)
+        self.assertEqual(len(review_calls), 2)
+        self.assertEqual(len(revision_calls), 1)
+        self.assertEqual(issues, [])
+        self.assertEqual(result["review_count"], 2)
+
+    def test_paper_article_review_allows_only_two_revisions(self):
+        review_calls = []
+        revision_calls = []
+
+        def review():
+            review_calls.append(1)
+            return {"issues": [{"block_ids": ["b1"], "issue": "重复", "instruction": "重写。"}]}
+
+        def revise(issues):
+            revision_calls.append(issues)
+            return True
+
+        result, issues, review_count, revision_count = _paper_bounded_article_review(review, revise)
+        self.assertEqual(review_count, 2)
+        self.assertEqual(revision_count, 2)
+        self.assertEqual(len(review_calls), 2)
+        self.assertEqual(len(revision_calls), 2)
+        self.assertEqual(result["revision_count"], 2)
+        self.assertTrue(issues)
 
     def test_paper_style_reviewer_accepts_only_known_block_issues(self):
         client = MagicMock()
@@ -5322,6 +5403,32 @@ class V1Tests(unittest.TestCase):
         self.assertNotEqual(captions[0], captions[1])
         self.assertIn("城乡地表温差", captions[0])
         self.assertIn("最低地表温度", captions[1])
+
+    def test_paper_caption_keeps_long_complete_text_and_receives_terminology_context(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        images = [{
+            "metadata_title": "Antarctic circulation",
+            "caption": "Antarctic circulation and snowfall",
+            "provider": "Nature",
+        }]
+        caption = "这是一个超过八十字的完整中文图注，用于说明东南极高压、印度洋水汽输送和冰盖质量变化之间的关系，同时交代图中不同区域的空间差异、整个事件的时间变化以及不同资料之间的一致性。"
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "items": [{"index": 1, "caption_cn": caption}],
+            }, ensure_ascii=False)))]
+        )
+        with patch("writer.llm.OpenAI", return_value=client):
+            captions = generate_image_captions(images, settings, "摘要和正文统一使用东南极、印度洋水汽。")
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertEqual(payload["terminology_context"], "摘要和正文统一使用东南极、印度洋水汽。")
+        self.assertEqual(len(payload["images"]), 1)
+        self.assertEqual(captions, [caption])
 
     def test_news_body_images_are_limited_and_deduplicated(self):
         def image(index, title):

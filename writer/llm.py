@@ -1496,6 +1496,7 @@ def _paper_plain_language_cleanup(text: str) -> str:
     """Translate non-essential technical shorthand without touching verified values."""
     cleaned = str(text or "")
     replacements = (
+        (r"(?<![A-Za-z0-9])(\d{3})\s*百帕", r"\1 hPa"),
         (r"(?i)(?<![A-Za-z0-9])9[-‐]year high[-‐]pass Butterworth filter(?![A-Za-z])", "九年周期滤波方法"),
         (r"(?i)(?<![A-Za-z0-9])high[-‐]pass Butterworth filter(?![A-Za-z])", "滤波方法"),
         (r"(?i)(?<![A-Za-z0-9])standard deviation(?![A-Za-z])", "标准差"),
@@ -2809,6 +2810,32 @@ def _paper_style_issue_block_ids(sections: list[dict[str, Any]]) -> set[str]:
     return target_ids
 
 
+def _paper_bounded_article_review(
+    review_fn: Any,
+    revision_fn: Any,
+    max_revisions: int = 2,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int, int]:
+    latest_review: dict[str, Any] = {"issues": []}
+    issues: list[dict[str, Any]] = []
+    review_count = 0
+    revision_count = 0
+    for _ in range(max_revisions):
+        reviewed = review_fn()
+        latest_review = dict(reviewed or {})
+        issues = list(latest_review.get("issues") or [])
+        review_count += 1
+        if not issues:
+            break
+        if not revision_fn(issues):
+            break
+        revision_count += 1
+        if revision_count >= max_revisions:
+            break
+    latest_review["review_count"] = review_count
+    latest_review["revision_count"] = revision_count
+    return latest_review, issues, review_count, revision_count
+
+
 def _paper_style_review(
     client: OpenAI,
     style_exemplar: str,
@@ -3344,6 +3371,7 @@ _PAPER_SINGLE_HIT_STYLE_KEYS = frozenset({
     "真正不是而是",
     "与其说不如说",
     "roughly",
+    "由此可见",
     "metadata_leakage",
 })
 
@@ -3399,7 +3427,8 @@ def _paper_ai_style_lint(markdown: str, include_abstract: bool = False) -> dict[
             r"evidence_id|block_id|provenance)"
         ),
         "作者式第一人称": (
-            r"(?:我室|咱们|我们|本研究(?:发现|展示|使用|进一步分析|的结果)|"
+            r"(?:我室|咱们|我们|研究团队在此(?:表明|显示|发现)|在此(?:表明|显示|发现)|"
+            r"本研究(?:发现|展示|使用|进一步分析|的结果)|"
             r"本文(?:发现|展示|使用|进一步分析|的结果))"
         ),
     }
@@ -3964,11 +3993,31 @@ def translate_paper_titles(
         return titles, False, f"{type(exc).__name__}: {exc}"
 
 
+def _paper_abstract_grammar_cleanup(text: str) -> str:
+    cleaned = re.sub(
+        r"(在[^，。！？]{2,30}年间)，\s*然而，",
+        r"然而，\1，",
+        str(text or ""),
+    )
+    cleaned = re.sub(
+        r"((?:\d{4}[—–-]\d{4}|\d{4})年(?:间)?)[，,]\s*然而，",
+        r"然而，\1，",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?<![A-Za-z0-9])(\d{3})\s*百帕", r"\1 hPa", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _paper_deauthor_abstract(text: str) -> str:
     """Remove first-person author voice without changing Abstract information."""
-    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    cleaned = _paper_abstract_grammar_cleanup(text)
     replacements = (
-        (r"在此[，,]\s*我们", "研究"),
+        (r"我们在此表明", "研究显示"),
+        (r"我们在此显示", "研究显示"),
+        (r"我们在此发现", "结果显示"),
+        (r"在此[，,]\s*我们表明", "研究显示"),
+        (r"在此[，,]\s*我们显示", "研究显示"),
+        (r"在此[，,]\s*我们发现", "结果显示"),
         (r"我们的结果", "研究结果"),
         (r"我们的研究", "该研究"),
         (r"我们的分析", "研究分析"),
@@ -3981,12 +4030,12 @@ def _paper_deauthor_abstract(text: str) -> str:
         (r"我们估计", "研究估计"),
         (r"我们提出", "研究提出"),
         (r"我们认为", "研究认为"),
-        (r"在此，我们", "研究"),
-        (r"我们", "研究团队"),
+        (r"在此[，,]\s*我们", "研究"),
+        (r"我们", "该研究"),
     )
     for pattern, replacement in replacements:
         cleaned = re.sub(pattern, replacement, cleaned)
-    return cleaned
+    return _paper_abstract_grammar_cleanup(cleaned)
 
 
 def translate_paper_abstract(abstract: str, settings: Settings) -> str:
@@ -4137,9 +4186,22 @@ def generate_image_search_keywords(
     return keywords[:5] if len(keywords) >= 3 else []
 
 
+def _paper_safe_caption(text: str, max_chars: int = 160) -> str:
+    caption = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(caption) <= max_chars:
+        return caption
+    boundaries = [
+        match.end()
+        for match in re.finditer(r"[。！？；.!?;]", caption)
+        if match.end() <= max_chars
+    ]
+    return caption[: max(boundaries)] if boundaries else caption
+
+
 def generate_image_captions(
     images: list[dict[str, Any]],
     settings: Settings,
+    terminology_context: str = "",
 ) -> list[str]:
     """Generate independent Chinese captions from each image's text metadata."""
     if not images or not settings.model_configured:
@@ -4154,6 +4216,11 @@ def generate_image_captions(
         }
         for index, image in enumerate(images, start=1)
     ]
+    request_payload: dict[str, Any] = {"images": payload}
+    if terminology_context.strip():
+        request_payload["terminology_context"] = re.sub(
+            r"\s+", " ", terminology_context
+        ).strip()[:6000]
     client = OpenAI(
         api_key=settings.model_api_key,
         base_url=settings.model_base_url,
@@ -4172,11 +4239,12 @@ def generate_image_captions(
                         "必须描述该图片实际展示的内容，不能仅根据文章主题写通用句子，"
                         "不同图片不得复用同一句图注。不得输出外部图片元数据或 URL、"
                         "图库名称或英文长caption。metadata不足时caption_cn返回空字符串。"
+                        "如果提供terminology_context，同一实体沿用其中已经使用的中文名称，不要自行重新翻译。"
                         "不要添加‘图1’等编号。返回严格JSON："
                         '{"items":[{"index":1,"caption_cn":"..."}]}。'
                     ),
                 },
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {"role": "user", "content": json.dumps(request_payload, ensure_ascii=False)},
             ],
         )
         parsed = _json_from_text(response.choices[0].message.content or "")
@@ -4184,7 +4252,7 @@ def generate_image_captions(
         used: set[str] = set()
         for item in parsed.get("items", []):
             index = int(item.get("index", 0))
-            caption = str(item.get("caption_cn") or "").strip()
+            caption = _paper_plain_language_cleanup(str(item.get("caption_cn") or "")).strip()
             caption = re.sub(r"^图\s*\d+\s*[.、：:]\s*", "", caption)
             if (
                 index < 1
@@ -4194,7 +4262,7 @@ def generate_image_captions(
                 or caption in used
             ):
                 continue
-            captions[index - 1] = caption[:80]
+            captions[index - 1] = _paper_safe_caption(caption)
             used.add(caption)
         return captions
     except Exception:
@@ -4341,6 +4409,7 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
     "根据当前论文自己的科学内容重新组织叙事：可以重排sections和自然段，也可以把多个相邻或相关block合并到同一个自然段，"
     "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。不要把文章写成Figure目录，不要按图号顺序汇报，"
     "不要复制范文事实、数字、人物、地点或结论；方法只保留帮助理解结论所需的部分。"
+    "术语和地名必须全文一致：Abstract已经采用的中文译名优先沿用；Abstract未覆盖的实体沿用正文首次明确使用的稳定写法，不交替使用英文名或自行创造新译名。"
     "writing_facts中的required_facts只是必须保留的论文事实，has_figure只是附近需要承载图的提示；"
     "不要在正文提到required fact、evidence、证据、锚点、约束、block、metadata、provenance或任何系统概念。"
     "不得发明事实、因果、意义、数字或来源。每个原有block_id必须在全文一个且仅一个paragraph的block_ids中出现，"
@@ -4358,7 +4427,9 @@ PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
     "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的五篇范文原文是主要参考。"
     "检查整篇文章的组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
     "必须检查：跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
-    "术语和地名是否一致、中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
+    "术语和地名是否一致：Abstract中的中文译名优先，正文首次明确使用的实体名称保持稳定，不要交替中文名、英文名或不同中文译名；"
+    "还要检查中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
+    "如果前文已经完整解释暖池增温—罗斯贝波—高压—水汽—增雪机制，后文只应补充recurrence、反馈、暂时性或长期边界，不得再次完整复述起点到终点。"
     "每个跨paragraph问题必须一次性列出全部受影响的已有block_ids，并给出一条整篇revision_instruction；不要分别制造局部修句任务。"
     "不要修改科学事实，不要发明证据，不要修改或返回evidence/source/Figure元数据。没有明确问题返回空issues。"
     "返回严格JSON且只能包含issues："
@@ -5070,10 +5141,15 @@ def _generate_paper_article_markdown(
             "editor_feedback": popular_feedback,
             "stop_slop": _paper_stop_slop_audit(markdown),
         }
-        try:
-            style_review = {
-                "status": "pass",
-                **_paper_style_review(
+        review_error = ""
+        revision_error = ""
+        revision_rollback = False
+        article_revision_attempts = 0
+
+        def review_article() -> dict[str, Any]:
+            nonlocal review_error
+            try:
+                return _paper_style_review(
                     client,
                     style_exemplar,
                     plan["sections"],
@@ -5081,13 +5157,17 @@ def _generate_paper_article_markdown(
                     settings.model_name,
                     article_level=True,
                     feedback=article_feedback,
-                ),
-            }
-            review_issues = style_review.get("issues") or []
-        except Exception as exc:
-            logger.warning("PAPER article style reviewer returned unusable output; continuing without revision: %s", exc)
-            style_review = {"status": "warning", "issues": [], "error": str(exc)}
-        if review_issues:
+                )
+            except Exception as exc:
+                review_error = str(exc)
+                logger.warning(
+                    "PAPER article style reviewer returned unusable output; continuing without revision: %s",
+                    exc,
+                )
+                return {"issues": []}
+
+        def revise_article(issues: list[dict[str, Any]]) -> bool:
+            nonlocal markdown, revision_error, revision_rollback, article_revision_attempts
             try:
                 editor_revision = _paper_article_editor(
                     client,
@@ -5097,7 +5177,7 @@ def _generate_paper_article_markdown(
                     style_exemplar,
                     settings.model_name,
                     block_specs,
-                    {"style_review": review_issues, **article_feedback},
+                    {"style_review": issues, **article_feedback},
                 )
                 accepted, candidate_markdown = _paper_apply_article_editor_candidate(
                     plan,
@@ -5110,20 +5190,42 @@ def _generate_paper_article_markdown(
                     valid_source_ids,
                     figure_evidence_bundles if figure_first else None,
                     markdown,
-                    "article style revision",
+                    f"article style revision {article_revision_attempts + 1}",
                 )
                 if accepted:
                     markdown = candidate_markdown
-                    style_review["revised"] = True
+                    article_revision_attempts += 1
                     logger.info("PAPER article-level style revision validation passed")
-                else:
-                    style_review["status"] = "warning"
-                    style_review["rollback"] = True
+                    return True
+                revision_rollback = True
             except Exception as exc:
-                style_review["status"] = "warning"
-                style_review["error"] = str(exc)
-                logger.warning("PAPER article style revision failed; retaining prior draft: %s", exc)
-            review_issues = []
+                revision_error = str(exc)
+                revision_rollback = True
+                logger.warning(
+                    "PAPER article style revision failed; retaining prior draft: %s",
+                    exc,
+                )
+            return False
+
+        style_review, review_issues, review_count, revision_count = _paper_bounded_article_review(
+            review_article,
+            revise_article,
+            max_revisions=2,
+        )
+        style_review["status"] = "pass" if not review_issues else "needs_revision"
+        if review_error or revision_error or revision_rollback:
+            style_review["status"] = "warning"
+        if review_error:
+            style_review["error"] = review_error
+        if revision_error:
+            style_review["error"] = revision_error
+        if revision_rollback:
+            style_review["rollback"] = True
+        if revision_count >= 2 and review_issues:
+            style_review["revision_limit_reached"] = True
+        # Article-level issues are handled only by the bounded whole-article
+        # revision loop; never downgrade them to per-block humanizer tasks.
+        review_issues = []
     else:
         try:
             style_review = {

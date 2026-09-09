@@ -3671,10 +3671,16 @@ class NewsPipeline:
             if dossier.get("content_type") == PAPER_CONTENT
             else "",
         )
+        terminology_context = (
+            markdown_path.read_text(encoding="utf-8")[:6000]
+            if dossier.get("content_type") == PAPER_CONTENT
+            else ""
+        )
         body_image_captions = await asyncio.to_thread(
             generate_image_captions,
             body_images,
             self.settings,
+            terminology_context,
         )
         dossier["cover_image"] = cover_image or {}
         dossier["body_images"] = body_images
