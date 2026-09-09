@@ -1668,9 +1668,71 @@ def _paper_clean_story_evidence(
     return evidence, evidence_map
 
 
+def _paper_story_skeleton(
+    plan: dict[str, Any],
+    clean_evidence: list[dict[str, Any]],
+    evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build fixed beat ownership from the validated scientific plan."""
+    clean_by_id = {
+        str(record.get("evidence_id") or ""): record
+        for record in clean_evidence
+        if str(record.get("evidence_id") or "")
+    }
+    skeleton: list[dict[str, Any]] = []
+    for index, section in enumerate(plan.get("sections") or [], start=1):
+        section_id = str(section.get("id") or "")
+        evidence_ids: list[str] = []
+        owner_ids = None
+        if evidence_map is not None:
+            owner_ids = {
+                evidence_id
+                for evidence_id, (owner_section, _) in evidence_map.items()
+                if owner_section is section
+            }
+        for finding in section.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            for value in finding.get("evidence_ids") or []:
+                evidence_id = str(value).strip()
+                if (
+                    evidence_id in clean_by_id
+                    and (owner_ids is None or evidence_id in owner_ids)
+                    and evidence_id not in evidence_ids
+                ):
+                    evidence_ids.append(evidence_id)
+        if evidence_map is not None:
+            for evidence_id, (owner_section, _) in evidence_map.items():
+                if owner_section is section and evidence_id in clean_by_id and evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+        if not evidence_ids:
+            raise RuntimeError(
+                "PAPER story skeleton section has no evidence: "
+                f"section_id={section_id!r}"
+            )
+        facts: list[str] = []
+        summaries = [str(section.get("title") or "").strip()]
+        for evidence_id in evidence_ids:
+            record = clean_by_id[evidence_id]
+            summaries.append(str(record.get("core_finding") or "").strip())
+            for anchor in record.get("anchors") or []:
+                fact = _paper_plain_language_cleanup(str(anchor)).strip()
+                if fact and fact not in facts:
+                    facts.append(fact)
+        skeleton.append({
+            "beat_id": f"beat-{index}",
+            "evidence_ids": evidence_ids,
+            "summary": "；".join(part for part in summaries if part)[:1200],
+            "required_facts": facts,
+        })
+    if not skeleton:
+        raise RuntimeError("PAPER story skeleton has no evidence beats")
+    return skeleton
+
+
 def _paper_validate_story_plan(
     story_plan: dict[str, Any],
-    valid_evidence_ids: set[str],
+    story_skeleton: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     brief = story_plan.get("editorial_brief")
     if not isinstance(brief, dict) or not all(
@@ -1679,47 +1741,38 @@ def _paper_validate_story_plan(
     ):
         raise RuntimeError("PAPER story planner returned an invalid editorial brief")
     beats = story_plan.get("story_beats")
-    if not isinstance(beats, list) or not 1 <= len(beats) <= 4:
+    expected_ids = [str(item.get("beat_id") or "") for item in story_skeleton]
+    if not isinstance(beats, list) or len(beats) != len(expected_ids):
         raise RuntimeError("PAPER story planner returned an invalid beat count")
-    seen_ids: set[str] = set()
-    used_evidence: set[str] = set()
+    returned_ids = [str(beat.get("id") or "").strip() if isinstance(beat, dict) else "" for beat in beats]
+    if returned_ids != expected_ids:
+        raise RuntimeError(
+            "PAPER story planner returned invalid beat ids: "
+            f"expected={expected_ids!r}; actual={returned_ids!r}"
+        )
     validated: list[dict[str, Any]] = []
-    for beat_index, beat in enumerate(beats):
+    for beat_index, (beat, skeleton) in enumerate(zip(beats, story_skeleton)):
         if not isinstance(beat, dict):
             raise RuntimeError("PAPER story planner returned an invalid story beat")
-        beat_id = str(beat.get("id") or "").strip()
         title = _paper_clean_story_text(beat.get("title", ""))
         reader_question = _paper_clean_story_text(beat.get("reader_question", ""))
         core_message = _paper_clean_story_text(beat.get("core_message", ""))
         transition = _paper_clean_story_text(beat.get("transition_to_next", ""))
-        evidence_ids = [str(value).strip() for value in beat.get("evidence_ids") or [] if str(value).strip()]
         if (
-            not beat_id
-            or beat_id in seen_ids
-            or not title
+            not title
             or not reader_question
             or not core_message
-            or not evidence_ids
             or (not transition and beat_index != len(beats) - 1)
-            or not set(evidence_ids).issubset(valid_evidence_ids)
         ):
             raise RuntimeError("PAPER story planner returned invalid story beat fields")
-        if used_evidence.intersection(evidence_ids):
-            raise RuntimeError("PAPER story planner reused evidence across story beats")
-        seen_ids.add(beat_id)
-        used_evidence.update(evidence_ids)
-        validated.append(
-            {
-                "id": beat_id,
-                "title": title,
-                "reader_question": reader_question,
-                "core_message": core_message,
-                "evidence_ids": list(dict.fromkeys(evidence_ids)),
-                "transition_to_next": transition or "文章收束。",
-            }
-        )
-    if used_evidence != valid_evidence_ids:
-        raise RuntimeError("PAPER story planner omitted or invented evidence")
+        validated.append({
+            "id": skeleton["beat_id"],
+            "title": title,
+            "reader_question": reader_question,
+            "core_message": core_message,
+            "evidence_ids": list(skeleton["evidence_ids"]),
+            "transition_to_next": transition or "文章收束。",
+        })
     story_plan["editorial_brief"] = {
         field: _paper_clean_story_text(brief[field])
         for field in ("audience", "purpose", "tone", "reader_should_leave_with", "story_question")
@@ -2079,11 +2132,19 @@ def _paper_story_draft_blocks(sections: list[dict[str, Any]]) -> list[dict[str, 
 
 def _paper_story_planner(
     client: OpenAI,
-    clean_evidence: list[dict[str, Any]],
+    story_skeleton: list[dict[str, Any]],
     style_exemplar: str,
     model: str,
     feedback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    model_skeleton = [
+        {
+            "beat_id": skeleton["beat_id"],
+            "summary": skeleton["summary"],
+            "required_facts": list(skeleton.get("required_facts") or []),
+        }
+        for skeleton in story_skeleton
+    ]
     return _paper_completion_json(
         client,
         PAPER_STORY_PLANNER_PROMPT,
@@ -2093,7 +2154,7 @@ def _paper_story_planner(
                 "purpose": "用几分钟讲清论文最值得知道的科学发现",
                 "tone": "清楚、自然、克制、有解释感，不像论文、汇报或营销稿",
             },
-            "clean_evidence": [_paper_clean_evidence_for_llm(record) for record in clean_evidence],
+            "story_skeleton": model_skeleton,
             "style_exemplar": style_exemplar,
             "targeted_feedback": feedback or {},
             "_model": model,
@@ -4249,13 +4310,13 @@ PAPER_STORY_PLANNER_PROMPT = (
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
     "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
     "故事形状由当前证据决定，不套固定的A→B→C公式；可以从现象、结果、机制或影响切入，结论和方法的先后以自然表达为准，方法只保留帮助理解结果的部分。"
-    "再把clean_evidence组织成2到4个story beats，通常约3个但不要硬凑。每个beat包含id、title、reader_question、core_message、"
-    "evidence_ids和transition_to_next。evidence_ids必须逐字复制输入registry中的真实ID，禁止编号、改写、合并或创造新ID。故事优先遵循问题—发现—为什么—意义/未来，而不是按资料顺序或编号排列。"
-    "允许多个证据共同进入一个beat；标题必须专业、直接、简洁，优先10到22个中文字，直接陈述科学结果。避免为何、线索、改写、同一片中国、谁在主导、真正的答案、背后的秘密等媒体化措辞。不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
+    "Python已经根据科学验证结果建立固定story skeleton，每个scientific section对应一个固定beat；不要重排、合并、拆分或重新分配beat。"
+    "你只需为每个固定beat填写title、reader_question、core_message和transition_to_next，不能返回任何evidence、source、Figure或provenance字段。故事顺序和证据归属由Python保持。"
+    "每个beat的summary和required_facts仅用于理解该固定section的科学主题；不要在输出中复述系统字段或任何内部标识。标题必须专业、直接、简洁，优先10到22个中文字，直接陈述科学结果。避免为何、线索、改写、同一片中国、谁在主导、真正的答案、背后的秘密等媒体化措辞。不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
     "只学习style_exemplar的中文节奏、句长、信息密度和推进方式，不复制其中的科学事实、数字、地点、机制或句子。"
     "返回严格JSON："
     '{"editorial_brief":{"audience":"...","purpose":"...","tone":"...","reader_should_leave_with":"...","story_question":"..."},'
-    '"story_beats":[{"id":"beat-1","title":"...","reader_question":"...","core_message":"...","evidence_ids":["复制registry中的真实evidence_id"],"transition_to_next":"..."}]}'
+    '"story_beats":[{"id":"beat-1","title":"...","reader_question":"...","core_message":"...","transition_to_next":"..."}]}'
 )
 
 PAPER_STORY_WRITER_PROMPT = (
@@ -4712,25 +4773,25 @@ def _generate_paper_article_markdown(
         source_paragraphs,
         evidence_registry,
     )
+    story_skeleton = _paper_story_skeleton(plan, clean_evidence, evidence_map)
     story_plan = _paper_story_planner(
         client,
-        clean_evidence,
+        story_skeleton,
         style_exemplar,
         settings.model_name,
     )
-    valid_evidence_ids = {record["evidence_id"] for record in clean_evidence}
     try:
-        story_beats = _paper_validate_story_plan(story_plan, valid_evidence_ids)
+        story_beats = _paper_validate_story_plan(story_plan, story_skeleton)
     except RuntimeError as exc:
         logger.warning("PAPER story planner returned an invalid beat plan; retrying once: %s", exc)
         story_plan = _paper_story_planner(
             client,
-            clean_evidence,
+            story_skeleton,
             style_exemplar,
             settings.model_name,
-            {"validation": "Use every evidence_id exactly once across the beats; keep each anchor in its assigned beat."},
+            {"validation": "Return exactly one beat for each fixed beat_id in the supplied skeleton, in the same order. Do not return evidence, source, Figure, or provenance fields."},
         )
-        story_beats = _paper_validate_story_plan(story_plan, valid_evidence_ids)
+        story_beats = _paper_validate_story_plan(story_plan, story_skeleton)
     story_sections = _paper_story_sections(
         story_beats,
         evidence_map,

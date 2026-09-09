@@ -110,6 +110,7 @@ from writer.llm import (
     _paper_evidence_by_id,
     _paper_derived_source_ids,
     _paper_story_sections,
+    _paper_story_skeleton,
     _paper_story_block_specs,
     _paper_plain_language_cleanup,
     _paper_metadata_leakage_lint,
@@ -123,6 +124,7 @@ from writer.llm import (
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
+    _paper_story_planner,
     _paper_normalize_story_output,
     _paper_humanize_story,
     _paper_style_review,
@@ -2578,6 +2580,89 @@ class V1Tests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "source provenance"):
             _validate_paper_plan_structure(plan, {"source-1", "source-8"}, None, registry)
+
+    def test_paper_story_skeleton_owns_evidence_and_planner_only_writes_beats(self):
+        section_one = {
+            "id": "section-1",
+            "title": "短期增重",
+            "role": "result",
+            "figure_ids": ["Fig. 1"],
+            "findings": [{"id": "f1", "evidence_ids": ["e1", "e2"], "figure_ids": ["Fig. 1"]}],
+        }
+        section_two = {
+            "id": "section-2",
+            "title": "水汽来源",
+            "role": "mechanism",
+            "figure_ids": ["Fig. 2"],
+            "findings": [{"id": "f2", "evidence_ids": ["e3"], "figure_ids": ["Fig. 2"]}],
+        }
+        plan = {"sections": [section_one, section_two]}
+        clean_evidence = [
+            {"evidence_id": "e1", "core_finding": "2021—2023年出现短期增重", "anchors": ["2021—2023"]},
+            {"evidence_id": "e2", "core_finding": "区域增重约占68%", "anchors": ["约68%"]},
+            {"evidence_id": "e3", "core_finding": "中纬度印度洋贡献水汽", "anchors": ["约49%"]},
+        ]
+        evidence_map = {
+            "e1": (section_one, section_one["findings"][0]),
+            "e2": (section_one, section_one["findings"][0]),
+            "e3": (section_two, section_two["findings"][0]),
+        }
+        skeleton = _paper_story_skeleton(plan, clean_evidence, evidence_map)
+        self.assertEqual([item["beat_id"] for item in skeleton], ["beat-1", "beat-2"])
+        self.assertEqual(skeleton[0]["evidence_ids"], ["e1", "e2"])
+        self.assertEqual(skeleton[1]["evidence_ids"], ["e3"])
+        self.assertEqual(skeleton[0]["required_facts"], ["2021—2023", "约68%"])
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "editorial_brief": {
+                    "audience": "跨专业读者",
+                    "purpose": "解释科学发现",
+                    "tone": "清楚自然",
+                    "reader_should_leave_with": "记住事件和机制",
+                    "story_question": "为什么会出现短期增重？",
+                },
+                "story_beats": [
+                    {"id": "beat-1", "title": "先看短期增重", "reader_question": "发生了什么？", "core_message": "短期增重没有改变长期趋势。", "transition_to_next": "接着看水汽来源。"},
+                    {"id": "beat-2", "title": "水汽从哪里来", "reader_question": "水汽如何抵达？", "core_message": "远距离输送发挥了作用。", "transition_to_next": "文章收束。"},
+                ],
+            }, ensure_ascii=False)))]
+        )
+        story_plan = _paper_story_planner(client, skeleton, "范文", "test-model")
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for forbidden in ("evidence_id", "evidence_ids", "source_paragraph_ids", "supported_figures", "provenance", "anchor", "mandatory_anchor"):
+            self.assertNotIn(forbidden, serialized)
+        validated = _paper_validate_story_plan(story_plan, skeleton)
+        self.assertEqual(validated[0]["evidence_ids"], ["e1", "e2"])
+        self.assertEqual(validated[1]["evidence_ids"], ["e3"])
+
+        registry = [
+            {"evidence_id": "e1", "source_paragraph_ids": ["source-1"], "source_sentence": "2021—2023年。", "anchors": ["2021—2023"]},
+            {"evidence_id": "e2", "source_paragraph_ids": ["source-2"], "source_sentence": "约68%。", "anchors": ["约68%"]},
+            {"evidence_id": "e3", "source_paragraph_ids": ["source-3"], "source_sentence": "约49%。", "anchors": ["约49%"]},
+        ]
+        sections = _paper_story_sections(validated, evidence_map, registry, {"source-1", "source-2", "source-3"})
+        self.assertEqual(sections[0]["source_paragraph_ids"], ["source-1", "source-2"])
+        self.assertEqual(sections[0]["figure_ids"], ["Fig. 1"])
+        self.assertEqual(sections[0]["findings"][0]["evidence_ids"], ["e1", "e2"])
+
+    def test_paper_story_planner_rejects_unknown_duplicate_and_missing_beats(self):
+        skeleton = [
+            {"beat_id": "beat-1", "evidence_ids": ["e1"], "summary": "一", "required_facts": []},
+            {"beat_id": "beat-2", "evidence_ids": ["e2"], "summary": "二", "required_facts": []},
+        ]
+        brief = {
+            "audience": "读者", "purpose": "解释", "tone": "清楚",
+            "reader_should_leave_with": "结论", "story_question": "问题？",
+        }
+        def beat(beat_id: str) -> dict[str, str]:
+            return {"id": beat_id, "title": "标题", "reader_question": "问题？", "core_message": "核心。", "transition_to_next": "继续。"}
+        for beats in ([beat("beat-1"), beat("unknown")], [beat("beat-1"), beat("beat-1")], [beat("beat-1")]):
+            with self.subTest(beats=beats):
+                with self.assertRaises(RuntimeError):
+                    _paper_validate_story_plan({"editorial_brief": brief, "story_beats": beats}, skeleton)
 
     def test_paper_canonical_section_sources_derive_from_evidence_ids(self):
         registry = [{
