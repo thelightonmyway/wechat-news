@@ -134,11 +134,13 @@ from writer.llm import (
     _paper_stop_slop_audit,
     _paper_stable_evidence_id,
     _paper_final_style_lint_failed,
+    _paper_hard_style_lint_failed,
     _paper_style_exemplar,
     _paper_style_lint_improved,
     _paper_style_lint_matches,
     _paper_style_lint_matches_by_block,
     _paper_style_repair_feedback,
+    _PAPER_STYLE_LINT_PATTERNS,
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
@@ -4455,10 +4457,43 @@ class V1Tests(unittest.TestCase):
             )
         )
 
+    def test_paper_final_style_lint_allows_bounded_editorial_residue(self):
+        for remaining in (
+            {"并非": 1},
+            {"结果表明": 2, "研究发现": 1},
+        ):
+            with self.subTest(remaining=remaining):
+                all_lint = {key: 0 for key in _PAPER_STYLE_LINT_PATTERNS}
+                all_lint.update(remaining)
+                self.assertFalse(_paper_hard_style_lint_failed(all_lint))
+                self.assertFalse(_paper_final_style_lint_failed(all_lint, all_lint))
+                _paper_require_clean_final_style_lint(all_lint, all_lint)
+
+    def test_paper_final_style_lint_keeps_author_voice_and_metadata_hard(self):
+        for text, key in (
+            ("摘要中的我们发现结果。", "作者式第一人称"),
+            ("摘要中的evidence_id泄漏。", "metadata_leakage"),
+        ):
+            with self.subTest(key=key):
+                counts = _paper_ai_style_lint(text, include_abstract=True)
+                self.assertEqual(counts[key], 1)
+                self.assertTrue(_paper_hard_style_lint_failed(counts))
+                with self.assertRaisesRegex(RuntimeError, "PAPER final style lint failed after local fallback"):
+                    _paper_require_clean_final_style_lint(counts, {})
+
     def test_paper_final_style_lint_hard_fails_after_fallback_rollback(self):
         counts = _paper_ai_style_lint("摘要中的我们仍然保留了metadata leakage。", include_abstract=True)
         with self.assertRaisesRegex(RuntimeError, "PAPER final style lint failed after local fallback"):
             _paper_require_clean_final_style_lint(counts)
+
+    def test_paper_hard_style_lint_covers_heading_metadata(self):
+        counts = _paper_ai_style_lint(
+            "# 我们发现 evidence_id 泄漏\n\n## 结果\n\n正文保持科学表述。",
+            include_abstract=True,
+        )
+        self.assertEqual(counts["作者式第一人称"], 1)
+        self.assertEqual(counts["metadata_leakage"], 1)
+        self.assertTrue(_paper_hard_style_lint_failed(counts))
 
     def test_paper_metadata_leakage_lint_is_deterministic(self):
         text = "证据锚点、锚点为、对应的锚点、mandatory anchor、required fact、evidence_id、block_id、provenance。"
@@ -5613,6 +5648,100 @@ class V1Tests(unittest.TestCase):
                         "openalex": {"abstract": "Abstract"},
                         "images": [{"figure_number": 2, "caption": "Figure 2. Correlation R = 0.71."}],
                         "paper_selected_body_images": [{"figure_number": 2, "caption": "Figure 2. Correlation R = 0.71."}],
+                    },
+                    settings,
+                    Path(tmp) / "paper",
+                )
+
+    def test_paper_abstract_editorial_lint_does_not_call_body_humanizer(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        paper_plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "findings": [{"id": "E1", "evidence_ids": ["evidence-source-source-0"], "anchors": []}],
+            }]
+        }
+        story_plan = _story_plan_for_evidence(1)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-source-source-0"]
+        client = MagicMock()
+        humanizer = MagicMock(return_value=[])
+        clean_feedback = {
+            "abstract_overlong": False,
+            "body_lengths": {"total_overlong": False},
+            "readability": {"issue_count": 0},
+            "title_style": {"issue_count": 0},
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_plan", return_value=paper_plan
+        ), patch("writer.llm.translate_paper_abstract", return_value="结果表明摘要中的普通表述。"
+        ), patch("writer.llm._paper_review", return_value={"status": "pass", "corrections": []}), patch(
+            "writer.llm._paper_story_planner", return_value=story_plan
+        ), patch("writer.llm._paper_write_section", return_value="森林变化解释了模式差异。"), patch(
+            "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["森林变化解释了模式差异。"])
+        ), patch("writer.llm._paper_article_editor", side_effect=RuntimeError("editor unavailable")), patch(
+            "writer.llm._paper_style_review", return_value={"issues": []}
+        ), patch("writer.llm._paper_editor_feedback", return_value=clean_feedback), patch(
+            "writer.llm._paper_humanize_story", humanizer
+        ):
+            path, _ = generate_article_markdown(
+                {
+                    "content_type": PAPER_CONTENT,
+                    "title": "Test paper",
+                    "title_cn": "测试标题",
+                    "text": "source",
+                    "openalex": {"abstract": "Abstract"},
+                    "images": [],
+                },
+                settings,
+                Path(tmp) / "paper",
+            )
+            self.assertIn("结果表明摘要", path.read_text(encoding="utf-8"))
+        humanizer.assert_not_called()
+
+    def test_paper_abstract_author_voice_still_hard_fails(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        paper_plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "findings": [{"id": "E1", "evidence_ids": ["evidence-source-source-0"], "anchors": []}],
+            }]
+        }
+        story_plan = _story_plan_for_evidence(1)
+        story_plan["story_beats"][0]["evidence_ids"] = ["evidence-source-source-0"]
+        client = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp, patch("writer.llm.OpenAI", return_value=client), patch(
+            "writer.llm._paper_plan", return_value=paper_plan
+        ), patch("writer.llm.translate_paper_abstract", return_value="我们发现摘要中的结果。"
+        ), patch("writer.llm._paper_review", return_value={"status": "pass", "corrections": []}), patch(
+            "writer.llm._paper_story_planner", return_value=story_plan
+        ), patch("writer.llm._paper_write_section", return_value="森林变化解释了模式差异。"), patch(
+            "writer.llm._paper_story_writer", return_value=_story_output_for_evidence(1, ["森林变化解释了模式差异。"])
+        ), patch("writer.llm._paper_article_editor", side_effect=RuntimeError("editor unavailable")), patch(
+            "writer.llm._paper_style_review", return_value={"issues": []}
+        ), patch("writer.llm._paper_humanize_story", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "PAPER final style lint failed after local fallback"):
+                generate_article_markdown(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "title": "Test paper",
+                        "title_cn": "测试标题",
+                        "text": "source",
+                        "openalex": {"abstract": "Abstract"},
+                        "images": [],
                     },
                     settings,
                     Path(tmp) / "paper",

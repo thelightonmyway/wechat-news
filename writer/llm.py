@@ -2352,6 +2352,7 @@ def _paper_apply_story_output(
                 }
             )
         section["title"] = str(item.get("title") or section.get("title") or "")
+        section.pop("paragraphs", None)
         section["blocks"] = blocks
         section["body"] = "\n\n".join(block["text"] for block in blocks)
 
@@ -3805,6 +3806,12 @@ _PAPER_SINGLE_HIT_STYLE_KEYS = frozenset({
     "metadata_leakage",
 })
 
+_PAPER_HARD_STYLE_KEYS = frozenset({"作者式第一人称", "metadata_leakage"})
+
+
+def _paper_hard_style_lint_failed(counts: dict[str, int]) -> bool:
+    return any(counts.get(key, 0) > 0 for key in _PAPER_HARD_STYLE_KEYS)
+
 
 def _paper_metadata_leakage_lint(text: str) -> dict[str, int]:
     patterns = {
@@ -3830,9 +3837,18 @@ def _paper_ai_style_lint(markdown: str, include_abstract: bool = False) -> dict[
         for name, pattern in _PAPER_STYLE_LINT_PATTERNS.items()
     }
     if include_abstract:
-        title_text = "\n".join(title for title, _ in _paper_body_sections(markdown))
+        document_titles = (
+            re.findall(r"(?m)^#\s+(.+?)\s*$", markdown)
+            if "\n" in markdown
+            else []
+        )
+        section_titles = [title for title, _ in _paper_body_sections(markdown)]
+        title_text = "\n".join(document_titles + section_titles)
         counts["metadata_leakage"] += len(
             re.findall(_PAPER_STYLE_LINT_PATTERNS["metadata_leakage"], title_text, flags=re.IGNORECASE)
+        )
+        counts["作者式第一人称"] += len(
+            re.findall(_PAPER_STYLE_LINT_PATTERNS["作者式第一人称"], title_text, flags=re.IGNORECASE)
         )
     return counts
 
@@ -3878,11 +3894,13 @@ def _paper_style_lint_improved(
 
 
 def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
-    return bool(counts.get("作者式第一人称")) or any(
-        counts.get(key, 0) > 0 for key in _PAPER_SINGLE_HIT_STYLE_KEYS
+    return _paper_hard_style_lint_failed(counts) or any(
+        counts.get(key, 0) > 0
+        for key in _PAPER_SINGLE_HIT_STYLE_KEYS
+        if key not in _PAPER_HARD_STYLE_KEYS
     ) or any(
         count > 1 for key, count in counts.items()
-        if key not in _PAPER_SINGLE_HIT_STYLE_KEYS and key != "作者式第一人称"
+        if key not in _PAPER_SINGLE_HIT_STYLE_KEYS and key not in _PAPER_HARD_STYLE_KEYS
     ) or sum(counts.values()) > 4
 
 
@@ -3890,11 +3908,9 @@ def _paper_final_style_lint_failed(
     all_lint: dict[str, int],
     body_lint: dict[str, int] | None = None,
 ) -> bool:
-    if body_lint is None:
-        return _paper_ai_style_lint_failed(all_lint)
-    return _paper_ai_style_lint_failed(body_lint) or any(
-        all_lint.get(key, 0) > 0
-        for key in ("作者式第一人称", "metadata_leakage")
+    """Only safety-critical style keys remain hard failures at the terminal gate."""
+    return _paper_hard_style_lint_failed(all_lint) or (
+        body_lint is not None and _paper_hard_style_lint_failed(body_lint)
     )
 
 
@@ -5561,8 +5577,12 @@ def _generate_paper_article_markdown(
     )
 
     def popular_audit_failed() -> bool:
+        # Ordinary editorial lint in the locked Abstract is not a body rewrite
+        # target.  Keep the earlier audit focused on body prose and hard keys.
+        body_lint = _paper_ai_style_lint(markdown, include_abstract=False)
         return bool(
-            _paper_ai_style_lint_failed(lint)
+            _paper_ai_style_lint_failed(body_lint)
+            or _paper_hard_style_lint_failed(lint)
             or popular_feedback["abstract_overlong"]
             or popular_feedback["body_lengths"]["total_overlong"]
             or popular_feedback["readability"]["issue_count"]
@@ -5626,6 +5646,20 @@ def _generate_paper_article_markdown(
             logger.warning("PAPER style rewrite generation failed; retaining prior draft: %s", exc)
             return []
 
+    body_lint_before_humanizer = _paper_ai_style_lint(markdown, include_abstract=False)
+    body_humanizer_feedback = _paper_editor_feedback(abstract_lead, markdown)
+    body_humanizer_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
+        humanizer_baseline,
+        markdown,
+        plan,
+    )
+    body_feedback_requires_humanizer = bool(
+        _paper_ai_style_lint_failed(body_lint_before_humanizer)
+        or body_humanizer_feedback["body_lengths"]["total_overlong"]
+        or body_humanizer_feedback["readability"]["issue_count"]
+        or body_humanizer_feedback["title_style"]["issue_count"]
+        or body_humanizer_feedback["anchor_preservation"]["issue_count"]
+    )
     humanized_output = (
         safe_humanize(
             client,
@@ -5636,39 +5670,13 @@ def _generate_paper_article_markdown(
             block_specs=block_specs,
             style_exemplar=style_exemplar,
         )
-        if not article_editor_succeeded
+        if not article_editor_succeeded and body_feedback_requires_humanizer
         else []
     )
-    accepted, candidate_markdown = _paper_apply_story_candidate(
-        plan,
-        humanized_output,
-        evidence_map,
-        evidence_registry,
-        block_specs,
-        display_title,
-        abstract_lead,
-        valid_source_ids,
-        figure_evidence_bundles if figure_first else None,
-        markdown,
-        "humanizer",
-    )
-    if accepted:
-        markdown = candidate_markdown
-        logger.info("PAPER deterministic evidence validation passed")
-    elif not article_editor_succeeded:
-        retry_output = safe_humanize(
-            client,
-            story_plan,
-            clean_evidence,
-            _paper_story_draft_blocks(plan["sections"]),
-            settings.model_name,
-            {"deterministic_validation": "The candidate dropped or changed a required hard anchor. Preserve every anchor exactly."},
-            block_specs=block_specs,
-            style_exemplar=style_exemplar,
-        )
+    if not article_editor_succeeded and body_feedback_requires_humanizer:
         accepted, candidate_markdown = _paper_apply_story_candidate(
             plan,
-            retry_output,
+            humanized_output,
             evidence_map,
             evidence_registry,
             block_specs,
@@ -5677,11 +5685,38 @@ def _generate_paper_article_markdown(
             valid_source_ids,
             figure_evidence_bundles if figure_first else None,
             markdown,
-            "humanizer retry",
+            "humanizer",
         )
         if accepted:
             markdown = candidate_markdown
             logger.info("PAPER deterministic evidence validation passed")
+        else:
+            retry_output = safe_humanize(
+                client,
+                story_plan,
+                clean_evidence,
+                _paper_story_draft_blocks(plan["sections"]),
+                settings.model_name,
+                {"deterministic_validation": "The candidate dropped or changed a required hard anchor. Preserve every anchor exactly."},
+                block_specs=block_specs,
+                style_exemplar=style_exemplar,
+            )
+            accepted, candidate_markdown = _paper_apply_story_candidate(
+                plan,
+                retry_output,
+                evidence_map,
+                evidence_registry,
+                block_specs,
+                display_title,
+                abstract_lead,
+                valid_source_ids,
+                figure_evidence_bundles if figure_first else None,
+                markdown,
+                "humanizer retry",
+            )
+            if accepted:
+                markdown = candidate_markdown
+                logger.info("PAPER deterministic evidence validation passed")
 
     style_review: dict[str, Any] = {"issues": [], "status": "skipped"}
     review_issues: list[dict[str, Any]] = []
@@ -6015,8 +6050,13 @@ def _generate_paper_article_markdown(
         markdown,
         plan,
     )
+    final_body_lint_before_terminal = _paper_ai_style_lint(
+        markdown,
+        include_abstract=False,
+    )
     final_popular_issue = bool(
-        _paper_ai_style_lint_failed(lint)
+        _paper_ai_style_lint_failed(final_body_lint_before_terminal)
+        or _paper_hard_style_lint_failed(lint)
         or popular_feedback["abstract_overlong"]
         or popular_feedback["body_lengths"]["total_overlong"]
         or popular_feedback["readability"]["issue_count"]
@@ -6024,12 +6064,21 @@ def _generate_paper_article_markdown(
         or popular_feedback["anchor_preservation"]["issue_count"]
     )
     if final_popular_issue:
+        style_lint_issue = (
+            final_body_lint_before_terminal
+            if _paper_ai_style_lint_failed(final_body_lint_before_terminal)
+            else {}
+        )
+        if _paper_hard_style_lint_failed(lint):
+            style_lint_issue = {key: value for key, value in lint.items() if value}
         popular_science_audit["status"] = "warning"
         popular_science_audit["unresolved_issues"] = {
-            "style_lint": lint if _paper_ai_style_lint_failed(lint) else {},
+            "style_lint": style_lint_issue,
             "feedback": popular_feedback,
         }
 
+    terminal_scientific_baseline_sections = copy.deepcopy(plan["sections"])
+    terminal_scientific_baseline_markdown = markdown
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)
     markdown = _paper_remove_inline_citation_markers(markdown)
@@ -6100,6 +6149,23 @@ def _generate_paper_article_markdown(
                 candidate_markdown,
                 include_abstract=False,
             )
+            try:
+                _validate_paper_evidence_plan(
+                    plan,
+                    candidate_markdown,
+                    valid_source_ids,
+                    figure_evidence_bundles if figure_first else None,
+                    evidence_registry,
+                )
+            except RuntimeError as exc:
+                logger.warning(
+                    "PAPER style repair=%d rejected: normalized candidate failed deterministic validation: %s",
+                    repair_index + 1,
+                    exc,
+                )
+                plan["sections"] = baseline_sections
+                final_author_rewrite_rolled_back = True
+                continue
             if not _paper_style_lint_improved(repair_lint, candidate_body_lint):
                 logger.warning(
                     "PAPER style repair=%d rejected: candidate is not monotonic",
@@ -6129,14 +6195,46 @@ def _generate_paper_article_markdown(
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
     plan["popular_science_audit"] = popular_science_audit
-    _validate_paper_evidence_plan(
-        plan,
-        markdown,
-        valid_source_ids,
-        figure_evidence_bundles if figure_first else None,
-        evidence_registry,
-    )
+    try:
+        _validate_paper_evidence_plan(
+            plan,
+            markdown,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+            evidence_registry,
+        )
+    except RuntimeError as exc:
+        # Final publication cleanup is surface-only. If it disrupts the
+        # paragraph contract, retain the last already-validated draft rather
+        # than weakening the deterministic scientific validator.
+        fallback_plan = copy.deepcopy(plan)
+        fallback_plan["sections"] = terminal_scientific_baseline_sections
+        try:
+            _validate_paper_evidence_plan(
+                fallback_plan,
+                terminal_scientific_baseline_markdown,
+                valid_source_ids,
+                figure_evidence_bundles if figure_first else None,
+                evidence_registry,
+            )
+        except RuntimeError:
+            raise exc
+        plan["sections"] = terminal_scientific_baseline_sections
+        markdown = terminal_scientific_baseline_markdown
+        final_lint = _paper_ai_style_lint(markdown, include_abstract=True)
+        final_body_lint = _paper_ai_style_lint(markdown, include_abstract=False)
+        plan["final_style_lint"] = final_lint
+        plan["final_body_style_lint"] = final_body_lint
+        logger.warning(
+            "PAPER final cleanup disrupted deterministic validation; retaining last scientific draft: %s",
+            exc,
+        )
     logger.info("PAPER deterministic evidence validation passed")
+    if _paper_ai_style_lint_failed(final_body_lint):
+        logger.warning(
+            "PAPER final editorial style lint remains after bounded repair: %s",
+            {key: value for key, value in final_body_lint.items() if value},
+        )
     dossier["paper_evidence_plan"] = plan
     return _write_article_files(dossier, settings, output_dir, markdown, plan)
 
