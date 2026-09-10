@@ -41,6 +41,7 @@ from news.pipeline import (
     _insert_paper_figures,
     _paper_publication_within_window,
     _paper_figure_reference_numbers,
+    _paper_caption_is_primarily_english,
     _paper_match_source_paragraphs,
     _prepare_paper_markdown,
     _select_article_images,
@@ -108,6 +109,7 @@ from writer.llm import (
     _paper_body_length_audit,
     _paper_chinese_char_count,
     _paper_canonical_evidence_registry,
+    _paper_canonical_anchor_owners,
     _paper_clean_story_evidence,
     _paper_clean_story_text,
     _paper_evidence_by_id,
@@ -115,7 +117,11 @@ from writer.llm import (
     _paper_story_sections,
     _paper_story_skeleton,
     _paper_story_block_specs,
+    _paper_story_contract_text,
     _paper_plain_language_cleanup,
+    _paper_protected_proper_nouns,
+    _paper_remove_inline_citation_markers,
+    _paper_restore_proper_noun_markers,
     _paper_safe_caption,
     _paper_metadata_leakage_lint,
     _paper_editor_anchor_audit,
@@ -3645,12 +3651,86 @@ class V1Tests(unittest.TestCase):
         self.assertIn("研究结果表明变化可能来自远洋输送", cleaned)
         self.assertIn("约74%的区域受影响", cleaned)
 
+    def test_paper_proper_noun_policy_preserves_places_not_scientific_concepts(self):
+        names = _paper_protected_proper_nouns(
+            "Queen Mary Land and Wilkes Land are affected by a Rossby wave over East Antarctica."
+        )
+        self.assertIn("Queen Mary Land", names)
+        self.assertIn("Wilkes Land", names)
+        self.assertIn("East Antarctica", names)
+        self.assertNotIn("Rossby wave", names)
+        self.assertIn("罗斯贝波", PAPER_ARTICLE_EDITOR_PROMPT)
+
+    def test_paper_proper_noun_restore_rejects_partial_span(self):
+        markers = {"[[PAPER_PROPER_NOUN_1]]": "East Antarctica"}
+        self.assertEqual(
+            _paper_restore_proper_noun_markers("位于[[PAPER_PROPER_NOUN_1]]。", markers),
+            "位于East Antarctica。",
+        )
+        with self.assertRaisesRegex(RuntimeError, "proper noun placeholder"):
+            _paper_restore_proper_noun_markers("位于East 南极洲 Antarctica。", markers)
+
+    def test_paper_citation_cleanup_removes_references_and_protects_units(self):
+        text = "主要贡献因素¹，损失²˒³，响应一致⁴；10 m²、m³、s⁻¹、m s⁻¹和W m⁻²。"
+        cleaned = _paper_remove_inline_citation_markers(text)
+        self.assertNotIn("因素¹", cleaned)
+        self.assertNotIn("损失²˒³", cleaned)
+        self.assertNotIn("一致⁴", cleaned)
+        for unit in ("m²", "m³", "s⁻¹", "m s⁻¹", "W m⁻²"):
+            self.assertIn(unit, cleaned)
+
     def test_paper_ai_style_lint_flags_broad_body_author_voice(self):
         for phrase in ("我们可以看到", "我们看到", "我们注意到", "咱们"):
             with self.subTest(phrase=phrase):
                 counts = _paper_ai_style_lint(f"{phrase}结果仍然稳定。")
                 self.assertEqual(counts["作者式第一人称"], 1)
                 self.assertTrue(_paper_ai_style_lint_failed(counts))
+
+    def test_paper_canonical_anchor_owner_deduplicates_same_claim_only(self):
+        registry = [
+            {"evidence_id": "evidence-source-source-1", "value": "zone 14 contributes 18.4% (Fig. 4)."},
+            {"evidence_id": "evidence-source-source-2", "value": "zone 9 also contributes 18.4% (Fig. 5)."},
+            {
+                "evidence_id": "e1", "anchors": ["18.4%"], "source_paragraph_ids": ["source-1"],
+                "source_sentence": "zone 14 contributes 18.4%.", "scope": "section_context", "supported_figures": ["Fig. 4"],
+            },
+            {
+                "evidence_id": "e2", "anchors": ["18.4%"], "source_paragraph_ids": ["source-1"],
+                "source_sentence": "zone 14 contributes 18.4%.", "scope": "figure_specific", "supported_figures": ["Fig. 4"],
+            },
+            {
+                "evidence_id": "e3", "anchors": ["18.4%"], "source_paragraph_ids": ["source-2"],
+                "source_sentence": "zone 9 contributes 18.4%.", "scope": "section_context", "supported_figures": ["Fig. 5"],
+            },
+        ]
+        owners = _paper_canonical_anchor_owners(registry)
+        self.assertEqual(owners[("e1", "18.4%")], "e1")
+        self.assertEqual(owners[("e2", "18.4%")], "e1")
+        self.assertEqual(owners[("e3", "18.4%")], "e3")
+
+    def test_paper_block_specs_dedupe_required_anchor_but_keep_bindings(self):
+        section = {
+            "id": "beat-1", "title": "水汽来源", "figure_ids": ["Fig. 4"],
+            "source_paragraph_ids": ["source-1"],
+            "findings": [{"id": "f1", "evidence_ids": ["e1", "e2"], "figure_ids": ["Fig. 4"]}],
+        }
+        story_plan = {"story_beats": [{"id": "beat-1", "evidence_ids": ["e1", "e2"]}]}
+        clean_evidence = [
+            {"evidence_id": "e1", "evidence_group": "g", "anchors": ["18.4%"]},
+            {"evidence_id": "e2", "evidence_group": "g", "anchors": ["18.4%"]},
+        ]
+        registry = [
+            {"evidence_id": "e1", "anchors": ["18.4%"], "source_paragraph_ids": ["source-1"], "source_sentence": "zone 14 contributes 18.4%.", "scope": "section_context", "supported_figures": ["Fig. 4"]},
+            {"evidence_id": "e2", "anchors": ["18.4%"], "source_paragraph_ids": ["source-1"], "source_sentence": "zone 14 contributes 18.4%.", "scope": "figure_specific", "supported_figures": ["Fig. 4"]},
+        ]
+        evidence_map = {"e1": (section, section["findings"][0]), "e2": (section, section["findings"][0])}
+        specs = _paper_story_block_specs(
+            story_plan, clean_evidence, evidence_map, registry, {"source-1"}
+        )["beat-1"]
+        self.assertEqual([spec["evidence_ids"] for spec in specs], [("e1",), ("e2",)])
+        self.assertEqual(specs[0]["anchors"], ("18.4%",))
+        self.assertEqual(specs[1]["anchors"], ())
+        self.assertEqual(specs[1]["source_paragraph_ids"], ("source-1",))
 
     def test_paper_article_editor_receives_full_article_and_corpus(self):
         client = MagicMock()
@@ -3797,6 +3877,41 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(rebuilt[0]["blocks"][0]["evidence_ids"], ["e1"])
         self.assertEqual(rebuilt[0]["blocks"][1]["evidence_ids"], ["e2"])
 
+    def test_paper_duplicate_anchor_validation_requires_one_canonical_occurrence(self):
+        registry = [
+            {"evidence_id": "evidence-source-source-1", "value": "zone 14 contributes 18.4% (Fig. 4)."},
+            {"evidence_id": "e1", "anchors": ["18.4%"], "source_paragraph_ids": ["source-1"], "source_sentence": "zone 14 contributes 18.4%.", "scope": "section_context", "supported_figures": ["Fig. 4"]},
+            {"evidence_id": "e2", "anchors": ["18.4%"], "source_paragraph_ids": ["source-1"], "source_sentence": "zone 14 contributes 18.4%.", "scope": "figure_specific", "supported_figures": ["Fig. 4"]},
+        ]
+        section = {
+            "id": "section-1", "title": "水汽来源", "figure_ids": ["Fig. 4"],
+            "source_paragraph_ids": ["source-1"],
+            "findings": [{"id": "f1", "evidence_ids": ["e1", "e2"], "figure_ids": ["Fig. 4"], "anchors": ["18.4%"]}],
+            "story_beat": {"evidence_ids": ["e1", "e2"]},
+            "blocks": [
+                {"id": "b1", "evidence_ids": ["e1"], "source_paragraph_ids": ["source-1"], "figure_ids": ["Fig. 4"], "text": "中部南印度洋贡献约18.4%。"},
+                {"id": "b2", "evidence_ids": ["e2"], "source_paragraph_ids": ["source-1"], "figure_ids": ["Fig. 4"], "text": "同一来源在事件期继续增加。"},
+            ],
+            "paragraphs": [{"block_ids": ["b1", "b2"], "text": "中部南印度洋贡献约18.4%，同一来源在事件期继续增加。"}],
+        }
+        plan = {
+            "sections": [section],
+            "story_evidence": {
+                "e1": {"anchors": ["18.4%"], "figure_ids": ["Fig. 4"]},
+                "e2": {"anchors": ["18.4%"], "figure_ids": ["Fig. 4"]},
+            },
+        }
+        _validate_paper_evidence_plan(
+            plan, "# 标题\n\n## 水汽来源\n\n中部南印度洋贡献约18.4%，同一来源在事件期继续增加。",
+            {"source-1"}, evidence_registry=registry,
+        )
+        section["paragraphs"][0]["text"] = "中部南印度洋贡献增加，同一来源在事件期继续增加。"
+        with self.assertRaisesRegex(RuntimeError, "anchor missing from bound block"):
+            _validate_paper_evidence_plan(
+                plan, "# 标题\n\n## 水汽来源\n\n中部南印度洋贡献增加，同一来源在事件期继续增加。",
+                {"source-1"}, evidence_registry=registry,
+            )
+
     def test_paper_article_editor_rejects_duplicate_missing_and_unknown_block_ids(self):
         plan = {"sections": [{"id": "section-1", "title": "一", "blocks": []}]}
         specs = {"section-1": [
@@ -3861,6 +3976,80 @@ class V1Tests(unittest.TestCase):
                 {"source-1", "source-2"},
                 evidence_registry=registry,
             )
+
+    def test_paper_story_contract_text_normalizes_only_publication_surface(self):
+        self.assertEqual(_paper_story_contract_text("West Antarctica驱动。1"), "WestAntarctica驱动。")
+        self.assertEqual(_paper_story_contract_text("结果得到验证²˒³。"), "结果得到验证。")
+        self.assertEqual(_paper_story_contract_text("通量为W m⁻²。"), "通量为Wm⁻²。")
+        self.assertNotEqual(_paper_story_contract_text("降水增加18.4%。"), _paper_story_contract_text("降水增加10%。"))
+
+    def test_paper_paragraph_membership_uses_contract_text_and_preserves_block_fallback(self):
+        registry = [{
+            "evidence_id": "e1", "anchors": [], "source_paragraph_ids": ["source-1"],
+            "source_sentence": "A contextual statement.", "scope": "section_context", "supported_figures": [],
+        }]
+
+        def make_plan(paragraph_text):
+            return {
+                "sections": [{
+                    "id": "section-1", "title": "结果", "figure_ids": [],
+                    "source_paragraph_ids": ["source-1"],
+                    "findings": [{"id": "f1", "evidence_ids": ["e1"], "figure_ids": []}],
+                    "story_beat": {"evidence_ids": ["e1"]},
+                    "blocks": [{"id": "b1", "evidence_ids": ["e1"], "source_paragraph_ids": ["source-1"], "figure_ids": [], "text": paragraph_text}],
+                    "paragraphs": [{"block_ids": ["b1"], "text": paragraph_text}],
+                }],
+                "story_evidence": {"e1": {"anchors": [], "figure_ids": []}},
+            }
+
+        _validate_paper_evidence_plan(
+            make_plan("West Antarctica驱动。1"),
+            "# 标题\n\n## 结果\n\nWest Antarctica驱动。",
+            {"source-1"}, evidence_registry=registry,
+        )
+        _validate_paper_evidence_plan(
+            make_plan("通量为W m⁻²。"),
+            "# 标题\n\n## 结果\n\n通量为W m⁻²。",
+            {"source-1"}, evidence_registry=registry,
+        )
+        for article in ("降水增加10%。", "完全不同的段落。"):
+            with self.subTest(article=article):
+                with self.assertRaisesRegex(RuntimeError, "paragraph text is not in article"):
+                    _validate_paper_evidence_plan(
+                        make_plan("降水增加18.4%。"),
+                        f"# 标题\n\n## 结果\n\n{article}",
+                        {"source-1"}, evidence_registry=registry,
+                    )
+        legacy_plan = make_plan("West Antarctica驱动。1")
+        legacy_plan["sections"][0].pop("paragraphs")
+        with self.assertRaisesRegex(RuntimeError, "block text is not in its planned paragraph"):
+            _validate_paper_evidence_plan(
+                legacy_plan,
+                "# 标题\n\n## 结果\n\nWest Antarctica驱动。",
+                {"source-1"}, evidence_registry=registry,
+            )
+
+    def test_paper_multi_block_paragraph_membership_keeps_all_block_coverage(self):
+        registry = [
+            {"evidence_id": f"e{index}", "anchors": [], "source_paragraph_ids": ["source-1"], "source_sentence": f"Fact {index}.", "scope": "section_context", "supported_figures": []}
+            for index in (1, 2, 3)
+        ]
+        plan = {
+            "sections": [{
+                "id": "section-1", "title": "结果", "figure_ids": [], "source_paragraph_ids": ["source-1"],
+                "findings": [{"id": "f1", "evidence_ids": ["e1", "e2", "e3"], "figure_ids": []}],
+                "story_beat": {"evidence_ids": ["e1", "e2", "e3"]},
+                "blocks": [
+                    {"id": f"b{index}", "evidence_ids": [f"e{index}"], "source_paragraph_ids": ["source-1"], "figure_ids": [], "text": f"事实{index}。"}
+                    for index in (1, 2, 3)
+                ],
+                "paragraphs": [{"block_ids": ["b1", "b2", "b3"], "text": "事实1、事实2和事实3。"}],
+            }],
+            "story_evidence": {f"e{index}": {"anchors": [], "figure_ids": []} for index in (1, 2, 3)},
+        }
+        _validate_paper_evidence_plan(
+            plan, "# 标题\n\n## 结果\n\n事实1、事实2和事实3。", {"source-1"}, evidence_registry=registry,
+        )
 
     def test_paper_final_style_lint_hard_fails_after_fallback_rollback(self):
         counts = _paper_ai_style_lint("摘要中的我们仍然保留了metadata leakage。", include_abstract=True)
@@ -3939,6 +4128,34 @@ class V1Tests(unittest.TestCase):
         payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
         self.assertEqual(payload["article_feedback"]["style_lint"]["roughly"], 1)
         self.assertIn("第一段。", payload["article_body"])
+
+    def test_paper_article_style_review_aggregates_related_issues(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "issues": [
+                    {"block_ids": ["b1"], "issue": "暖池到水汽机制重复", "instruction": "整篇只保留一次完整机制。"},
+                    {"block_ids": ["b2", "b3"], "issue": "后文重复高压—增雪链条", "instruction": "后文改为简短承接。"},
+                    {"block_ids": ["b4"], "issue": "术语和地名混用", "instruction": "统一全文名称。"},
+                    {"block_ids": ["b5", "b6"], "issue": "Results翻译腔", "instruction": "改成自然中文。"},
+                ]
+            }, ensure_ascii=False)))]
+        )
+        sections = [{
+            "id": "s1", "title": "结果", "paragraphs": [
+                {"block_ids": ["b1"], "text": "一。"},
+                {"block_ids": ["b2", "b3"], "text": "二。"},
+                {"block_ids": ["b4"], "text": "三。"},
+                {"block_ids": ["b5", "b6"], "text": "四。"},
+            ],
+        }]
+        result = _paper_style_review(
+            client, "范文", sections, "## 结果\\n\\n一。", "test-model", article_level=True,
+        )
+        self.assertEqual(len(result["issues"]), 3)
+        self.assertEqual(result["issues"][0]["block_ids"], ["b1", "b2", "b3"])
+        self.assertEqual(result["issues"][1]["block_ids"], ["b4"])
+        self.assertEqual(result["issues"][2]["block_ids"], ["b5", "b6"])
 
     def test_paper_article_review_rechecks_after_revision_and_stops_on_pass(self):
         reviews = [
@@ -4168,6 +4385,51 @@ class V1Tests(unittest.TestCase):
             final_text = path.read_text(encoding="utf-8")
         self.assertEqual(story_writer.call_count, 2)
         self.assertNotIn("并非A而是B", final_text)
+
+    def test_paper_abstract_translation_cleans_citations_before_and_after_llm(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "abstract_cn": "研究由[[PAPER_PROPER_NOUN_1]]驱动。1 损失速率下降。2,3"
+            }, ensure_ascii=False)))]
+        )
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        with patch("writer.llm.OpenAI", return_value=client):
+            result = translate_paper_abstract(
+                "Mass loss is driven by West Antarctica¹ [2,3].", settings
+            )
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertNotIn("¹", payload["abstract"])
+        self.assertNotIn("[2,3]", payload["abstract"])
+        self.assertNotIn("。1", result)
+        self.assertNotIn("。2,3", result)
+        self.assertIn("West Antarctica", result)
+
+    def test_paper_abstract_translation_restores_authoritative_english_place_names(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "abstract_cn": "[[PAPER_PROPER_NOUN_1]]和[[PAPER_PROPER_NOUN_2]]的质量变化。"
+            }, ensure_ascii=False)))]
+        )
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        with patch("writer.llm.OpenAI", return_value=client):
+            result = translate_paper_abstract(
+                "Mass changes occurred in Queen Mary Land and Wilkes Land.", settings
+            )
+        self.assertIn("Queen Mary Land", result)
+        self.assertIn("Wilkes Land", result)
+        self.assertNotIn("PAPER_PROPER_NOUN", result)
 
     def test_paper_abstract_translation_is_not_compressed(self):
         faithful = "这是完整的中文摘要翻译。研究结果和限定条件全部保留。" + "重要结果继续保留。" * 20
@@ -5429,6 +5691,38 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(payload["terminology_context"], "摘要和正文统一使用东南极、印度洋水汽。")
         self.assertEqual(len(payload["images"]), 1)
         self.assertEqual(captions, [caption])
+
+    def test_paper_caption_targeted_english_fallback_uses_same_caption_llm(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        images = [{
+            "metadata_title": "Tropical warm pool warming",
+            "original_caption": "TWP warming excites a poleward-propagating Rossby-wave train over East Antarctica.",
+            "caption": "",
+            "provider": "Nature",
+        }]
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "items": [{"index": 1, "caption_cn": "热带暖池增温激发向极传播的罗斯贝波列，影响东南极。"}],
+            }, ensure_ascii=False)))]
+        )
+        with patch("writer.llm.OpenAI", return_value=client):
+            captions = generate_image_captions(
+                images, settings, "Queen Mary Land、Wilkes Land和东南极。", True
+            )
+        self.assertEqual(captions, ["热带暖池增温激发向极传播的罗斯贝波列，影响东南极。"])
+        payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+        self.assertIn("原始caption忠实翻译", client.chat.completions.create.call_args.kwargs["messages"][0]["content"])
+        self.assertIn("Queen Mary Land", payload["protected_proper_nouns"])
+
+    def test_paper_caption_english_detection_does_not_change_news_path(self):
+        self.assertTrue(_paper_caption_is_primarily_english("Figure 5. Rossby-wave train over East Antarctica."))
+        self.assertFalse(_paper_caption_is_primarily_english("东南极降水变化。"))
 
     def test_news_body_images_are_limited_and_deduplicated(self):
         def image(index, title):

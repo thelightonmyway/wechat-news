@@ -516,6 +516,105 @@ def _paper_evidence_by_id(registry: list[dict[str, Any]]) -> dict[str, dict[str,
     }
 
 
+def _paper_canonical_anchor_owners(
+    evidence_registry: list[dict[str, Any]],
+) -> dict[tuple[str, str], str]:
+    """Assign one literal owner per repeated occurrence of the same scientific claim."""
+    evidence_by_id = _paper_evidence_by_id(evidence_registry)
+    source_context = {
+        str(record.get("evidence_id") or "")[len("evidence-source-"):]: str(
+            record.get("source_sentence") or record.get("value") or ""
+        )
+        for record in evidence_registry
+        if str(record.get("evidence_id") or "").startswith("evidence-source-")
+    }
+    groups: dict[tuple[str, tuple[str, ...], tuple[str, ...]], list[dict[str, Any]]] = {}
+    for evidence_id, record in evidence_by_id.items():
+        source_ids = tuple(
+            str(source_id).strip()
+            for source_id in record.get("source_paragraph_ids") or []
+            if str(source_id).strip()
+        )
+        sentence = str(record.get("source_sentence") or record.get("value") or "")
+        context = " ".join(
+            [sentence]
+            + [source_context.get(source_id, "") for source_id in source_ids]
+        )
+        explicit_figures = {
+            _paper_figure_id(value)
+            for value in record.get("supported_figures") or []
+            if str(value).strip()
+        }
+        explicit_figures.update(
+            f"Fig. {match.group(1)}"
+            for source_id in source_ids
+            for match in [re.search(r"source-figure-(\d+)", source_id)]
+            if match
+        )
+        figure_matches = list(re.finditer(
+            r"\b(?:Fig(?:ure)?\.?\s*\d+)", context, flags=re.IGNORECASE
+        ))
+        label_matches = list(re.finditer(
+            r"\b(?:zone|region)\s+\d+\b", context, flags=re.IGNORECASE
+        ))
+        for anchor in record.get("anchors") or []:
+            normalized = _normalize_evidence_anchor(str(anchor))
+            if not normalized:
+                continue
+            anchor_matches = list(re.finditer(re.escape(str(anchor)), context, flags=re.IGNORECASE))
+            anchor_positions = [match.start() for match in anchor_matches] or [0]
+            figure_context = set(explicit_figures)
+            if figure_matches and not figure_context:
+                nearest_figure = min(
+                    figure_matches,
+                    key=lambda match: min(
+                        abs(match.start() - position) for position in anchor_positions
+                    ),
+                )
+                figure_context.add(_paper_figure_id(nearest_figure.group(0)))
+            nearby_labels: set[str] = set()
+            if label_matches:
+                label_candidates: list[tuple[int, re.Match[str]]] = []
+                for position in anchor_positions:
+                    preceding = [match for match in label_matches if match.start() <= position]
+                    selected = preceding[-1] if preceding else label_matches[0]
+                    label_candidates.append((abs(selected.start() - position), selected))
+                nearest = min(label_candidates, key=lambda item: item[0])[1]
+                nearby_labels.add(nearest.group(0).lower())
+            # Labels such as “zone 14” distinguish two different claims that
+            # happen to share the same percentage.  When no stable label is
+            # available, source identity remains part of the key.
+            claim_identity = (
+                ("label", *sorted(nearby_labels))
+                if nearby_labels
+                else ("source", *source_ids, _normalize_evidence_anchor(sentence))
+            )
+            key = (normalized, claim_identity, tuple(sorted(figure_context)))
+            groups.setdefault(key, []).append(record)
+
+    owners: dict[tuple[str, str], str] = {}
+    for records in groups.values():
+        owner = min(
+            records,
+            key=lambda record: (
+                0 if str(record.get("scope") or "") == "section_context" else 1,
+                0 if not any(
+                    str(source_id).startswith("source-figure-")
+                    for source_id in record.get("source_paragraph_ids") or []
+                ) else 1,
+                str(record.get("evidence_id") or ""),
+            ),
+        )
+        owner_id = str(owner.get("evidence_id") or "")
+        for record in records:
+            evidence_id = str(record.get("evidence_id") or "")
+            for anchor in record.get("anchors") or []:
+                normalized = _normalize_evidence_anchor(str(anchor))
+                if normalized:
+                    owners[(evidence_id, normalized)] = owner_id
+    return owners
+
+
 def _paper_registry_for_llm(registry: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -628,15 +727,8 @@ def _paper_validate_story_blocks(
         return
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
     canonical_mode = bool(evidence_registry)
+    canonical_anchor_owners = _paper_canonical_anchor_owners(evidence_registry or [])
     planned_sections = plan.get("sections") or []
-    anchor_evidence_ids: dict[str, set[str]] = {}
-    for evidence_id, evidence in story_evidence.items():
-        if not isinstance(evidence, dict):
-            continue
-        for anchor in evidence.get("anchors") or []:
-            normalized_anchor = _normalize_evidence_anchor(str(anchor))
-            if normalized_anchor:
-                anchor_evidence_ids.setdefault(normalized_anchor, set()).add(str(evidence_id))
     seen_block_ids: set[str] = set()
     if len(sections) != len(planned_sections):
         raise RuntimeError("PAPER story block validation failed: section count changed")
@@ -647,6 +739,7 @@ def _paper_validate_story_blocks(
         beat_ids = set((section.get("story_beat") or {}).get("evidence_ids") or [])
         seen_evidence: set[str] = set()
         body_normalized = re.sub(r"\s+", "", sections[section_index][1])
+        contract_body_normalized = _paper_story_contract_text(sections[section_index][1])
         paragraph_text_by_block: dict[str, str] = {}
         planned_paragraphs = section.get("paragraphs")
         if planned_paragraphs is not None:
@@ -667,8 +760,10 @@ def _paper_validate_story_blocks(
                     or any(block_id in paragraph_text_by_block for block_id in paragraph_block_ids)
                 ):
                     raise RuntimeError("PAPER story block validation failed: invalid paragraph ownership")
-                normalized_paragraph = re.sub(r"\s+", "", paragraph_text)
-                paragraph_position = body_normalized.find(normalized_paragraph, paragraph_position + 1)
+                normalized_paragraph = _paper_story_contract_text(paragraph_text)
+                paragraph_position = contract_body_normalized.find(
+                    normalized_paragraph, paragraph_position + 1
+                )
                 if paragraph_position < 0:
                     raise RuntimeError(
                         "PAPER story block validation failed: paragraph text is not in article"
@@ -764,9 +859,10 @@ def _paper_validate_story_blocks(
                 if not canonical_mode:
                     figure_specific = figure_specific or bool(supported_figures)
                 owning_blocks = blocks_by_evidence.get(evidence_id, [])
-                duplicate_anchor = len(anchor_evidence_ids.get(normalized_anchor, set())) > 1
-                hard_anchor_owner = bool(evidence_record.get("anchors"))
-                if canonical_mode and (hard_anchor_owner or duplicate_anchor or figure_specific):
+                literal_anchor_owner = canonical_anchor_owners.get(
+                    (str(evidence_id), normalized_anchor), str(evidence_id)
+                ) == str(evidence_id)
+                if canonical_mode and literal_anchor_owner:
                     if len(owning_blocks) != 1:
                         raise RuntimeError(
                             "PAPER story block validation failed: evidence is not bound to one block: "
@@ -861,6 +957,7 @@ def _validate_paper_evidence_plan(
             ).update(_paper_figure_id(value) for value in figures)
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
     canonical_mode = bool(evidence_registry)
+    canonical_anchor_owners = _paper_canonical_anchor_owners(evidence_registry or [])
     anchor_evidence_ids: dict[str, set[str]] = {}
     if canonical_mode:
         for evidence_id, evidence in evidence_by_id.items():
@@ -1492,6 +1589,116 @@ def _paper_clean_story_text(text: str) -> str:
     return cleaned.strip()
 
 
+_PAPER_PROPER_NOUN_SUFFIXES = (
+    "Land",
+    "Sea",
+    "Shelf",
+    "Island",
+    "Islands",
+    "Bay",
+    "Basin",
+    "Glacier",
+    "Coast",
+    "Peninsula",
+    "Mountains",
+    "Plateau",
+    "Ocean",
+    "Antarctica",
+    "Arctic",
+)
+
+
+def _paper_protected_proper_nouns(text: str) -> list[str]:
+    """Find geographic names and taxonomic names that should remain authoritative English."""
+    source = re.sub(r"\s+", " ", str(text or "")).strip()
+    found: list[str] = []
+    suffixes = "|".join(re.escape(value) for value in _PAPER_PROPER_NOUN_SUFFIXES)
+    for match in re.finditer(
+        rf"\b(?:[A-Z][A-Za-z'’\-]+(?:\s+|$))+?(?:{suffixes})\b",
+        source,
+    ):
+        value = match.group(0).strip()
+        if value and value not in found:
+            found.append(value)
+    for match in re.finditer(r"\b([A-Z][a-z]{2,})\s+([a-z]{4,})\b", source):
+        value = match.group(0)
+        if value not in found and value.split()[1].lower() not in {
+            "abstract", "analysis", "method", "results", "study", "paper",
+            "wave", "waves", "oscillation", "oscillations", "mode", "modes",
+            "anomaly", "anomalies", "circulation", "flow", "flux", "feedback",
+            "forcing", "pressure", "temperature", "precipitation", "snowfall",
+            "moisture", "transport", "event", "events", "trend", "variability",
+            "warming", "cooling", "response", "relationship", "model", "models",
+            "filter", "coefficient", "coefficients", "ice", "sheet", "mass",
+            "loss", "cover", "change", "changes", "water", "air", "land",
+        }:
+            found.append(value)
+    return found
+
+
+def _paper_restore_proper_noun_markers(
+    text: str,
+    markers: dict[str, str],
+) -> str:
+    """Restore complete protected spans and reject partial or missing restores."""
+    restored = str(text or "")
+    for marker, value in markers.items():
+        marker_name = marker[2:-2]
+        restored = re.sub(
+            rf"\[\[\s*{re.escape(marker_name)}\s*\]\]",
+            value,
+            restored,
+        )
+    if any(
+        re.search(rf"\[\[\s*{re.escape(marker[2:-2])}\s*\]\]", restored)
+        for marker in markers
+    ) or any(value not in restored for value in markers.values()):
+        raise RuntimeError("PAPER Abstract proper noun placeholder integrity check failed")
+    return restored
+
+
+def _paper_remove_inline_citation_markers(text: str) -> str:
+    """Remove bibliographic superscripts while preserving scientific unit exponents."""
+    cleaned = str(text or "")
+    cluster = r"(?:⁻?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)(?:[˒,、·.\-–—−⁻][⁰¹²³⁴⁵⁶⁷⁸⁹]+)*"
+    unit_token = re.compile(
+        r"(?i)(?:w|m|cm|mm|km|s|ms|kg|g|k|pa|hz|n|j)$"
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = cleaned[: match.start()]
+        previous_token = re.search(r"[A-Za-z]+$", prefix)
+        if previous_token and (
+            unit_token.fullmatch(previous_token.group(0))
+            or (
+                previous_token.group(0).isupper()
+                and len(previous_token.group(0)) <= 3
+            )
+        ):
+            return match.group(0)
+        return ""
+
+    cleaned = re.sub(cluster, replace, cleaned)
+    cleaned = re.sub(
+        r"(?<=[。！？.!?])\s*[1-4](?:\s*[,，]\s*[1-4])*(?:\s*[-–—]\s*[1-4])?(?=\s*$|\s+[㐀-鿿A-Za-z])",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?<=[㐀-鿿A-Za-z)])\s*\[\s*\d{1,3}(?:\s*[,;、]\s*\d{1,3})*(?:\s*[-–—]\s*\d{1,3})?\s*\]",
+        "",
+        cleaned,
+    )
+    return cleaned
+
+
+def _paper_story_contract_text(text: str) -> str:
+    """Normalize only publication-layer whitespace and citation-only surface markers."""
+    return re.sub(
+        r"\s+", "", _paper_remove_inline_citation_markers(str(text or ""))
+    )
+
+
 def _paper_plain_language_cleanup(text: str) -> str:
     """Translate non-essential technical shorthand without touching verified values."""
     cleaned = str(text or "")
@@ -1863,6 +2070,7 @@ def _paper_story_block_specs(
         if str(record.get("evidence_id") or "")
     }
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
+    canonical_anchor_owners = _paper_canonical_anchor_owners(evidence_registry or [])
     specs_by_beat: dict[str, list[dict[str, Any]]] = {}
     for beat in story_plan.get("story_beats") or []:
         beat_id = str(beat.get("id") or "")
@@ -1900,6 +2108,9 @@ def _paper_story_block_specs(
                     str(anchor)
                     for anchor in clean_by_id[evidence_id].get("anchors") or []
                     if str(anchor).strip()
+                    and canonical_anchor_owners.get(
+                        (evidence_id, _normalize_evidence_anchor(str(anchor))), evidence_id
+                    ) == evidence_id
                 )
                 if evidence_registry:
                     resolved_sources = _paper_derived_source_ids(
@@ -2493,6 +2704,9 @@ def _paper_article_editor(
             "draft": draft,
             "sections": _paper_article_editor_sections(plan.get("sections") or []),
             "writing_facts": writing_facts,
+            "protected_proper_nouns": _paper_protected_proper_nouns(
+                f"{abstract}\n{draft}"
+            ),
             "style_exemplar": style_exemplar,
             "article_feedback": feedback or {},
             "_model": model,
@@ -2810,6 +3024,52 @@ def _paper_style_issue_block_ids(sections: list[dict[str, Any]]) -> set[str]:
     return target_ids
 
 
+def _paper_aggregate_article_review_issues(
+    issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Coalesce one article-level defect into one actionable revision item."""
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        text = f"{issue.get('issue', '')} {issue.get('instruction', '')}".lower()
+        if any(term in text for term in (
+            "机制", "重复", "复述", "暖池", "罗斯贝", "高压", "水汽", "增雪", "遥相关",
+            "mechanism", "repeat", "restate", "moisture", "snowfall", "high-pressure", "rossby",
+        )):
+            key = "mechanism"
+        elif any(term in text for term in (
+            "术语", "地名", "译名", "名称", "中英文", "英文名", "单位", "混用", "中文名",
+            "专名", "实体", "写法", "proper noun", "inconsisten", "terminolog",
+        )):
+            key = "terminology"
+        elif any(term in text for term in (
+            "翻译腔", "results", "方法", "统计", "变量", "句式", "ai", "translation", "awkward", "stylist",
+        )):
+            key = "results_style"
+        else:
+            key = f"issue:{len(order)}"
+        if key not in grouped:
+            grouped[key] = {
+                "block_ids": [],
+                "issue": str(issue.get("issue") or "").strip(),
+                "instruction": str(issue.get("instruction") or "").strip(),
+            }
+            order.append(key)
+        target = grouped[key]
+        for block_id in issue.get("block_ids") or []:
+            if block_id not in target["block_ids"]:
+                target["block_ids"].append(block_id)
+        current_issue = str(issue.get("issue") or "").strip()
+        current_instruction = str(issue.get("instruction") or "").strip()
+        if current_issue and current_issue != target["issue"] and current_issue not in target["issue"]:
+            target["issue"] = f"{target['issue']}；{current_issue}".strip("；")
+        if current_instruction and current_instruction != target["instruction"] and current_instruction not in target["instruction"]:
+            target["instruction"] = f"{target['instruction']}；{current_instruction}".strip("；")
+    return [grouped[key] for key in order]
+
+
 def _paper_bounded_article_review(
     review_fn: Any,
     revision_fn: Any,
@@ -2937,7 +3197,7 @@ def _paper_style_review(
                 "issue": problem.strip(),
                 "instruction": instruction.strip(),
             })
-        return {"issues": issues}
+        return {"issues": _paper_aggregate_article_review_issues(issues)}
     valid_ids = {
         block["block_id"]
         for section in review_sections
@@ -4041,8 +4301,17 @@ def _paper_deauthor_abstract(text: str) -> str:
 def translate_paper_abstract(abstract: str, settings: Settings) -> str:
     """Translate the original paper Abstract faithfully and remove author voice."""
     source = re.sub(r"\s+", " ", str(abstract or "")).strip()
+    source = _paper_remove_inline_citation_markers(source)
     if not source:
         return ""
+    protected_proper_nouns = _paper_protected_proper_nouns(source)
+    protected_source = source
+    markers: dict[str, str] = {}
+    for index, value in enumerate(sorted(protected_proper_nouns, key=len, reverse=True), start=1):
+        marker = f"[[PAPER_PROPER_NOUN_{index}]]"
+        protected_source = protected_source.replace(value, marker)
+        markers[marker] = value
+
     if not settings.model_configured:
         raise RuntimeError("MODEL_BASE_URL / MODEL_API_KEY / MODEL_NAME not configured")
     client = OpenAI(
@@ -4063,18 +4332,30 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
                     "按原文逻辑、顺序和段落关系做忠实中文翻译，只做必要的中文语序调整。"
                     "完整保留原文的重要背景、研究问题、方法范围、结果、数字、因果强度和限定条件。"
                     "不得压缩、删去关键结果、重新组织科学结构、自由总结、增加意义或补充原文没有的结论。"
+                    "不确定有权威中文译名的专有地名、学名和地理实体默认保留原始英文；普通科学概念继续翻译。"
+                    "输入中的[[PAPER_PROPER_NOUN_N]]是必须原样保留的专名占位符，输出后由脚本恢复为英文。"
                     "不要让公众号文风、标题风格或正文内容影响摘要。不要添加小标题、列表或解释，只返回严格JSON："
                     '{"abstract_cn":"..."}'
                 ),
             },
-            {"role": "user", "content": json.dumps({"abstract": source}, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "abstract": protected_source,
+                        "protected_proper_nouns": protected_proper_nouns,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
         ],
     )
     parsed = _json_from_text(response.choices[0].message.content or "")
     translated = re.sub(r"\s+", " ", str(parsed.get("abstract_cn") or "")).strip()
     if not translated:
         raise RuntimeError("model returned empty Chinese Abstract translation")
-    return _paper_deauthor_abstract(translated)
+    translated = _paper_restore_proper_noun_markers(translated, markers)
+    return _paper_remove_inline_citation_markers(_paper_deauthor_abstract(translated))
 
 
 def _replace_paper_lead(markdown: str, abstract_lead: str) -> str:
@@ -4202,6 +4483,7 @@ def generate_image_captions(
     images: list[dict[str, Any]],
     settings: Settings,
     terminology_context: str = "",
+    targeted_english_fallback: bool = False,
 ) -> list[str]:
     """Generate independent Chinese captions from each image's text metadata."""
     if not images or not settings.model_configured:
@@ -4210,7 +4492,13 @@ def generate_image_captions(
         {
             "index": index,
             "title": image.get("metadata_title", ""),
-            "caption": str(image.get("caption") or "")[:1500],
+            "caption": str(
+                (
+                    image.get("original_caption") or image.get("caption") or ""
+                )
+                if targeted_english_fallback
+                else (image.get("caption") or "")
+            )[:1500],
             "description": str(image.get("description") or image.get("alt") or "")[:1000],
             "provider": image.get("provider", ""),
         }
@@ -4218,6 +4506,9 @@ def generate_image_captions(
     ]
     request_payload: dict[str, Any] = {"images": payload}
     if terminology_context.strip():
+        request_payload["protected_proper_nouns"] = _paper_protected_proper_nouns(
+            terminology_context
+        )
         request_payload["terminology_context"] = re.sub(
             r"\s+", " ", terminology_context
         ).strip()[:6000]
@@ -4235,11 +4526,16 @@ def generate_image_captions(
                 {
                     "role": "system",
                     "content": (
-                        "根据每张图片各自的文本metadata，独立生成简短、准确的中文图注。"
-                        "必须描述该图片实际展示的内容，不能仅根据文章主题写通用句子，"
+                        (
+                            "将每张图片的英文原始caption忠实翻译成简短中文图注；不得增添原文没有的科学内容。"
+                            if targeted_english_fallback
+                            else "根据每张图片各自的文本metadata，独立生成简短、准确的中文图注。"
+                        )
+                        + "必须描述该图片实际展示的内容，不能仅根据文章主题写通用句子，"
                         "不同图片不得复用同一句图注。不得输出外部图片元数据或 URL、"
                         "图库名称或英文长caption。metadata不足时caption_cn返回空字符串。"
                         "如果提供terminology_context，同一实体沿用其中已经使用的中文名称，不要自行重新翻译。"
+                        "不确定有权威中文译名的专有地名、学名和地理实体保留英文原样；普通科学概念继续翻译。"
                         "不要添加‘图1’等编号。返回严格JSON："
                         '{"items":[{"index":1,"caption_cn":"..."}]}。'
                     ),
@@ -4409,7 +4705,7 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
     "根据当前论文自己的科学内容重新组织叙事：可以重排sections和自然段，也可以把多个相邻或相关block合并到同一个自然段，"
     "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。不要把文章写成Figure目录，不要按图号顺序汇报，"
     "不要复制范文事实、数字、人物、地点或结论；方法只保留帮助理解结论所需的部分。"
-    "术语和地名必须全文一致：Abstract已经采用的中文译名优先沿用；Abstract未覆盖的实体沿用正文首次明确使用的稳定写法，不交替使用英文名或自行创造新译名。"
+    "术语和地名必须全文一致：Abstract已经采用的中文译名优先沿用；但Abstract中的原始英文专有地名、学名和地理实体是权威写法，后文必须原样沿用，不要机翻或自行创造中文名。Abstract未覆盖的实体沿用正文首次明确使用的稳定写法，不交替使用英文名或不同中文译名。普通科学概念如Rossby wave仍应译为‘罗斯贝波’。payload中的protected_proper_nouns是必须保留的英文写法。"
     "writing_facts中的required_facts只是必须保留的论文事实，has_figure只是附近需要承载图的提示；"
     "不要在正文提到required fact、evidence、证据、锚点、约束、block、metadata、provenance或任何系统概念。"
     "不得发明事实、因果、意义、数字或来源。每个原有block_id必须在全文一个且仅一个paragraph的block_ids中出现，"
@@ -4427,7 +4723,7 @@ PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
     "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的五篇范文原文是主要参考。"
     "检查整篇文章的组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
     "必须检查：跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
-    "术语和地名是否一致：Abstract中的中文译名优先，正文首次明确使用的实体名称保持稳定，不要交替中文名、英文名或不同中文译名；"
+    "术语和地名是否一致：Abstract中的中文译名优先；Abstract中的原始英文专有地名、学名和地理实体必须保持英文原样，后文不得改成自造中文名；普通科学概念如Rossby wave应统一译为‘罗斯贝波’，不得中英文或多个中文译名混用；"
     "还要检查中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
     "如果前文已经完整解释暖池增温—罗斯贝波—高压—水汽—增雪机制，后文只应补充recurrence、反馈、暂时性或长期边界，不得再次完整复述起点到终点。"
     "每个跨paragraph问题必须一次性列出全部受影响的已有block_ids，并给出一条整篇revision_instruction；不要分别制造局部修句任务。"
@@ -5482,6 +5778,7 @@ def _generate_paper_article_markdown(
 
     markdown = _remove_unverified_paper_quotes(markdown, paper_text)
     markdown = _normalize_article_markdown(markdown, display_title)
+    markdown = _paper_remove_inline_citation_markers(markdown)
     final_lint = _paper_ai_style_lint(markdown, include_abstract=True)
     final_author_rewrite_rolled_back = False
     if _paper_ai_style_lint_failed(final_lint):

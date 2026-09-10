@@ -36,6 +36,7 @@ from writer.llm import (
     generate_article_markdown,
     generate_image_captions,
     generate_image_search_keywords,
+    _paper_remove_inline_citation_markers,
     prune_paper_sections_after_allocation,
     select_paper_ranked,
     select_paper_top_ten,
@@ -1907,6 +1908,13 @@ def _paper_wechat_cover(paper_first_page: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _paper_caption_is_primarily_english(text: str) -> bool:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    words = re.findall(r"\b[A-Za-z]+(?:[-'][A-Za-z]+)*\b", value)
+    han = re.findall(r"[㐀-鿿]", value)
+    return len(words) >= 3 and len(words) >= max(3, len(han) * 2)
+
+
 def _paper_figure_caption(
     image: dict[str, Any],
     generated_caption: str,
@@ -1927,6 +1935,7 @@ def _paper_figure_caption(
         caption,
         flags=re.IGNORECASE,
     ).strip()
+    caption = _paper_remove_inline_citation_markers(caption).strip()
     return figure_number, caption or str(image.get("figure_title") or f"Figure {figure_number}")
 
 
@@ -3682,6 +3691,28 @@ class NewsPipeline:
             self.settings,
             terminology_context,
         )
+        if dossier.get("content_type") == PAPER_CONTENT:
+            body_image_captions = list(body_image_captions)
+            body_image_captions.extend([""] * (len(body_images) - len(body_image_captions)))
+            fallback_positions = [
+                index
+                for index, image in enumerate(body_images)
+                if not str(body_image_captions[index] or "").strip()
+                and _paper_caption_is_primarily_english(
+                    str(image.get("original_caption") or image.get("caption") or "")
+                )
+            ]
+            if fallback_positions:
+                fallback_captions = await asyncio.to_thread(
+                    generate_image_captions,
+                    [body_images[index] for index in fallback_positions],
+                    self.settings,
+                    terminology_context,
+                    True,
+                )
+                for index, fallback_caption in zip(fallback_positions, fallback_captions):
+                    if str(fallback_caption or "").strip():
+                        body_image_captions[index] = fallback_caption
         dossier["cover_image"] = cover_image or {}
         dossier["body_images"] = body_images
         dossier["generated_body_image_captions"] = body_image_captions
