@@ -633,6 +633,25 @@ def _paper_registry_for_llm(registry: list[dict[str, Any]]) -> list[dict[str, An
     ]
 
 
+def _paper_planner_registry_for_llm(
+    registry: list[dict[str, Any]],
+    selected_figure_ids: list[str] | set[str],
+) -> list[dict[str, Any]]:
+    """Hide evidence owned only by unselected Figures from the Planner."""
+    if not selected_figure_ids:
+        return list(registry)
+    selected = {_paper_figure_id(value) for value in selected_figure_ids if str(value).strip()}
+    return [
+        record
+        for record in registry
+        if not {
+            _paper_figure_id(value)
+            for value in record.get("supported_figures") or []
+            if str(value).strip()
+        } - selected
+    ]
+
+
 def _paper_figure_backed_evidence_ids(
     registry: list[dict[str, Any]],
     selected_figure_ids: list[str] | set[str],
@@ -3388,7 +3407,12 @@ def _paper_plan(
             "metadata": metadata,
             "selected_body_figures": selected_figure_ids or [],
             "figure_evidence_bundles": figure_evidence_bundles or [],
-            "evidence_registry": _paper_registry_for_llm(metadata.get("evidence_registry") or []),
+            "evidence_registry": _paper_registry_for_llm(
+                _paper_planner_registry_for_llm(
+                    metadata.get("evidence_registry") or [],
+                    selected_figure_ids or [],
+                )
+            ),
             "figure_backed_evidence_ids": _paper_figure_backed_evidence_ids(
                 metadata.get("evidence_registry") or [],
                 selected_figure_ids or [],

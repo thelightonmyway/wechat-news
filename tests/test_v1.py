@@ -128,6 +128,7 @@ from writer.llm import (
     _paper_editor_feedback,
     _paper_figure_evidence_bundles,
     _paper_figure_backed_evidence_ids,
+    _paper_planner_registry_for_llm,
     _generate_paper_article_markdown,
     _paper_readability_audit,
     _paper_stop_slop_audit,
@@ -2316,6 +2317,8 @@ class V1Tests(unittest.TestCase):
             _paper_figure_backed_evidence_ids(registry, ["Fig. 2", "Fig. 3"]),
             {"Fig. 2": ["e1"], "Fig. 3": ["e3"]},
         )
+        visible = _paper_planner_registry_for_llm(registry, ["Fig. 2"])
+        self.assertEqual([record["evidence_id"] for record in visible], ["e1", "e2"])
         with patch(
             "writer.llm._paper_completion_json", return_value={"sections": []}
         ) as completion:
@@ -2332,6 +2335,10 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(
             payload["figure_backed_evidence_ids"],
             {"Fig. 2": ["e1"], "Fig. 3": ["e3"]},
+        )
+        self.assertEqual(
+            [record["evidence_id"] for record in payload["evidence_registry"]],
+            ["e1", "e2", "e3"],
         )
 
     def test_paper_planner_retries_section_without_figure_evidence_once(self):
