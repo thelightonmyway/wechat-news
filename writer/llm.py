@@ -1589,51 +1589,9 @@ def _paper_clean_story_text(text: str) -> str:
     return cleaned.strip()
 
 
-_PAPER_PROPER_NOUN_SUFFIXES = (
-    "Land",
-    "Sea",
-    "Shelf",
-    "Island",
-    "Islands",
-    "Bay",
-    "Basin",
-    "Glacier",
-    "Coast",
-    "Peninsula",
-    "Mountains",
-    "Plateau",
-    "Ocean",
-    "Antarctica",
-    "Arctic",
-)
-
-
 def _paper_protected_proper_nouns(text: str) -> list[str]:
-    """Find geographic names and taxonomic names that should remain authoritative English."""
-    source = re.sub(r"\s+", " ", str(text or "")).strip()
-    found: list[str] = []
-    suffixes = "|".join(re.escape(value) for value in _PAPER_PROPER_NOUN_SUFFIXES)
-    for match in re.finditer(
-        rf"\b(?:[A-Z][A-Za-z'’\-]+(?:\s+|$))+?(?:{suffixes})\b",
-        source,
-    ):
-        value = match.group(0).strip()
-        if value and value not in found:
-            found.append(value)
-    for match in re.finditer(r"\b([A-Z][a-z]{2,})\s+([a-z]{4,})\b", source):
-        value = match.group(0)
-        if value not in found and value.split()[1].lower() not in {
-            "abstract", "analysis", "method", "results", "study", "paper",
-            "wave", "waves", "oscillation", "oscillations", "mode", "modes",
-            "anomaly", "anomalies", "circulation", "flow", "flux", "feedback",
-            "forcing", "pressure", "temperature", "precipitation", "snowfall",
-            "moisture", "transport", "event", "events", "trend", "variability",
-            "warming", "cooling", "response", "relationship", "model", "models",
-            "filter", "coefficient", "coefficients", "ice", "sheet", "mass",
-            "loss", "cover", "change", "changes", "water", "air", "land",
-        }:
-            found.append(value)
-    return found
+    """Return no automatic geography guesses; translation choice belongs to the LLM."""
+    return []
 
 
 def _paper_restore_proper_noun_markers(
@@ -2704,9 +2662,6 @@ def _paper_article_editor(
             "draft": draft,
             "sections": _paper_article_editor_sections(plan.get("sections") or []),
             "writing_facts": writing_facts,
-            "protected_proper_nouns": _paper_protected_proper_nouns(
-                f"{abstract}\n{draft}"
-            ),
             "style_exemplar": style_exemplar,
             "article_feedback": feedback or {},
             "_model": model,
@@ -4304,14 +4259,6 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
     source = _paper_remove_inline_citation_markers(source)
     if not source:
         return ""
-    protected_proper_nouns = _paper_protected_proper_nouns(source)
-    protected_source = source
-    markers: dict[str, str] = {}
-    for index, value in enumerate(sorted(protected_proper_nouns, key=len, reverse=True), start=1):
-        marker = f"[[PAPER_PROPER_NOUN_{index}]]"
-        protected_source = protected_source.replace(value, marker)
-        markers[marker] = value
-
     if not settings.model_configured:
         raise RuntimeError("MODEL_BASE_URL / MODEL_API_KEY / MODEL_NAME not configured")
     client = OpenAI(
@@ -4332,8 +4279,11 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
                     "按原文逻辑、顺序和段落关系做忠实中文翻译，只做必要的中文语序调整。"
                     "完整保留原文的重要背景、研究问题、方法范围、结果、数字、因果强度和限定条件。"
                     "不得压缩、删去关键结果、重新组织科学结构、自由总结、增加意义或补充原文没有的结论。"
-                    "不确定有权威中文译名的专有地名、学名和地理实体默认保留原始英文；普通科学概念继续翻译。"
-                    "输入中的[[PAPER_PROPER_NOUN_N]]是必须原样保留的专名占位符，输出后由脚本恢复为英文。"
+                    "地名按语义判断：有标准且明确中文译名的地理名称正常翻译，例如East Antarctica译为东南极、"
+                    "West Antarctica译为西南极、Indian Ocean译为印度洋、Southern Ocean译为南大洋、"
+                    "North Atlantic译为北大西洋、Arctic译为北极；生僻、具体、命名型地理实体如果中文译名不确定，"
+                    "保留原始英文，例如Queen Mary Land、Wilkes Land，但不得把Antarctic moistening、"
+                    "Antarctic precipitation、Antarctic warming或Rossby wave当作地名，必须译为中文。"
                     "不要让公众号文风、标题风格或正文内容影响摘要。不要添加小标题、列表或解释，只返回严格JSON："
                     '{"abstract_cn":"..."}'
                 ),
@@ -4342,8 +4292,7 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
                 "role": "user",
                 "content": json.dumps(
                     {
-                        "abstract": protected_source,
-                        "protected_proper_nouns": protected_proper_nouns,
+                        "abstract": source,
                     },
                     ensure_ascii=False,
                 ),
@@ -4354,7 +4303,6 @@ def translate_paper_abstract(abstract: str, settings: Settings) -> str:
     translated = re.sub(r"\s+", " ", str(parsed.get("abstract_cn") or "")).strip()
     if not translated:
         raise RuntimeError("model returned empty Chinese Abstract translation")
-    translated = _paper_restore_proper_noun_markers(translated, markers)
     return _paper_remove_inline_citation_markers(_paper_deauthor_abstract(translated))
 
 
@@ -4506,9 +4454,6 @@ def generate_image_captions(
     ]
     request_payload: dict[str, Any] = {"images": payload}
     if terminology_context.strip():
-        request_payload["protected_proper_nouns"] = _paper_protected_proper_nouns(
-            terminology_context
-        )
         request_payload["terminology_context"] = re.sub(
             r"\s+", " ", terminology_context
         ).strip()[:6000]
@@ -4535,7 +4480,9 @@ def generate_image_captions(
                         "不同图片不得复用同一句图注。不得输出外部图片元数据或 URL、"
                         "图库名称或英文长caption。metadata不足时caption_cn返回空字符串。"
                         "如果提供terminology_context，同一实体沿用其中已经使用的中文名称，不要自行重新翻译。"
-                        "不确定有权威中文译名的专有地名、学名和地理实体保留英文原样；普通科学概念继续翻译。"
+                        "地名按语义判断：有标准且明确中文译名的大尺度地理区域正常翻译，例如East Antarctica译为东南极、"
+                        "West Antarctica译为西南极、Indian Ocean译为印度洋；生僻、具体、命名型地理实体若中文译名不确定则保留准确英文。"
+                        "普通科学表达如Antarctic moistening、Antarctic precipitation、Antarctic warming和Rossby wave必须翻译。"
                         "不要添加‘图1’等编号。返回严格JSON："
                         '{"items":[{"index":1,"caption_cn":"..."}]}。'
                     ),
@@ -4705,7 +4652,11 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
     "根据当前论文自己的科学内容重新组织叙事：可以重排sections和自然段，也可以把多个相邻或相关block合并到同一个自然段，"
     "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。不要把文章写成Figure目录，不要按图号顺序汇报，"
     "不要复制范文事实、数字、人物、地点或结论；方法只保留帮助理解结论所需的部分。"
-    "术语和地名必须全文一致：Abstract已经采用的中文译名优先沿用；但Abstract中的原始英文专有地名、学名和地理实体是权威写法，后文必须原样沿用，不要机翻或自行创造中文名。Abstract未覆盖的实体沿用正文首次明确使用的稳定写法，不交替使用英文名或不同中文译名。普通科学概念如Rossby wave仍应译为‘罗斯贝波’。payload中的protected_proper_nouns是必须保留的英文写法。"
+    "术语和地名必须全文一致：地名按语义判断，有标准且明确中文译名的地理名称正常翻译，例如East Antarctica译为东南极、"
+    "West Antarctica译为西南极、Indian Ocean译为印度洋、Southern Ocean译为南大洋、North Atlantic译为北大西洋、"
+    "Arctic译为北极；生僻、具体、命名型地理实体如果中文译名不确定，保留准确的原始英文，例如Queen Mary Land、Wilkes Land。"
+    "普通科学表达必须翻译，例如Antarctic moistening、Antarctic precipitation、Antarctic warming和Rossby wave分别使用自然中文，"
+    "不得因为包含Antarctic或Antarctica就保留整段英文。Abstract和正文首次明确采用的写法优先沿用，后文不得交替使用英文名或不同中文译名。"
     "writing_facts中的required_facts只是必须保留的论文事实，has_figure只是附近需要承载图的提示；"
     "不要在正文提到required fact、evidence、证据、锚点、约束、block、metadata、provenance或任何系统概念。"
     "不得发明事实、因果、意义、数字或来源。每个原有block_id必须在全文一个且仅一个paragraph的block_ids中出现，"
@@ -4723,8 +4674,10 @@ PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
     "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的五篇范文原文是主要参考。"
     "检查整篇文章的组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
     "必须检查：跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
-    "术语和地名是否一致：Abstract中的中文译名优先；Abstract中的原始英文专有地名、学名和地理实体必须保持英文原样，后文不得改成自造中文名；普通科学概念如Rossby wave应统一译为‘罗斯贝波’，不得中英文或多个中文译名混用；"
+    "术语和地名是否一致：Abstract和正文首次采用的标准中文译名优先沿用；中文译名不确定的生僻命名型地理实体可保持准确英文，后文不得交替使用不同写法；"
+    "普通科学概念如Rossby wave应统一译为‘罗斯贝波’，不得中英文或多个中文译名混用；"
     "还要检查中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
+    "检查普通英文 prose 或科学短语是否意外未翻译；不要把合法缩写、单位、拉丁学名或有意保留的生僻命名型地理名称误报为问题。"
     "如果前文已经完整解释暖池增温—罗斯贝波—高压—水汽—增雪机制，后文只应补充recurrence、反馈、暂时性或长期边界，不得再次完整复述起点到终点。"
     "每个跨paragraph问题必须一次性列出全部受影响的已有block_ids，并给出一条整篇revision_instruction；不要分别制造局部修句任务。"
     "不要修改科学事实，不要发明证据，不要修改或返回evidence/source/Figure元数据。没有明确问题返回空issues。"

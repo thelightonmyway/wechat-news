@@ -3651,15 +3651,23 @@ class V1Tests(unittest.TestCase):
         self.assertIn("研究结果表明变化可能来自远洋输送", cleaned)
         self.assertIn("约74%的区域受影响", cleaned)
 
-    def test_paper_proper_noun_policy_preserves_places_not_scientific_concepts(self):
+    def test_paper_proper_noun_policy_leaves_translation_choice_to_llm(self):
         names = _paper_protected_proper_nouns(
             "Queen Mary Land and Wilkes Land are affected by a Rossby wave over East Antarctica."
         )
-        self.assertIn("Queen Mary Land", names)
-        self.assertIn("Wilkes Land", names)
-        self.assertIn("East Antarctica", names)
-        self.assertNotIn("Rossby wave", names)
-        self.assertIn("罗斯贝波", PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertEqual(names, [])
+        for phrase in (
+            "Antarctic moistening",
+            "Antarctic precipitation",
+            "Antarctic warming",
+            "Rossby wave",
+            "East Antarctica",
+            "West Antarctica",
+            "Indian Ocean",
+        ):
+            self.assertIn(phrase, PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertIn("Queen Mary Land", PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertIn("Wilkes Land", PAPER_ARTICLE_EDITOR_PROMPT)
 
     def test_paper_proper_noun_restore_rejects_partial_span(self):
         markers = {"[[PAPER_PROPER_NOUN_1]]": "East Antarctica"}
@@ -4390,7 +4398,7 @@ class V1Tests(unittest.TestCase):
         client = MagicMock()
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "abstract_cn": "研究由[[PAPER_PROPER_NOUN_1]]驱动。1 损失速率下降。2,3"
+                "abstract_cn": "研究由西南极驱动。1 损失速率下降。2,3"
             }, ensure_ascii=False)))]
         )
         settings = replace(
@@ -4408,13 +4416,14 @@ class V1Tests(unittest.TestCase):
         self.assertNotIn("[2,3]", payload["abstract"])
         self.assertNotIn("。1", result)
         self.assertNotIn("。2,3", result)
-        self.assertIn("West Antarctica", result)
+        self.assertIn("西南极", result)
+        self.assertNotIn("PAPER_PROPER_NOUN", result)
 
-    def test_paper_abstract_translation_restores_authoritative_english_place_names(self):
+    def test_paper_abstract_translation_uses_llm_geographic_name_judgment(self):
         client = MagicMock()
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "abstract_cn": "[[PAPER_PROPER_NOUN_1]]和[[PAPER_PROPER_NOUN_2]]的质量变化。"
+                "abstract_cn": "Queen Mary Land和Wilkes Land的质量变化，发生在东南极和西南极；印度洋水汽与南极增湿、南极降水、南极增暖和罗斯贝波有关。"
             }, ensure_ascii=False)))]
         )
         settings = replace(
@@ -4425,10 +4434,12 @@ class V1Tests(unittest.TestCase):
         )
         with patch("writer.llm.OpenAI", return_value=client):
             result = translate_paper_abstract(
-                "Mass changes occurred in Queen Mary Land and Wilkes Land.", settings
+                "Mass changes occurred in Queen Mary Land and Wilkes Land over East Antarctica and West Antarctica, with Indian Ocean moisture linked to Antarctic moistening, Antarctic precipitation, Antarctic warming and a Rossby wave.", settings
             )
         self.assertIn("Queen Mary Land", result)
         self.assertIn("Wilkes Land", result)
+        for phrase in ("东南极", "西南极", "印度洋", "南极增湿", "南极降水", "南极增暖", "罗斯贝波"):
+            self.assertIn(phrase, result)
         self.assertNotIn("PAPER_PROPER_NOUN", result)
 
     def test_paper_abstract_translation_is_not_compressed(self):
@@ -5718,7 +5729,7 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(captions, ["热带暖池增温激发向极传播的罗斯贝波列，影响东南极。"])
         payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
         self.assertIn("原始caption忠实翻译", client.chat.completions.create.call_args.kwargs["messages"][0]["content"])
-        self.assertIn("Queen Mary Land", payload["protected_proper_nouns"])
+        self.assertNotIn("protected_proper_nouns", payload)
 
     def test_paper_caption_english_detection_does_not_change_news_path(self):
         self.assertTrue(_paper_caption_is_primarily_english("Figure 5. Rossby-wave train over East Antarctica."))
