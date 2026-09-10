@@ -3513,6 +3513,37 @@ def _paper_assemble_markdown(display_title: str, abstract_lead: str, sections: l
     for section in sections:
         paragraphs = section.get("paragraphs") or []
         blocks = section.get("blocks") or []
+        if paragraphs and blocks:
+            paragraph_block_ids = [
+                str(block_id)
+                for paragraph in paragraphs
+                if isinstance(paragraph, dict)
+                for block_id in paragraph.get("block_ids") or []
+            ]
+            block_ids = [
+                str(block.get("id") or block.get("block_id") or "")
+                for block in blocks
+                if isinstance(block, dict)
+            ]
+            paragraph_text_by_block = {
+                str(block_id): str(paragraph.get("text") or "").strip()
+                for paragraph in paragraphs
+                if isinstance(paragraph, dict)
+                for block_id in paragraph.get("block_ids") or []
+            }
+            if (
+                paragraph_block_ids != block_ids
+                or any(
+                    str(block.get("text") or "").strip()
+                    != paragraph_text_by_block.get(str(block.get("id") or block.get("block_id") or ""))
+                    for block in blocks
+                    if isinstance(block, dict)
+                )
+            ):
+                # A block-level stage replaced the prose. Do not let an old
+                # Article Editor paragraph silently win during assembly.
+                section.pop("paragraphs", None)
+                paragraphs = []
         if paragraphs:
             body = "\n\n".join(
                 str(paragraph.get("text") or "").strip()

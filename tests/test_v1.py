@@ -106,6 +106,7 @@ from writer.llm import (
     _paper_normalize_article_editor_output,
     _paper_apply_story_output,
     _paper_apply_story_candidate,
+    _paper_assemble_markdown,
     _paper_body_length_audit,
     _paper_chinese_char_count,
     _paper_canonical_evidence_registry,
@@ -4412,6 +4413,74 @@ class V1Tests(unittest.TestCase):
         _validate_paper_evidence_plan(
             plan, "# 标题\n\n## 结果\n\n事实1、事实2和事实3。", {"source-1"}, evidence_registry=registry,
         )
+
+    def test_paper_block_stage_clears_merged_paragraph_contract(self):
+        registry = [
+            {"evidence_id": "e1", "anchors": [], "source_paragraph_ids": ["source-1"], "source_sentence": "Fact 1.", "scope": "section_context", "supported_figures": []},
+            {"evidence_id": "e2", "anchors": [], "source_paragraph_ids": ["source-1"], "source_sentence": "Fact 2.", "scope": "section_context", "supported_figures": []},
+        ]
+        section = {
+            "id": "beat-1",
+            "title": "结果",
+            "figure_ids": [],
+            "source_paragraph_ids": ["source-1"],
+            "findings": [{"id": "finding-1", "evidence_ids": ["e1", "e2"], "figure_ids": []}],
+            "story_beat": {"evidence_ids": ["e1", "e2"]},
+            "blocks": [
+                {"id": "b1", "evidence_ids": ["e1"], "figure_ids": [], "source_paragraph_ids": ["source-1"], "text": "旧段落。"},
+                {"id": "b2", "evidence_ids": ["e2"], "figure_ids": [], "source_paragraph_ids": ["source-1"], "text": "旧段落。"},
+            ],
+            "paragraphs": [{"block_ids": ["b1", "b2"], "text": "旧段落。"}],
+        }
+        plan = {
+            "sections": [section],
+            "story_evidence": {evidence_id: {"anchors": [], "figure_ids": []} for evidence_id in ("e1", "e2")},
+        }
+        specs = {
+            "beat-1": [
+                {"block_id": "b1", "evidence_ids": ("e1",), "figure_ids": (), "source_paragraph_ids": ("source-1",)},
+                {"block_id": "b2", "evidence_ids": ("e2",), "figure_ids": (), "source_paragraph_ids": ("source-1",)},
+            ]
+        }
+        _paper_apply_story_output(
+            plan["sections"],
+            [{"id": "beat-1", "title": "结果", "blocks": [
+                {"block_id": "b1", "text": "新事实一。"},
+                {"block_id": "b2", "text": "新事实二。"},
+            ]}],
+            {},
+            registry,
+            specs,
+        )
+        self.assertNotIn("paragraphs", plan["sections"][0])
+        markdown = _paper_assemble_markdown("标题", "", plan["sections"])
+        self.assertIn("新事实一。\n\n新事实二。", markdown)
+        _validate_paper_evidence_plan(plan, markdown, {"source-1"}, evidence_registry=registry)
+
+    def test_paper_paragraphs_are_authoritative_over_stale_body(self):
+        section = {
+            "id": "beat-1",
+            "title": "结果",
+            "paragraphs": [{"block_ids": ["b1"], "text": "当前自然段。"}],
+            "blocks": [{"id": "b1", "evidence_ids": ["e1"], "figure_ids": [], "text": "当前自然段。"}],
+            "body": "旧正文。",
+        }
+        markdown = _paper_assemble_markdown("标题", "", [section])
+        self.assertIn("当前自然段。", markdown)
+        self.assertNotIn("旧正文。", markdown)
+
+    def test_paper_assembly_drops_stale_paragraphs_after_block_text_change(self):
+        section = {
+            "id": "beat-1",
+            "title": "结果",
+            "paragraphs": [{"block_ids": ["b1"], "text": "旧自然段。"}],
+            "blocks": [{"id": "b1", "evidence_ids": ["e1"], "figure_ids": [], "text": "新自然段。"}],
+            "body": "新自然段。",
+        }
+        markdown = _paper_assemble_markdown("标题", "", [section])
+        self.assertNotIn("paragraphs", section)
+        self.assertIn("新自然段。", markdown)
+        self.assertNotIn("旧自然段。", markdown)
 
     def test_paper_style_repair_rejects_new_lint_keys(self):
         before = {"并非": 1, "而不是": 1}
