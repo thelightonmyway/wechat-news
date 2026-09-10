@@ -606,6 +606,37 @@ class V1Tests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_concurrent_papers_refresh_uses_single_flight(self):
+        class FakePipeline:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.calls = 0
+
+            async def get_or_refresh(self, content_type=None):
+                self.calls += 1
+                self.started.set()
+                await self.release.wait()
+                return [{"content_type": content_type, "rank": 1}]
+
+            def format_news(self, candidates):
+                return f"formatted:{candidates[0]['content_type']}"
+
+        async def check():
+            settings = replace(load_settings(), model_base_url="https://model.example/v1", model_api_key="test-key", model_name="test-model")
+            pipeline = FakePipeline()
+            handler = CommandHandler(settings, pipeline)
+            first = asyncio.create_task(handler.handle("/papers"))
+            await pipeline.started.wait()
+            second = await handler.handle("/papers")
+            self.assertIn("正在刷新", second)
+            self.assertEqual(pipeline.calls, 1)
+            pipeline.release.set()
+            self.assertEqual(await first, "formatted:paper")
+            self.assertEqual(handler._papers_refresh_task, None)
+
+        asyncio.run(check())
+
     def test_direct_paper_url_recognizes_doi_and_ignores_ordinary_url(self):
         item = _direct_paper_item(
             "https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2025GL120559"
@@ -7892,7 +7923,7 @@ class V1Tests(unittest.TestCase):
 
         asyncio.run(check())
 
-    def test_paper_refresh_failure_keeps_same_day_last_known_good(self):
+    def test_paper_refresh_failure_does_not_use_same_day_local_fallback_without_prior_pool(self):
         async def check():
             with tempfile.TemporaryDirectory() as tmp:
                 settings = replace(
@@ -7961,20 +7992,21 @@ class V1Tests(unittest.TestCase):
                             False,
                             "502 server_is_overloaded",
                         ),
-                    ),
+                    ) as select,
                 ):
                     candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
 
-                self.assertEqual([item["title"] for item in candidates], ["Previously selected paper"])
+                self.assertEqual(candidates, [])
                 self.assertEqual(
-                    [item["title"] for item in pipeline.db.get_candidates("2026-08-26", PAPER_CONTENT)],
-                    ["Previously selected paper"],
+                    pipeline.db.get_candidates("2026-08-26", PAPER_CONTENT),
+                    [],
                 )
-                self.assertIn("继续使用今日最近一次成功结果", pipeline.format_news(candidates))
+                self.assertEqual(select.call_count, 2)
+                self.assertIn("已保留成功筛选结果", pipeline.last_paper_refresh_warning)
 
         asyncio.run(check())
 
-    def test_paper_refresh_failure_uses_fallback_when_no_same_day_candidates(self):
+    def test_paper_refresh_failure_skips_batch_without_prior_pool(self):
         async def check():
             with tempfile.TemporaryDirectory() as tmp:
                 settings = replace(
@@ -8027,11 +8059,11 @@ class V1Tests(unittest.TestCase):
                 ):
                     candidates = await pipeline.refresh("2026-08-26", PAPER_CONTENT)
 
-                self.assertEqual([value["title"] for value in candidates], ["Local fallback paper"])
-                self.assertIn("当前显示本地筛选结果", pipeline.format_news(candidates))
+                self.assertEqual(candidates, [])
+                self.assertIn("已保留成功筛选结果", pipeline.last_paper_refresh_warning)
                 self.assertEqual(
                     len(pipeline.db.get_candidates("2026-08-26", PAPER_CONTENT)),
-                    1,
+                    0,
                 )
 
         asyncio.run(check())
@@ -8582,6 +8614,248 @@ class V1Tests(unittest.TestCase):
                     pipeline.last_paper_discovery_stats["lookback_days"],
                     90,
                 )
+
+        asyncio.run(check())
+
+    def test_db_gets_latest_prior_paper_pool_before_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Database(Path(tmp) / "latest-pool.db")
+            article_id = database.upsert_article(
+                {
+                    "source": "Nature",
+                    "url": "https://example.test/prior",
+                    "canonical_url": "https://example.test/prior",
+                    "title": "Prior paper",
+                    "summary": "Climate",
+                    "doi": "10.1000/prior",
+                    "journal": "Nature",
+                    "published_at": "2026-09-09T00:00:00+00:00",
+                }
+            )
+            database.replace_paper_candidate_pool(
+                "2026-09-05",
+                [{"article_id": article_id, "score": 1, "title_cn": "旧论文"}],
+                PAPER_CONTENT,
+            )
+            database.replace_paper_candidate_pool(
+                "2026-09-09",
+                [{"article_id": article_id, "score": 2, "title_cn": "最新旧论文"}],
+                PAPER_CONTENT,
+            )
+            previous_date, candidates = database.get_latest_paper_candidate_pool_before(
+                "2026-09-10", PAPER_CONTENT
+            )
+            self.assertEqual(previous_date, "2026-09-09")
+            self.assertEqual([item["title_cn"] for item in candidates], ["最新旧论文"])
+            self.assertEqual(
+                database.get_latest_paper_candidate_pool_before("2026-09-05", PAPER_CONTENT),
+                (None, []),
+            )
+
+    def test_paper_refresh_reuses_prior_pool_and_selects_only_new_candidates(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "incremental.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+
+                def make_item(index, published, doi=None):
+                    return {
+                        "source": "Nature",
+                        "url": f"https://example.test/incremental-{index}",
+                        "canonical_url": f"https://example.test/incremental-{index}",
+                        "title": f"Incremental paper {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": published,
+                        "doi": doi or f"10.1000/incremental-{index}",
+                        "journal": "Nature",
+                        "word_count": 800,
+                        "status": "discovered",
+                        "discovered_at": published,
+                    }
+
+                prior_items = [make_item(index, "2026-09-09T00:00:00+00:00") for index in range(3)]
+                prior_ids = [pipeline.db.upsert_article(item) for item in prior_items]
+                pipeline.db.replace_paper_candidate_pool(
+                    "2026-09-09",
+                    [
+                        {"article_id": article_id, "score": 20 - index, "title_cn": f"旧论文{index}"}
+                        for index, article_id in enumerate(prior_ids)
+                    ],
+                    PAPER_CONTENT,
+                )
+                duplicate = dict(prior_items[0])
+                new_items = [make_item(index, "2026-09-10T00:00:00+00:00") for index in range(3, 5)]
+                calls = []
+                selected_inputs = []
+
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(0, result=copy.deepcopy(values))
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0, result=[dict(value, paper_local_score=2) for value in values]
+                )
+
+                def select_batch(values, _settings):
+                    selected_inputs.extend(values)
+                    return [dict(value, paper_relevance_score=3) for value in values], True, ""
+
+                def fake_fetch(_path, hours):
+                    calls.append(hours)
+                    return [duplicate, *new_items], [], {"test": 3}
+
+                with (
+                    patch("news.pipeline.fetch_all_feeds", side_effect=fake_fetch),
+                    patch("news.pipeline.select_paper_ranked", side_effect=select_batch),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                    patch(
+                        "news.pipeline.translate_paper_titles",
+                        return_value=(['标题'] * 5, True, ""),
+                    ),
+                ):
+                    result = await pipeline.refresh("2026-09-10", PAPER_CONTENT)
+
+                self.assertEqual(calls, [48])
+                self.assertEqual(
+                    {item["title"] for item in selected_inputs},
+                    {item["title"] for item in new_items},
+                )
+                self.assertEqual(
+                    [item["title"] for item in result],
+                    [item["title"] for item in new_items] + [item["title"] for item in prior_items],
+                )
+                stats = pipeline.last_paper_discovery_stats
+                self.assertEqual(stats["prior_pool_date"], "2026-09-09")
+                self.assertEqual(stats["prior_pool_count"], 3)
+                self.assertEqual(stats["incremental_window_days"], 2)
+                self.assertEqual(stats["new_candidates"], 2)
+                self.assertEqual(stats["ai_examined"], 2)
+                self.assertEqual(stats["failed_batches"], 0)
+                self.assertEqual(stats["final"], 5)
+
+        asyncio.run(check())
+
+    def test_paper_refresh_retries_failed_batch_without_destroying_prior_pool(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "batch-failure.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+
+                def item(index, published="2026-09-10T00:00:00+00:00"):
+                    return {
+                        "source": "Nature",
+                        "url": f"https://example.test/batch-{index}",
+                        "canonical_url": f"https://example.test/batch-{index}",
+                        "title": f"Batch paper {index}",
+                        "summary": "Near-surface wind climate mechanism",
+                        "published_at": published,
+                        "doi": f"10.1000/batch-{index}",
+                        "journal": "Nature",
+                        "word_count": 800,
+                        "status": "discovered",
+                    }
+
+                prior = item(999, "2026-09-09T00:00:00+00:00")
+                prior_id = pipeline.db.upsert_article(prior)
+                pipeline.db.replace_paper_candidate_pool(
+                    "2026-09-09",
+                    [{"article_id": prior_id, "score": 50, "title_cn": "旧候选"}],
+                    PAPER_CONTENT,
+                )
+                items = [item(index) for index in range(60)]
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(0, result=copy.deepcopy(values))
+                pipeline._published_papers = lambda values, _date: asyncio.sleep(
+                    0, result=[dict(value, paper_local_score=2) for value in values]
+                )
+                calls = []
+
+                def select_batch(values, _settings):
+                    calls.append(len(values))
+                    if len(calls) == 1:
+                        return [dict(value, paper_relevance_score=3) for value in values], True, ""
+                    return [], False, "502 server_is_overloaded"
+
+                with (
+                    patch("news.pipeline.fetch_all_feeds", return_value=(items, [], {"test": 60})),
+                    patch("news.pipeline.select_paper_ranked", side_effect=select_batch),
+                    patch("news.pipeline.deduplicate", side_effect=lambda values: values),
+                    patch("news.pipeline.translate_paper_titles", return_value=(['标题'] * 10, True, "")),
+                ):
+                    result = await pipeline.refresh("2026-09-10", PAPER_CONTENT)
+
+                self.assertEqual(calls, [30, 30, 30])
+                pool = pipeline.db.get_paper_candidate_pool("2026-09-10", PAPER_CONTENT)
+                self.assertEqual(len(pool), 31)
+                self.assertEqual(pool[-1]["title"], prior["title"])
+                self.assertEqual(len(result), 10)
+                self.assertEqual(pipeline.last_paper_discovery_stats["failed_batches"], 1)
+                self.assertEqual(pipeline.last_paper_discovery_stats["ai_examined"], 60)
+                self.assertEqual(pipeline.last_paper_discovery_stats["ai_kept"], 30)
+                self.assertIn("已保留最近一次有效候选池", pipeline.last_paper_refresh_warning)
+                self.assertNotIn("本地筛选结果", pipeline.last_paper_refresh_warning)
+                self.assertEqual(
+                    len(pipeline.db.get_paper_candidate_pool("2026-09-10", PAPER_CONTENT)),
+                    31,
+                )
+
+        asyncio.run(check())
+
+    def test_paper_refresh_prunes_stale_and_published_prior_pool(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = replace(
+                    load_settings(),
+                    database_path=Path(tmp) / "prune-pool.db",
+                    model_base_url="https://model.example/v1",
+                    model_api_key="test-key",
+                    model_name="test-model",
+                    openalex_api_key="",
+                )
+                pipeline = NewsPipeline(settings)
+
+                def insert(index, published):
+                    return pipeline.db.upsert_article(
+                        {
+                            "source": "Nature",
+                            "url": f"https://example.test/prune-{index}",
+                            "canonical_url": f"https://example.test/prune-{index}",
+                            "title": f"Prune paper {index}",
+                            "summary": "Near-surface wind climate mechanism",
+                            "published_at": published,
+                            "doi": f"10.1000/prune-{index}",
+                            "journal": "Nature",
+                        }
+                    )
+
+                valid_id = insert(1, "2026-09-09T00:00:00+00:00")
+                stale_id = insert(2, "2026-06-01T00:00:00+00:00")
+                published_id = insert(3, "2026-09-08T00:00:00+00:00")
+                pipeline.db.save_publish_history(published_id, "drafted")
+                pipeline.db.replace_paper_candidate_pool(
+                    "2026-09-09",
+                    [
+                        {"article_id": valid_id, "score": 3, "title_cn": "有效"},
+                        {"article_id": stale_id, "score": 2, "title_cn": "过期"},
+                        {"article_id": published_id, "score": 1, "title_cn": "已发布"},
+                    ],
+                    PAPER_CONTENT,
+                )
+                pipeline._extract_shortlist = lambda values: asyncio.sleep(0, result=[])
+                with patch("news.pipeline.fetch_all_feeds", return_value=([], [], {})):
+                    result = await pipeline.refresh("2026-09-10", PAPER_CONTENT)
+                self.assertEqual([item["title"] for item in result], ["Prune paper 1"])
+                self.assertEqual(pipeline.last_paper_discovery_stats["final"], 1)
 
         asyncio.run(check())
 

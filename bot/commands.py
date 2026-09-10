@@ -90,6 +90,22 @@ class CommandHandler:
     def __init__(self, settings: Settings, pipeline: NewsPipeline) -> None:
         self.settings = settings
         self.pipeline = pipeline
+        self._papers_refresh_task: asyncio.Task | None = None
+
+    async def _handle_papers_refresh(self) -> str:
+        task = self._papers_refresh_task
+        if task is not None and not task.done():
+            return "⚠ PAPER 候选正在刷新，请稍候后再次使用 /papers。"
+        task = asyncio.create_task(
+            self.pipeline.get_or_refresh(content_type=PAPER_CONTENT)
+        )
+        self._papers_refresh_task = task
+        try:
+            candidates = await task
+            return self.pipeline.format_news(candidates)
+        finally:
+            if self._papers_refresh_task is task:
+                self._papers_refresh_task = None
 
     async def handle(self, content: str) -> str | None:
         command = content.strip()
@@ -103,10 +119,7 @@ class CommandHandler:
             candidates = await self.pipeline.next_paper_batch()
             return self.pipeline.format_news(candidates)
         if lowered == "/papers":
-            candidates = await self.pipeline.get_or_refresh(
-                content_type=PAPER_CONTENT,
-            )
-            return self.pipeline.format_news(candidates)
+            return await self._handle_papers_refresh()
         if lowered == "/paper":
             return PAPER_USAGE
         if lowered == "/status":

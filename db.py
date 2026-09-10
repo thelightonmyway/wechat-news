@@ -342,6 +342,28 @@ class Database:
             ).fetchone()
         return int(row["count"] or 0)
 
+    def get_latest_paper_candidate_pool_before(
+        self,
+        date: str,
+        content_type: str = "paper",
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        with self.connect() as connection:
+            latest = connection.execute(
+                """SELECT MAX(date) AS date FROM paper_candidate_pool
+                WHERE date < ? AND content_type=?""",
+                (date, content_type),
+            ).fetchone()
+            previous_date = str(latest["date"] or "") if latest else ""
+            if not previous_date:
+                return None, []
+            rows = connection.execute(
+                """SELECT p.date,p.content_type,p.rank,p.title_cn,p.score,a.*
+                FROM paper_candidate_pool p JOIN articles a ON a.id=p.article_id
+                WHERE p.date=? AND p.content_type=? ORDER BY p.rank""",
+                (previous_date, content_type),
+            ).fetchall()
+        return previous_date, [dict(row) for row in rows]
+
     def update_paper_candidate_titles(
         self,
         date: str,

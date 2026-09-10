@@ -2458,6 +2458,40 @@ def merge_paper_candidate_pool(
     return deduplicate(ordered)
 
 
+def _paper_candidate_identity_keys(item: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for field in ("article_id", "id"):
+        value = str(item.get(field) or "").strip()
+        if value:
+            keys.add(f"id:{value}")
+    doi = str(item.get("doi") or "").strip().lower()
+    if doi:
+        keys.add(f"doi:{doi}")
+    canonical = str(item.get("canonical_url") or item.get("url") or "").strip()
+    if canonical:
+        keys.add(f"url:{canonical}")
+    return keys
+
+
+def _paper_candidate_within_retention(
+    item: dict[str, Any],
+    run_date: str,
+) -> bool:
+    value = str(
+        item.get("paper_publication_date")
+        or item.get("published_at")
+        or ""
+    )[:10]
+    if not value:
+        return True
+    try:
+        published = date_type.fromisoformat(value)
+        current = date_type.fromisoformat(run_date)
+    except ValueError:
+        return True
+    return current - timedelta(days=PAPER_LOOKBACK_DAYS) <= published <= current
+
+
 def _direct_paper_dossier_valid(dossier: dict[str, Any]) -> bool:
     openalex = dossier.get("openalex") or {}
     if openalex.get("found") and (openalex.get("title") or openalex.get("journal")):
@@ -2664,6 +2698,13 @@ class NewsPipeline:
                 if run_type == PAPER_CONTENT
                 else []
             )
+            prior_pool_date: str | None = None
+            prior_pool: list[dict[str, Any]] = []
+            if run_type == PAPER_CONTENT:
+                prior_pool_date, prior_pool = self.db.get_latest_paper_candidate_pool_before(
+                    run_date,
+                    PAPER_CONTENT,
+                )
             seen_paper_ids = (
                 self.db.get_seen_candidate_ids(run_date, PAPER_CONTENT)
                 if run_type == PAPER_CONTENT and exclude_seen
@@ -2681,7 +2722,21 @@ class NewsPipeline:
                 source_counts: dict[str, int] = {}
                 topic_items: list[dict[str, Any]] = []
                 enriched: list[dict[str, Any]] = []
-                lookback_hours = LOOKBACK_HOURS[0]
+                lookback_hours = (
+                    PAPER_LOOKBACK_HOURS
+                    if run_type == PAPER_CONTENT
+                    else LOOKBACK_HOURS[0]
+                )
+                incremental_window_days = PAPER_LOOKBACK_DAYS
+                if run_type == PAPER_CONTENT and prior_pool_date:
+                    run_day = date_type.fromisoformat(run_date)
+                    previous_day = date_type.fromisoformat(prior_pool_date)
+                    window_start = previous_day - timedelta(days=1)
+                    incremental_window_days = min(
+                        PAPER_LOOKBACK_DAYS,
+                        max(1, (run_day - window_start).days),
+                    )
+                    lookback_hours = incremental_window_days * 24
                 rss_paper_count = 0
                 openalex_added_count = 0
                 journal_first_count = 0
@@ -2692,7 +2747,7 @@ class NewsPipeline:
                 journal_first_broad_count = 0
                 topic_strict_count = 0
                 journal_counts: dict[str, int] = {}
-                windows = (PAPER_LOOKBACK_HOURS,) if run_type == PAPER_CONTENT else LOOKBACK_HOURS
+                windows = (lookback_hours,) if run_type == PAPER_CONTENT else LOOKBACK_HOURS
                 for window_hours in windows:
                     items, window_errors, window_counts = await asyncio.to_thread(
                         fetch_all_feeds,
@@ -2776,6 +2831,21 @@ class NewsPipeline:
                             ),
                             reverse=True,
                         )
+                        retained_prior_pool: list[dict[str, Any]] = []
+                        prior_identity_keys: set[str] = set()
+                        for prior_item in prior_pool:
+                            if _is_published_article(prior_item, published):
+                                continue
+                            if not _paper_candidate_within_retention(prior_item, run_date):
+                                continue
+                            retained = dict(prior_item)
+                            retained["article_id"] = int(
+                                retained.get("article_id") or retained.get("id")
+                            )
+                            retained_prior_pool.append(retained)
+                            prior_identity_keys.update(
+                                _paper_candidate_identity_keys(retained)
+                            )
                         eligible: list[dict[str, Any]] = []
                         for item in enriched:
                             if _is_published_article(item, published):
@@ -2785,6 +2855,8 @@ class NewsPipeline:
                             if article_id in seen_paper_ids:
                                 continue
                             if _is_published_article(item, published):
+                                continue
+                            if _paper_candidate_identity_keys(item).intersection(prior_identity_keys):
                                 continue
                             if item.get("images") is not None:
                                 self.db.replace_images(article_id, item.get("images") or [])
@@ -2818,6 +2890,11 @@ class NewsPipeline:
                     self.last_paper_discovery_stats = {
                         "lookback": lookback_hours,
                         "lookback_days": PAPER_LOOKBACK_DAYS,
+                        "prior_pool_date": prior_pool_date,
+                        "prior_pool_count": len(prior_pool),
+                        "incremental_window_days": incremental_window_days,
+                        "new_candidates": len(enriched),
+                        "failed_batches": 0,
                         "journal_first": journal_first_count,
                         "topic_openalex": topic_openalex_count,
                         "rss": rss_paper_count,
@@ -2853,16 +2930,19 @@ class NewsPipeline:
 
                 title_error = ""
                 if run_type == PAPER_CONTENT:
-                    selected: list[dict[str, Any]] = []
+                    selected_new: list[dict[str, Any]] = []
                     used_model = True
                     llm_error = ""
+                    batch_errors: list[str] = []
                     ai_examined = 0
+                    failed_batches = 0
                     if not self.settings.model_configured:
-                        selected = [
-                            dict(item, title_cn=str(item.get("title_cn") or ""))
-                            for item in enriched
-                            if int(item.get("paper_local_score") or 0) >= 1
-                        ]
+                        if not prior_pool:
+                            selected_new = [
+                                dict(item, title_cn=str(item.get("title_cn") or ""))
+                                for item in enriched
+                                if int(item.get("paper_local_score") or 0) >= 1
+                            ]
                         used_model = False
                         llm_error = "model not configured"
                     else:
@@ -2877,17 +2957,26 @@ class NewsPipeline:
                                 self.settings,
                             )
                             if not batch_used:
-                                used_model = False
-                                llm_error = batch_error
-                                selected = [
-                                    dict(item, title_cn=str(item.get("title_cn") or ""))
-                                    for item in enriched
-                                    if int(item.get("paper_local_score") or 0) >= 1
-                                ]
-                                break
-                            selected.extend(batch_selected)
-                    selected = sorted(
-                        selected,
+                                batch_selected, batch_used, retry_error = await asyncio.to_thread(
+                                    select_paper_ranked,
+                                    batch,
+                                    self.settings,
+                                )
+                                batch_error = retry_error or batch_error
+                            if not batch_used:
+                                failed_batches += 1
+                                llm_error = batch_error or "batch selection unavailable"
+                                batch_errors.append(llm_error)
+                                self.logger.warning(
+                                    "PAPER AI batch failed offset=%s size=%s error=%s; skipping batch",
+                                    offset,
+                                    len(batch),
+                                    llm_error,
+                                )
+                                continue
+                            selected_new.extend(batch_selected)
+                    selected_new = sorted(
+                        selected_new,
                         key=lambda item: (
                             -int(item.get("paper_relevance_score") or item.get("paper_local_score") or 0),
                             -float(item.get("score") or deterministic_score(item)),
@@ -2895,14 +2984,25 @@ class NewsPipeline:
                             -_parse_datetime(str(item.get("published_at") or "")).timestamp(),
                         ),
                     )
+                    selected: list[dict[str, Any]] = []
+                    selected_identity_keys: set[str] = set()
+                    for candidate in [*selected_new, *retained_prior_pool]:
+                        identity_keys = _paper_candidate_identity_keys(candidate)
+                        if identity_keys.intersection(selected_identity_keys):
+                            continue
+                        selected.append(candidate)
+                        selected_identity_keys.update(identity_keys)
                     if self.last_paper_discovery_stats:
                         self.last_paper_discovery_stats.update(
                             {
                                 "ai_examined": ai_examined,
-                                "ai_kept": len(selected) if used_model else 0,
+                                "ai_kept": len(selected_new),
+                                "failed_batches": failed_batches,
                                 "final": len(selected),
                             }
                         )
+                    if batch_errors:
+                        llm_error = " | ".join(batch_errors)
                 else:
                     prioritized = prioritize_candidates(enriched)
                     selected, used_model, llm_error = await asyncio.to_thread(
@@ -2912,31 +3012,27 @@ class NewsPipeline:
                     )
                     selected = prioritize_candidates(selected)
                 errors = list(feed_errors)
-                if (
-                    run_type == PAPER_CONTENT
-                    and (not used_model or not selected)
-                    and existing_paper_candidates
-                ):
-                    self.last_paper_refresh_warning = (
-                        "⚠ 本次 AI 刷新失败，继续使用今日最近一次成功结果"
-                    )
+                if run_type == PAPER_CONTENT:
+                    if failed_batches and retained_prior_pool:
+                        self.last_paper_refresh_warning = (
+                            "⚠ 部分新论文 AI 筛选失败，已保留最近一次有效候选池"
+                        )
+                    elif failed_batches:
+                        self.last_paper_refresh_warning = (
+                            "⚠ 部分新论文 AI 筛选失败，已保留成功筛选结果"
+                        )
+                    elif not used_model and retained_prior_pool:
+                        self.last_paper_refresh_warning = (
+                            "⚠ AI 筛选暂时不可用，继续使用最近一次有效候选池"
+                        )
+                    elif not used_model:
+                        self.last_paper_refresh_warning = (
+                            "⚠ AI 筛选暂时不可用，当前显示本地筛选结果"
+                        )
                     if llm_error:
-                        errors.append(f"LLM selection fallback: {llm_error}")
-                    self.db.set_daily_run(
-                        run_date,
-                        fetched_at=utc_now(),
-                        candidate_count=len(existing_paper_candidates),
-                        content_type=run_type,
-                        status="degraded",
-                        error=" | ".join(errors)[:2000],
-                    )
-                    return existing_paper_candidates
-                if self.settings.model_configured and llm_error:
+                        errors.append(f"LLM selection: {llm_error}")
+                elif self.settings.model_configured and llm_error:
                     errors.append(f"LLM selection fallback: {llm_error}")
-                if run_type == PAPER_CONTENT and not used_model:
-                    self.last_paper_refresh_warning = (
-                        "⚠ AI 筛选暂时不可用，当前显示本地筛选结果"
-                    )
                 if run_type == PAPER_CONTENT:
                     self.db.replace_paper_candidate_pool(run_date, selected, run_type)
                     self.last_paper_pool_total = self.db.get_paper_candidate_pool_count(
@@ -2968,7 +3064,7 @@ class NewsPipeline:
                     self.db.replace_candidates(run_date, selected, run_type)
                 stored_candidates = self.db.get_candidates(run_date, run_type)
                 status = "success" if selected else "empty"
-                if feed_errors and selected:
+                if (feed_errors or (run_type == PAPER_CONTENT and failed_batches)) and selected:
                     status = "partial"
                 self.db.set_daily_run(
                     run_date,
@@ -2980,9 +3076,15 @@ class NewsPipeline:
                 )
                 if run_type == PAPER_CONTENT:
                     self.logger.info(
-                        "PAPER discovery stats lookback=%sh journal_first=%s topic_openalex=%s rss=%s "
-                        "merged_unique=%s after_journal_whitelist=%s after_published_seen=%s "
-                        "after_local_relevance=%s ai_examined=%s ai_kept=%s final=%s journals=%s",
+                        "PAPER discovery stats prior_pool_date=%s prior_pool_count=%s "
+                        "incremental_window_days=%s new_candidates=%s lookback=%sh "
+                        "journal_first=%s topic_openalex=%s rss=%s merged_unique=%s "
+                        "after_journal_whitelist=%s after_published_seen=%s after_local_relevance=%s "
+                        "ai_examined=%s ai_kept=%s failed_batches=%s final_pool_count=%s journals=%s",
+                        self.last_paper_discovery_stats.get("prior_pool_date"),
+                        self.last_paper_discovery_stats.get("prior_pool_count", 0),
+                        self.last_paper_discovery_stats.get("incremental_window_days", PAPER_LOOKBACK_DAYS),
+                        self.last_paper_discovery_stats.get("new_candidates", 0),
                         lookback_hours,
                         self.last_paper_discovery_stats.get("journal_first", 0),
                         self.last_paper_discovery_stats.get("topic_openalex", 0),
@@ -2993,6 +3095,7 @@ class NewsPipeline:
                         self.last_paper_discovery_stats.get("after_local_relevance", 0),
                         self.last_paper_discovery_stats.get("ai_examined", 0),
                         self.last_paper_discovery_stats.get("ai_kept", 0),
+                        self.last_paper_discovery_stats.get("failed_batches", 0),
                         self.last_paper_discovery_stats.get("final", 0),
                         self.last_paper_journal_counts,
                     )
