@@ -127,6 +127,7 @@ from writer.llm import (
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
     _paper_figure_evidence_bundles,
+    _generate_paper_article_markdown,
     _paper_readability_audit,
     _paper_stop_slop_audit,
     _paper_stable_evidence_id,
@@ -2204,6 +2205,214 @@ class V1Tests(unittest.TestCase):
         self.assertIn("总体结果", article_text)
         self.assertIn("global_context", PAPER_PLANNER_PROMPT)
         self.assertIn("section_context", PAPER_PLANNER_PROMPT)
+
+    def test_paper_planner_ignores_model_figure_ids_and_derives_support(self):
+        registry = [{
+            "evidence_id": "evidence-a",
+            "value": "R = 0.71",
+            "source_paragraph_ids": ["source-1"],
+            "source_sentence": "The result has R = 0.71.",
+            "scope": "figure_specific",
+            "supported_figures": ["Fig. 2"],
+            "anchors": ["R = 0.71"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "figure_ids": ["Fig. 3"],
+                "findings": [{
+                    "id": "finding-1",
+                    "figure_ids": ["Fig. 3"],
+                    "evidence_ids": ["evidence-a"],
+                }],
+            }]
+        }
+        sections = _validate_paper_plan_structure(
+            plan, {"source-1"}, {"Fig. 2"}, registry
+        )
+        self.assertEqual(sections[0]["figure_ids"], ["Fig. 2"])
+        self.assertEqual(sections[0]["findings"][0]["figure_ids"], ["Fig. 2"])
+
+    def test_paper_planner_derives_figure_when_model_omits_figure_ids(self):
+        registry = [{
+            "evidence_id": "evidence-a",
+            "value": "图2显示结果。",
+            "source_paragraph_ids": ["source-1"],
+            "source_sentence": "Figure 2 shows the result.",
+            "scope": "figure_specific",
+            "supported_figures": ["Fig. 2"],
+            "anchors": [],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "findings": [{"id": "finding-1", "evidence_ids": ["evidence-a"]}],
+            }]
+        }
+        sections = _validate_paper_plan_structure(
+            plan, {"source-1"}, {"Fig. 2"}, registry
+        )
+        self.assertEqual(sections[0]["figure_ids"], ["Fig. 2"])
+        self.assertEqual(sections[0]["findings"][0]["figure_ids"], ["Fig. 2"])
+
+    def test_paper_planner_keeps_contextual_evidence_unfigured(self):
+        registry = [
+            {
+                "evidence_id": "evidence-figure",
+                "value": "R = 0.71",
+                "source_paragraph_ids": ["source-1"],
+                "source_sentence": "The result has R = 0.71.",
+                "scope": "figure_specific",
+                "supported_figures": ["Fig. 2"],
+                "anchors": ["R = 0.71"],
+            },
+            {
+                "evidence_id": "evidence-context",
+                "value": "这一变化发生在近年。",
+                "source_paragraph_ids": ["source-2"],
+                "source_sentence": "The change occurred in recent years.",
+                "scope": "section_context",
+                "supported_figures": [],
+                "anchors": [],
+            },
+        ]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "findings": [
+                    {"id": "finding-1", "evidence_ids": ["evidence-figure"]},
+                    {"id": "finding-2", "evidence_ids": ["evidence-context"]},
+                ],
+            }]
+        }
+        sections = _validate_paper_plan_structure(
+            plan, {"source-1", "source-2"}, {"Fig. 2"}, registry
+        )
+        self.assertEqual(sections[0]["figure_ids"], ["Fig. 2"])
+        self.assertEqual(sections[0]["findings"][1]["figure_ids"], [])
+        self.assertEqual(registry[1]["supported_figures"], [])
+        self.assertEqual(registry[1]["scope"], "section_context")
+
+    def test_paper_planner_retries_section_without_figure_evidence_once(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        error = RuntimeError(
+            "PAPER scientific planner section has no Figure-backed evidence"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "writer.llm.OpenAI", return_value=MagicMock()
+        ), patch(
+            "writer.llm._paper_figure_evidence_bundles",
+            return_value=[{"figure_id": "Fig. 2"}],
+        ), patch(
+            "writer.llm._paper_canonical_evidence_registry",
+            return_value=[],
+        ), patch(
+            "writer.llm._paper_plan",
+            side_effect=[{"sections": [{}]}, {"sections": [{}]}],
+        ) as planner, patch(
+            "writer.llm._validate_paper_plan_structure", side_effect=[error, []]
+        ), patch(
+            "writer.llm.translate_paper_abstract",
+            side_effect=RuntimeError("stop after planner retry"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after planner retry"):
+                _generate_paper_article_markdown(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "title": "Planner retry paper",
+                        "title_cn": "规划重试论文",
+                        "text": "source",
+                        "openalex": {"abstract": "Abstract"},
+                        "images": [],
+                        "paper_selected_body_images": [{"figure_number": 2}],
+                    },
+                    settings,
+                    Path(tmp) / "paper",
+                    "规划重试论文",
+                )
+        self.assertEqual(planner.call_count, 2)
+        retry_feedback = planner.call_args_list[1].args[7]
+        self.assertIn("Figure ownership is Python-managed", retry_feedback)
+        self.assertIn("canonical supported_figures", retry_feedback)
+
+    def test_paper_planner_stops_after_one_structure_retry(self):
+        settings = replace(
+            load_settings(),
+            model_base_url="https://model.example/v1",
+            model_api_key="test-key",
+            model_name="test-model",
+        )
+        error = RuntimeError(
+            "PAPER scientific planner section has no Figure-backed evidence"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "writer.llm.OpenAI", return_value=MagicMock()
+        ), patch(
+            "writer.llm._paper_figure_evidence_bundles",
+            return_value=[{"figure_id": "Fig. 2"}],
+        ), patch(
+            "writer.llm._paper_canonical_evidence_registry",
+            return_value=[],
+        ), patch(
+            "writer.llm._paper_plan",
+            side_effect=[{"sections": [{}]}, {"sections": [{}]}],
+        ) as planner, patch(
+            "writer.llm._validate_paper_plan_structure", side_effect=[error, error]
+        ) as validator, patch(
+            "writer.llm.translate_paper_abstract"
+        ) as translate:
+            with self.assertRaisesRegex(RuntimeError, "no Figure-backed evidence"):
+                _generate_paper_article_markdown(
+                    {
+                        "content_type": PAPER_CONTENT,
+                        "title": "Planner retry paper",
+                        "title_cn": "规划重试论文",
+                        "text": "source",
+                        "openalex": {"abstract": "Abstract"},
+                        "images": [],
+                        "paper_selected_body_images": [{"figure_number": 2}],
+                    },
+                    settings,
+                    Path(tmp) / "paper",
+                    "规划重试论文",
+                )
+        self.assertEqual(planner.call_count, 2)
+        self.assertEqual(validator.call_count, 2)
+        translate.assert_not_called()
+
+    def test_paper_planner_rejects_unselected_canonical_figure(self):
+        registry = [{
+            "evidence_id": "evidence-a",
+            "value": "R = 0.71",
+            "source_paragraph_ids": ["source-1"],
+            "source_sentence": "The result has R = 0.71.",
+            "scope": "figure_specific",
+            "supported_figures": ["Fig. 3"],
+            "anchors": ["R = 0.71"],
+        }]
+        plan = {
+            "sections": [{
+                "id": "section-1",
+                "title": "结果",
+                "role": "result",
+                "findings": [{"id": "finding-1", "evidence_ids": ["evidence-a"]}],
+            }]
+        }
+        with self.assertRaisesRegex(RuntimeError, "unselected Figure"):
+            _validate_paper_plan_structure(
+                plan, {"source-1"}, {"Fig. 2"}, registry
+            )
 
     def test_paper_figure_first_writers_receive_only_current_bundles(self):
         planner = SimpleNamespace(

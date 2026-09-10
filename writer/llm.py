@@ -1165,6 +1165,23 @@ def _validate_paper_evidence_plan(
                     )
 
 
+def _paper_planner_structure_retryable(error: str) -> bool:
+    """Limit planner retries to model structure/evidence selection errors."""
+    return any(
+        marker in error
+        for marker in (
+            "returned no sections",
+            "invalid section metadata",
+            "section without findings",
+            "invalid evidence_ids",
+            "unknown evidence_id",
+            "invalid finding",
+            "invalid quantitative anchors",
+            "no Figure-backed evidence",
+        )
+    )
+
+
 def _validate_paper_plan_structure(
     plan: dict[str, Any],
     valid_source_paragraph_ids: set[str],
@@ -1194,20 +1211,37 @@ def _validate_paper_plan_structure(
         else:
             if not isinstance(source_ids, list) or not source_ids:
                 raise RuntimeError("PAPER scientific planner returned invalid source paragraph ids")
-            if not all(isinstance(source_id, str) and source_id in valid_source_paragraph_ids for source_id in source_ids):
+            if not all(
+                isinstance(source_id, str) and source_id in valid_source_paragraph_ids
+                for source_id in source_ids
+            ):
                 raise RuntimeError("PAPER scientific planner returned unknown source paragraph ids")
-        figure_ids = [
-            _paper_figure_id(value)
-            for value in (section.get("figure_ids") or section.get("selected_body_figures") or [])
-            if str(value).strip()
-        ]
-        if selected_figure_ids is not None:
+        if not isinstance(findings, list) or not findings:
+            raise RuntimeError("PAPER scientific planner returned a section without findings")
+
+        # In canonical mode, Figure ownership is derived exclusively from the
+        # immutable evidence registry. Any Figure fields returned by the model
+        # are compatibility noise and must never affect validation or output.
+        figure_ids = (
+            []
+            if canonical_mode
+            else [
+                _paper_figure_id(value)
+                for value in (
+                    section.get("figure_ids")
+                    or section.get("selected_body_figures")
+                    or []
+                )
+                if str(value).strip()
+            ]
+        )
+        if not canonical_mode and selected_figure_ids is not None:
             if not figure_ids or not set(figure_ids).issubset(selected_figure_ids):
                 raise RuntimeError("PAPER scientific planner returned an invalid figure mapping")
             section["figure_ids"] = figure_ids
-        if not isinstance(findings, list) or not findings:
-            raise RuntimeError("PAPER scientific planner returned a section without findings")
+
         derived_section_evidence_ids: list[str] = []
+        derived_section_figures: list[str] = []
         for finding in findings:
             if not isinstance(finding, dict):
                 raise RuntimeError("PAPER scientific planner returned an invalid finding")
@@ -1224,7 +1258,26 @@ def _validate_paper_plan_structure(
                 records = [evidence_by_id.get(evidence_id) for evidence_id in evidence_ids]
                 if any(record is None for record in records):
                     raise RuntimeError("PAPER scientific planner returned unknown evidence_id")
+                supported_figures: list[str] = []
+                for record in records:
+                    if record is None:
+                        continue
+                    for value in record.get("supported_figures") or []:
+                        figure_id = _paper_figure_id(value)
+                        if figure_id and figure_id not in supported_figures:
+                            supported_figures.append(figure_id)
+                if selected_figure_ids is not None and not set(supported_figures).issubset(
+                    selected_figure_ids
+                ):
+                    raise RuntimeError(
+                        "PAPER canonical evidence references an unselected Figure: "
+                        + ", ".join(sorted(set(supported_figures) - selected_figure_ids))
+                    )
                 finding["evidence_ids"] = evidence_ids
+                # Keep finding.figure_ids as direct support only. Contextual
+                # evidence stays unfigured; section placement is handled by
+                # the enclosing section and never changes its provenance.
+                finding["figure_ids"] = supported_figures
                 finding["evidence"] = " ".join(
                     str(record.get("source_sentence") or record.get("value") or "").strip()
                     for record in records
@@ -1247,20 +1300,30 @@ def _validate_paper_plan_structure(
                     for record in records
                     if record is not None
                 ]
+                for figure_id in supported_figures:
+                    if figure_id not in derived_section_figures:
+                        derived_section_figures.append(figure_id)
                 for evidence_id in evidence_ids:
                     if evidence_id not in derived_section_evidence_ids:
                         derived_section_evidence_ids.append(evidence_id)
             elif not str(finding.get("evidence") or "").strip():
                 raise RuntimeError("PAPER scientific planner returned an invalid finding")
-            finding_figure_ids = [
-                _paper_figure_id(value)
-                for value in (finding.get("figure_ids") or finding.get("figures") or figure_ids)
-                if str(value).strip()
-            ]
-            if selected_figure_ids is not None:
-                if not finding_figure_ids or not set(finding_figure_ids).issubset(set(figure_ids)):
-                    raise RuntimeError("PAPER scientific planner returned an unbound finding")
-                finding["figure_ids"] = finding_figure_ids
+            if not canonical_mode:
+                finding_figure_ids = [
+                    _paper_figure_id(value)
+                    for value in (
+                        finding.get("figure_ids")
+                        or finding.get("figures")
+                        or figure_ids
+                    )
+                    if str(value).strip()
+                ]
+                if selected_figure_ids is not None:
+                    if not finding_figure_ids or not set(finding_figure_ids).issubset(
+                        set(figure_ids)
+                    ):
+                        raise RuntimeError("PAPER scientific planner returned an unbound finding")
+                    finding["figure_ids"] = finding_figure_ids
             anchors = finding.get(
                 "anchors",
                 finding.get("quantitative_anchors", finding.get("quantitative anchors", [])),
@@ -1274,7 +1337,13 @@ def _validate_paper_plan_structure(
             finding["anchors"] = anchors
             finding.pop("quantitative_anchors", None)
             finding.pop("quantitative anchors", None)
+
         if canonical_mode:
+            if selected_figure_ids is not None and not derived_section_figures:
+                raise RuntimeError(
+                    "PAPER scientific planner section has no Figure-backed evidence"
+                )
+            section["figure_ids"] = derived_section_figures
             section["source_paragraph_ids"] = _paper_derived_source_ids(
                 derived_section_evidence_ids, evidence_by_id, valid_source_paragraph_ids
             )
@@ -1764,18 +1833,28 @@ def _paper_clean_story_evidence(
                 continue
             if not canonical_mode:
                 counter += 1
-            finding_figures = tuple(
-                dict.fromkeys(
-                    _paper_figure_id(value)
-                    for value in (
-                        finding.get("figure_ids")
-                        or section.get("figure_ids")
-                        or section.get("selected_body_figures")
-                        or []
+            if canonical_mode:
+                finding_figures = tuple(
+                    dict.fromkeys(
+                        _paper_figure_id(value)
+                        for evidence_id in finding_evidence_ids
+                        for value in evidence_by_id[evidence_id].get("supported_figures") or []
+                        if str(value).strip()
                     )
-                    if str(value).strip()
                 )
-            )
+            else:
+                finding_figures = tuple(
+                    dict.fromkeys(
+                        _paper_figure_id(value)
+                        for value in (
+                            finding.get("figure_ids")
+                            or section.get("figure_ids")
+                            or section.get("selected_body_figures")
+                            or []
+                        )
+                        if str(value).strip()
+                    )
+                )
             if finding_figures:
                 if finding_figures not in figure_groups:
                     figure_groups[finding_figures] = f"evidence_group_{chr(64 + len(figure_groups) + 1)}"
@@ -2067,13 +2146,24 @@ def _paper_story_block_specs(
                 original_section, finding = (
                     evidence_map[evidence_id] if evidence_map is not None else ({}, {})
                 )
-                for value in (
-                    finding.get("figure_ids")
-                    or original_section.get("figure_ids")
-                    or original_section.get("selected_body_figures")
-                    or evidence_by_id.get(evidence_id, {}).get("supported_figures")
-                    or []
-                ):
+                if evidence_registry:
+                    figure_values = evidence_by_id.get(evidence_id, {}).get("supported_figures") or []
+                    # Contextual evidence is placed in the section's prose for
+                    # rendering, but its canonical support remains unfigured.
+                    if not figure_values:
+                        figure_values = (
+                            original_section.get("figure_ids")
+                            or original_section.get("selected_body_figures")
+                            or []
+                        )
+                else:
+                    figure_values = (
+                        finding.get("figure_ids")
+                        or original_section.get("figure_ids")
+                        or original_section.get("selected_body_figures")
+                        or []
+                    )
+                for value in figure_values:
                     normalized = _paper_figure_id(value)
                     if normalized and normalized not in figure_ids:
                         figure_ids.append(normalized)
@@ -4732,9 +4822,10 @@ PAPER_STYLE_REVIEWER_PROMPT = (
 
 PAPER_PLANNER_PROMPT = (
     "你是Figure-first Scientific Planner，不写文章正文。根据Abstract、paper_text、source_paragraphs、selected_body_figures和figure_evidence_bundles，"
-    "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；不要自行猜测Figure归属。"
-    "每个section包含id、title、role、figure_ids和findings；source provenance由Python根据evidence_ids推导，禁止返回source_paragraph_ids、source_sentence或其他source字段。title必须是适合中文成稿的简洁中文小标题；每个finding包含id、figure_ids和evidence_ids。"
-    "有selected Figure时，section和Figure-specific finding应明确绑定当前section的figure_ids；一个section可以包含多张高度相关Figure。若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section；这类section允许使用global_context或section_context，不得因为没有Figure-specific evidence而返回空sections。"
+    "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；Figure ownership is Python-managed，不要根据自己的判断重新分配evidence到Figure。"
+    "每个section包含id、title、role和findings；source provenance与真实Figure mapping均由Python根据evidence_ids和canonical evidence registry推导，禁止返回source_paragraph_ids、source_sentence或其他source字段。title必须是适合中文成稿的简洁中文小标题；每个finding包含id和evidence_ids。"
+    "不要返回或依赖figure_ids、selected_body_figures等Figure ownership字段；即使兼容旧JSON格式返回这些字段，Python也会忽略它们。evidence_ids必须来自输入registry，Figure mapping将由Python根据canonical supported_figures自动恢复。"
+    "有selected Figure时，每个section必须包含至少一条来自supplied selected_body_figures的Figure-backed evidence，可搭配global_context或section_context；若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
@@ -4744,7 +4835,7 @@ PAPER_PLANNER_PROMPT = (
     "每个finding都要有evidence_ids数组；不要返回anchors、source_paragraph_ids、source_sentence或scope，anchors和全部source provenance由Python registry推导。"
     "涉及数字、百分比或统计量时，必须引用对应的quantitative evidence-anchor记录；evidence-source-source-*段落记录仅作上下文，anchors为空，不能替代数字owner。"
     "如果输入包含validation_feedback，必须优先修复其中指出的Figure、source或anchor归属，不能重复提交同一错误计划。"
-    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","figure_ids":["Fig. 2"],"findings":[{"id":"E1","figure_ids":["Fig. 2"],"evidence_ids":["复制registry中的真实evidence_id"]}]}]}'
+    '返回格式：{"sections":[{"id":"section-1","title":"...","role":"attribution","findings":[{"id":"E1","evidence_ids":["复制registry中的真实evidence_id"]}]}]}'
 )
 
 PAPER_REVIEWER_PROMPT = (
@@ -4921,6 +5012,7 @@ def _generate_paper_article_markdown(
         max_retries=2,
     )
     scientific_planner_started = time.perf_counter()
+    planner_retry_count = 0
     plan = _paper_plan(
         client,
         abstract,
@@ -4931,6 +5023,7 @@ def _generate_paper_article_markdown(
         figure_evidence_bundles,
     )
     if not isinstance(plan.get("sections"), list) or not plan["sections"]:
+        planner_retry_count += 1
         logger.warning("PAPER scientific planner returned empty sections; retrying once")
         plan = _paper_plan(
             client,
@@ -4942,15 +5035,69 @@ def _generate_paper_article_markdown(
             figure_evidence_bundles,
             "The previous planner response had no sections. Return at least one section supported by the supplied paper_text or source_paragraphs. Use Figure-specific evidence when available, but allow global_context or section_context when no unique Figure supports the content. Do not invent results.",
         )
-    plan["sections"] = _validate_paper_plan_structure(
-        plan,
-        valid_source_ids,
-        set(selected_figure_ids) if figure_first else None,
-        evidence_registry,
-    )
+    try:
+        plan["sections"] = _validate_paper_plan_structure(
+            plan,
+            valid_source_ids,
+            set(selected_figure_ids) if figure_first else None,
+            evidence_registry,
+        )
+    except RuntimeError as exc:
+        if not _paper_planner_structure_retryable(str(exc)):
+            raise
+        planner_retry_count += 1
+        logger.warning(
+            "PAPER planner structure validation failed; retrying once: %s",
+            exc,
+        )
+        validation_feedback = (
+            f"The previous planner response failed deterministic validation: {exc}. "
+            "Return only valid section metadata and evidence_ids from the supplied registry. "
+            "Figure ownership is Python-managed: do not return or rely on figure_ids or selected_body_figures. "
+            "If a section has no Figure-backed evidence, select at least one supplied evidence record "
+            "whose canonical supported_figures contains a selected body Figure; do not invent or remap Figure provenance."
+        )
+        plan = _paper_plan(
+            client,
+            abstract,
+            paper_text,
+            source_paragraphs,
+            metadata,
+            selected_figure_ids,
+            figure_evidence_bundles,
+            validation_feedback,
+        )
+        plan["sections"] = _validate_paper_plan_structure(
+            plan,
+            valid_source_ids,
+            set(selected_figure_ids) if figure_first else None,
+            evidence_registry,
+        )
     logger.info(
-        "PAPER stage=scientific_planner normalized_sections=%d",
+        "PAPER stage=scientific_planner normalized_sections=%d selected_figure_ids=%s "
+        "planner_evidence_sections=%s derived_section_figures=%s retry_count=%d elapsed=%.3f",
         len(plan["sections"]),
+        selected_figure_ids,
+        [
+            {
+                "section_id": section.get("id"),
+                "evidence_ids": [
+                    evidence_id
+                    for finding in section.get("findings") or []
+                    for evidence_id in finding.get("evidence_ids") or []
+                ],
+            }
+            for section in plan["sections"]
+        ],
+        [
+            {
+                "section_id": section.get("id"),
+                "figure_ids": section.get("figure_ids") or [],
+            }
+            for section in plan["sections"]
+        ],
+        planner_retry_count,
+        time.perf_counter() - scientific_planner_started,
     )
     for section in plan["sections"]:
         section.pop("necessary_transition", None)
@@ -5152,11 +5299,14 @@ def _generate_paper_article_markdown(
                 dict.fromkeys(
                     _paper_figure_id(value)
                     for value in (
-                        finding.get("figure_ids")
-                        or original_section.get("figure_ids")
-                        or original_section.get("selected_body_figures")
-                        or canonical.get("supported_figures")
-                        or []
+                        canonical.get("supported_figures")
+                        if evidence_registry
+                        else (
+                            finding.get("figure_ids")
+                            or original_section.get("figure_ids")
+                            or original_section.get("selected_body_figures")
+                            or []
+                        )
                     )
                     if str(value).strip()
                 )
