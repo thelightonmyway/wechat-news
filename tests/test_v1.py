@@ -127,6 +127,7 @@ from writer.llm import (
     _paper_editor_anchor_audit,
     _paper_editor_feedback,
     _paper_figure_evidence_bundles,
+    _paper_figure_backed_evidence_ids,
     _generate_paper_article_markdown,
     _paper_readability_audit,
     _paper_stop_slop_audit,
@@ -140,6 +141,7 @@ from writer.llm import (
     _paper_humanize_story,
     _paper_style_review,
     _paper_validate_story_plan,
+    _paper_plan,
     _validate_paper_plan_structure,
     prune_paper_sections_after_allocation,
     _normalize_article_markdown,
@@ -2299,6 +2301,34 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(registry[1]["supported_figures"], [])
         self.assertEqual(registry[1]["scope"], "section_context")
 
+    def test_paper_planner_exposes_canonical_allowed_figure_evidence(self):
+        registry = [
+            {"evidence_id": "e1", "supported_figures": ["Fig. 2"]},
+            {"evidence_id": "e2", "supported_figures": []},
+            {"evidence_id": "e3", "supported_figures": ["Fig. 3"]},
+        ]
+        self.assertEqual(
+            _paper_figure_backed_evidence_ids(registry, ["Fig. 2", "Fig. 3"]),
+            {"Fig. 2": ["e1"], "Fig. 3": ["e3"]},
+        )
+        with patch(
+            "writer.llm._paper_completion_json", return_value={"sections": []}
+        ) as completion:
+            _paper_plan(
+                MagicMock(),
+                "abstract",
+                "paper",
+                [],
+                {"model": "test-model", "evidence_registry": registry},
+                ["Fig. 2", "Fig. 3"],
+                [],
+            )
+        payload = completion.call_args.args[2]
+        self.assertEqual(
+            payload["figure_backed_evidence_ids"],
+            {"Fig. 2": ["e1"], "Fig. 3": ["e3"]},
+        )
+
     def test_paper_planner_retries_section_without_figure_evidence_once(self):
         settings = replace(
             load_settings(),
@@ -2316,7 +2346,12 @@ class V1Tests(unittest.TestCase):
             return_value=[{"figure_id": "Fig. 2"}],
         ), patch(
             "writer.llm._paper_canonical_evidence_registry",
-            return_value=[],
+            return_value=[
+                {
+                    "evidence_id": "evidence-a",
+                    "supported_figures": ["Fig. 2"],
+                }
+            ],
         ), patch(
             "writer.llm._paper_plan",
             side_effect=[{"sections": [{}]}, {"sections": [{}]}],
@@ -2344,7 +2379,8 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(planner.call_count, 2)
         retry_feedback = planner.call_args_list[1].args[7]
         self.assertIn("Figure ownership is Python-managed", retry_feedback)
-        self.assertIn("canonical supported_figures", retry_feedback)
+        self.assertIn("allowed Figure-backed evidence IDs", retry_feedback)
+        self.assertIn('"Fig. 2": ["evidence-a"]', retry_feedback)
 
     def test_paper_planner_stops_after_one_structure_retry(self):
         settings = replace(
@@ -2363,7 +2399,12 @@ class V1Tests(unittest.TestCase):
             return_value=[{"figure_id": "Fig. 2"}],
         ), patch(
             "writer.llm._paper_canonical_evidence_registry",
-            return_value=[],
+            return_value=[
+                {
+                    "evidence_id": "evidence-a",
+                    "supported_figures": ["Fig. 2"],
+                }
+            ],
         ), patch(
             "writer.llm._paper_plan",
             side_effect=[{"sections": [{}]}, {"sections": [{}]}],

@@ -633,6 +633,24 @@ def _paper_registry_for_llm(registry: list[dict[str, Any]]) -> list[dict[str, An
     ]
 
 
+def _paper_figure_backed_evidence_ids(
+    registry: list[dict[str, Any]],
+    selected_figure_ids: list[str] | set[str],
+) -> dict[str, list[str]]:
+    """Expose the canonical Figure-backed evidence choices without selecting claims."""
+    selected = {_paper_figure_id(value) for value in selected_figure_ids if str(value).strip()}
+    allowed = {figure_id: [] for figure_id in selected}
+    for record in registry:
+        evidence_id = str(record.get("evidence_id") or "").strip()
+        if not evidence_id:
+            continue
+        for value in record.get("supported_figures") or []:
+            figure_id = _paper_figure_id(value)
+            if figure_id in allowed and evidence_id not in allowed[figure_id]:
+                allowed[figure_id].append(evidence_id)
+    return {figure_id: evidence_ids for figure_id, evidence_ids in allowed.items()}
+
+
 def _paper_clean_evidence_for_llm(record: dict[str, Any]) -> dict[str, Any]:
     return {
         key: record.get(key)
@@ -3345,6 +3363,10 @@ def _paper_plan(
             "selected_body_figures": selected_figure_ids or [],
             "figure_evidence_bundles": figure_evidence_bundles or [],
             "evidence_registry": _paper_registry_for_llm(metadata.get("evidence_registry") or []),
+            "figure_backed_evidence_ids": _paper_figure_backed_evidence_ids(
+                metadata.get("evidence_registry") or [],
+                selected_figure_ids or [],
+            ),
             "validation_feedback": validation_feedback,
             "_model": metadata["model"],
             "_temperature": 0.1,
@@ -4825,7 +4847,7 @@ PAPER_PLANNER_PROMPT = (
     "建立唯一的paper_evidence_plan，并只返回严格JSON对象。正文科学骨架必须来自selected body Figures及其真实evidence bundles；Figure ownership is Python-managed，不要根据自己的判断重新分配evidence到Figure。"
     "每个section包含id、title、role和findings；source provenance与真实Figure mapping均由Python根据evidence_ids和canonical evidence registry推导，禁止返回source_paragraph_ids、source_sentence或其他source字段。title必须是适合中文成稿的简洁中文小标题；每个finding包含id和evidence_ids。"
     "不要返回或依赖figure_ids、selected_body_figures等Figure ownership字段；即使兼容旧JSON格式返回这些字段，Python也会忽略它们。evidence_ids必须来自输入registry，Figure mapping将由Python根据canonical supported_figures自动恢复。"
-    "有selected Figure时，每个section必须包含至少一条来自supplied selected_body_figures的Figure-backed evidence，可搭配global_context或section_context；若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section。"
+    "输入中的figure_backed_evidence_ids按selected Figure列出合法的Figure-backed evidence_id；有selected Figure时，每个section至少选择一条对应列表中的evidence_id，可搭配global_context或section_context，但不要由模型重新推断Figure归属。若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section。"
     "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
@@ -5050,12 +5072,17 @@ def _generate_paper_article_markdown(
             "PAPER planner structure validation failed; retrying once: %s",
             exc,
         )
+        allowed_figure_evidence = _paper_figure_backed_evidence_ids(
+            evidence_registry,
+            selected_figure_ids,
+        )
         validation_feedback = (
             f"The previous planner response failed deterministic validation: {exc}. "
             "Return only valid section metadata and evidence_ids from the supplied registry. "
             "Figure ownership is Python-managed: do not return or rely on figure_ids or selected_body_figures. "
             "If a section has no Figure-backed evidence, select at least one supplied evidence record "
-            "whose canonical supported_figures contains a selected body Figure; do not invent or remap Figure provenance."
+            "from the following allowed Figure-backed evidence IDs, without inventing or remapping provenance: "
+            f"{json.dumps(allowed_figure_evidence, ensure_ascii=False, sort_keys=True)}"
         )
         plan = _paper_plan(
             client,
