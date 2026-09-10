@@ -1192,6 +1192,7 @@ def _paper_planner_structure_retryable(error: str) -> bool:
             "invalid section metadata",
             "section without findings",
             "invalid evidence_ids",
+            "duplicate evidence_id",
             "unknown evidence_id",
             "invalid finding",
             "invalid quantitative anchors",
@@ -1210,6 +1211,7 @@ def _validate_paper_plan_structure(
     if not isinstance(sections, list) or not sections:
         raise RuntimeError("PAPER scientific planner returned no sections")
     seen_ids: set[str] = set()
+    seen_evidence_ids: set[str] = set()
     validated: list[dict[str, Any]] = []
     evidence_by_id = _paper_evidence_by_id(evidence_registry or [])
     canonical_mode = bool(evidence_registry)
@@ -1273,6 +1275,10 @@ def _validate_paper_plan_structure(
                 ]
                 if not evidence_ids or len(set(evidence_ids)) != len(evidence_ids):
                     raise RuntimeError("PAPER scientific planner returned invalid evidence_ids")
+                if seen_evidence_ids.intersection(evidence_ids):
+                    raise RuntimeError(
+                        "PAPER scientific planner returned duplicate evidence_id ownership"
+                    )
                 records = [evidence_by_id.get(evidence_id) for evidence_id in evidence_ids]
                 if any(record is None for record in records):
                     raise RuntimeError("PAPER scientific planner returned unknown evidence_id")
@@ -1324,6 +1330,7 @@ def _validate_paper_plan_structure(
                 for evidence_id in evidence_ids:
                     if evidence_id not in derived_section_evidence_ids:
                         derived_section_evidence_ids.append(evidence_id)
+                seen_evidence_ids.update(evidence_ids)
             elif not str(finding.get("evidence") or "").strip():
                 raise RuntimeError("PAPER scientific planner returned an invalid finding")
             if not canonical_mode:
@@ -4848,7 +4855,7 @@ PAPER_PLANNER_PROMPT = (
     "每个section包含id、title、role和findings；source provenance与真实Figure mapping均由Python根据evidence_ids和canonical evidence registry推导，禁止返回source_paragraph_ids、source_sentence或其他source字段。title必须是适合中文成稿的简洁中文小标题；每个finding包含id和evidence_ids。"
     "不要返回或依赖figure_ids、selected_body_figures等Figure ownership字段；即使兼容旧JSON格式返回这些字段，Python也会忽略它们。evidence_ids必须来自输入registry，Figure mapping将由Python根据canonical supported_figures自动恢复。"
     "输入中的figure_backed_evidence_ids按selected Figure列出合法的Figure-backed evidence_id；有selected Figure时，每个section至少选择一条对应列表中的evidence_id，可搭配global_context或section_context，但不要由模型重新推断Figure归属。若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section。"
-    "每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
+    "每个evidence_id只能归属于一个primary section；不要把同一个evidence_id重复分配给多个section。每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
     "每个Figure bundle的核心finding只能进入包含该Figure的section；Figure 只可通过bundle中的caption、明确引用段落和直接关联Results段落支持正文。不要把Fig.2的R=0.71写入只包含Fig.3的section。"

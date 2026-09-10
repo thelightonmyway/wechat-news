@@ -2432,6 +2432,34 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(validator.call_count, 2)
         translate.assert_not_called()
 
+    def test_paper_planner_rejects_duplicate_canonical_evidence_ownership(self):
+        registry = [{
+            "evidence_id": "evidence-a",
+            "source_paragraph_ids": ["source-1"],
+            "source_sentence": "A contextual result.",
+            "scope": "global_context",
+            "supported_figures": [],
+            "anchors": [],
+        }]
+        plan = {
+            "sections": [
+                {
+                    "id": "section-1",
+                    "title": "结果一",
+                    "role": "result",
+                    "findings": [{"id": "finding-1", "evidence_ids": ["evidence-a"]}],
+                },
+                {
+                    "id": "section-2",
+                    "title": "结果二",
+                    "role": "result",
+                    "findings": [{"id": "finding-2", "evidence_ids": ["evidence-a"]}],
+                },
+            ]
+        }
+        with self.assertRaisesRegex(RuntimeError, "duplicate evidence_id ownership"):
+            _validate_paper_plan_structure(plan, {"source-1"}, None, registry)
+
     def test_paper_planner_rejects_unselected_canonical_figure(self):
         registry = [{
             "evidence_id": "evidence-a",
