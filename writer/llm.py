@@ -1637,6 +1637,21 @@ def _paper_remove_inline_citation_markers(text: str) -> str:
         return ""
 
     cleaned = re.sub(cluster, replace, cleaned)
+
+    ascii_cluster = re.compile(
+        r"(?<![\d.])"
+        r"(?P<gap>[ \t]*)"
+        r"(?P<cluster>[1-9]\d?(?:\s*[,，]\s*[1-9]\d?|\s*[-–—]\s*[1-9]\d?)*)"
+        r"\s*(?P<punct>[，,。！？.!?])(?!\d)"
+    )
+
+    def remove_ascii_citation(match: re.Match[str]) -> str:
+        before = cleaned[: match.start()].rstrip()
+        if re.search(r"(?i)(?:\bfig(?:ure)?\.?)$", before):
+            return match.group(0)
+        return match.group("punct")
+
+    cleaned = ascii_cluster.sub(remove_ascii_citation, cleaned)
     cleaned = re.sub(
         r"(?<=[。！？.!?])\s*[1-4](?:\s*[,，]\s*[1-4])*(?:\s*[-–—]\s*[1-4])?(?=\s*$|\s+[㐀-鿿A-Za-z])",
         "",

@@ -3687,6 +3687,37 @@ class V1Tests(unittest.TestCase):
         for unit in ("m²", "m³", "s⁻¹", "m s⁻¹", "W m⁻²"):
             self.assertIn(unit, cleaned)
 
+    def test_paper_citation_cleanup_removes_conservative_ascii_clusters(self):
+        removals = (
+            ("一致4。", "一致。"),
+            ("结果2,3。", "结果。"),
+            ("研究1–4。", "研究。"),
+            ("研究1, 3, 5。", "研究。"),
+            ("rise 1 . loss 2,3 . moistening 4 ,", "rise. loss. moistening,"),
+        )
+        for source, expected in removals:
+            with self.subTest(source=source):
+                self.assertEqual(_paper_remove_inline_citation_markers(source), expected)
+
+    def test_paper_citation_cleanup_preserves_ascii_scientific_numbers(self):
+        values = (
+            "增加4%",
+            "持续4年",
+            "发生于2024年",
+            "2021–2023年",
+            "贡献为18.4%",
+            "温度升高4 K",
+            "降水增加4 mm",
+            "质量变化4 Gt",
+            "300 hPa",
+            "Fig. 4",
+            "Figure 4",
+            "R=0.79",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertEqual(_paper_remove_inline_citation_markers(value + "。"), value + "。")
+
     def test_paper_ai_style_lint_flags_broad_body_author_voice(self):
         for phrase in ("我们可以看到", "我们看到", "我们注意到", "咱们"):
             with self.subTest(phrase=phrase):
