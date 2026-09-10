@@ -3109,6 +3109,25 @@ def _paper_style_issue_block_ids(sections: list[dict[str, Any]]) -> set[str]:
     return target_ids
 
 
+def _paper_style_repair_feedback(
+    lint: dict[str, int],
+    matches_by_block: dict[str, dict[str, list[str]]],
+) -> dict[str, Any]:
+    return {
+        "current_style_hits": {
+            key: count for key, count in lint.items() if isinstance(count, int) and count > 0
+        },
+        "matched_sentences": matches_by_block,
+        "forbidden_style_patterns": list(_PAPER_STYLE_LINT_PATTERNS),
+        "instruction": (
+            "只修改 target blocks 中列出的命中句子或必要的紧邻语法。用自然的等义表达重写，"
+            "不要机械删除字符串，也不要用另一种禁用模板替换当前模板。保持原科学含义、"
+            "数字、单位、时间范围、趋势方向、相关与因果强度、限定词及 required anchors；"
+            "不移动 evidence，不改变 Figure/source/provenance。"
+        ),
+    }
+
+
 def _paper_aggregate_article_review_issues(
     issues: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -3707,6 +3726,44 @@ def _paper_style_lint_text(markdown: str, include_abstract: bool = False) -> str
     return "\n\n".join(part for part in (lead, body) if part) or markdown
 
 
+_PAPER_STYLE_LINT_PATTERNS = {
+    "不是而是": r"不是[^。！？\n]{0,50}而是",
+    "并不是而是": r"并不是[^。！？\n]{0,50}而是",
+    "并非而是": r"并非[^。！？\n]{0,50}而是",
+    "并非": r"并非",
+    "并不是": r"并不是",
+    "而不是": r"而不是",
+    "不在而在": r"不在[^。！？\n]{0,50}而在",
+    "不只是更是": r"不只是[^。！？\n]{0,50}更是",
+    "不仅更": r"不仅[^。！？\n]{0,50}更",
+    "真正不是而是": r"真正[^。！？\n]{0,50}不是[^。！？\n]{0,50}而是",
+    "与其说不如说": r"与其说[^。！？\n]{0,50}不如说",
+    "其原因在于": r"其原因在于",
+    "也就是说": r"也就是说",
+    "不只是": r"不只是",
+    "不仅": r"不仅",
+    "研究发现": r"研究发现",
+    "结果表明": r"结果表明",
+    "进一步分析": r"进一步分析",
+    "值得注意的是": r"值得注意的是",
+    "进一步表明": r"进一步表明",
+    "这一发现表明": r"这一发现表明",
+    "总体而言": r"总体而言",
+    "由此可见": r"由此可见",
+    "这意味着": r"这意味着",
+    "综上所述": r"综上所述",
+    "roughly": r"(?i)\broughly\b",
+    "metadata_leakage": (
+        r"(?:证据锚点|锚点为|对应的锚点|mandatory[_ ]?anchor|required[_ ]?fact|"
+        r"evidence_id|block_id|provenance)"
+    ),
+    "作者式第一人称": (
+        r"(?:我室|咱们|我们|研究团队在此(?:表明|显示|发现)|在此(?:表明|显示|发现)|"
+        r"本研究(?:发现|展示|使用|进一步分析|的结果)|"
+        r"本文(?:发现|展示|使用|进一步分析|的结果))"
+    ),
+}
+
 _PAPER_SINGLE_HIT_STYLE_KEYS = frozenset({
     "不是而是",
     "并不是而是",
@@ -3744,50 +3801,56 @@ def _paper_metadata_leakage_lint(text: str) -> dict[str, int]:
 
 def _paper_ai_style_lint(markdown: str, include_abstract: bool = False) -> dict[str, int]:
     prose = _paper_style_lint_text(markdown, include_abstract=include_abstract)
-    patterns = {
-        "不是而是": r"不是[^。！？\n]{0,50}而是",
-        "并不是而是": r"并不是[^。！？\n]{0,50}而是",
-        "并非而是": r"并非[^。！？\n]{0,50}而是",
-        "并非": r"并非",
-        "并不是": r"并不是",
-        "而不是": r"而不是",
-        "不在而在": r"不在[^。！？\n]{0,50}而在",
-        "不只是更是": r"不只是[^。！？\n]{0,50}更是",
-        "不仅更": r"不仅[^。！？\n]{0,50}更",
-        "真正不是而是": r"真正[^。！？\n]{0,50}不是[^。！？\n]{0,50}而是",
-        "与其说不如说": r"与其说[^。！？\n]{0,50}不如说",
-        "其原因在于": r"其原因在于",
-        "也就是说": r"也就是说",
-        "不只是": r"不只是",
-        "不仅": r"不仅",
-        "研究发现": r"研究发现",
-        "结果表明": r"结果表明",
-        "进一步分析": r"进一步分析",
-        "值得注意的是": r"值得注意的是",
-        "进一步表明": r"进一步表明",
-        "这一发现表明": r"这一发现表明",
-        "总体而言": r"总体而言",
-        "由此可见": r"由此可见",
-        "这意味着": r"这意味着",
-        "综上所述": r"综上所述",
-        "roughly": r"(?i)\broughly\b",
-        "metadata_leakage": (
-            r"(?:证据锚点|锚点为|对应的锚点|mandatory[_ ]?anchor|required[_ ]?fact|"
-            r"evidence_id|block_id|provenance)"
-        ),
-        "作者式第一人称": (
-            r"(?:我室|咱们|我们|研究团队在此(?:表明|显示|发现)|在此(?:表明|显示|发现)|"
-            r"本研究(?:发现|展示|使用|进一步分析|的结果)|"
-            r"本文(?:发现|展示|使用|进一步分析|的结果))"
-        ),
+    counts = {
+        name: len(re.findall(pattern, prose, flags=re.IGNORECASE))
+        for name, pattern in _PAPER_STYLE_LINT_PATTERNS.items()
     }
-    counts = {name: len(re.findall(pattern, prose)) for name, pattern in patterns.items()}
     if include_abstract:
         title_text = "\n".join(title for title, _ in _paper_body_sections(markdown))
         counts["metadata_leakage"] += len(
-            re.findall(patterns["metadata_leakage"], title_text)
+            re.findall(_PAPER_STYLE_LINT_PATTERNS["metadata_leakage"], title_text, flags=re.IGNORECASE)
         )
     return counts
+
+
+def _paper_style_lint_matches(text: str) -> dict[str, list[str]]:
+    prose = _paper_style_lint_text(str(text or ""), include_abstract=False)
+    return {
+        name: list(dict.fromkeys(match.group(0) for match in re.finditer(pattern, prose, flags=re.IGNORECASE)))
+        for name, pattern in _PAPER_STYLE_LINT_PATTERNS.items()
+        if re.search(pattern, prose, flags=re.IGNORECASE)
+    }
+
+
+def _paper_style_lint_matches_by_block(
+    sections: list[dict[str, Any]],
+) -> dict[str, dict[str, list[str]]]:
+    matches_by_block: dict[str, dict[str, list[str]]] = {}
+    for section in sections:
+        for block in section.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            block_id = str(block.get("id") or block.get("block_id") or "").strip()
+            if block_id:
+                matches = _paper_style_lint_matches(str(block.get("text") or ""))
+                if matches:
+                    matches_by_block[block_id] = matches
+    return matches_by_block
+
+
+def _paper_style_lint_improved(
+    before: dict[str, int],
+    after: dict[str, int],
+) -> bool:
+    before_hits = {key for key, count in before.items() if count > 0}
+    after_hits = {key for key, count in after.items() if count > 0}
+    if after_hits - before_hits:
+        return False
+    if not _paper_ai_style_lint_failed(after):
+        return True
+    if sum(after.values()) >= sum(before.values()):
+        return False
+    return all(after.get(key, 0) <= before.get(key, 0) for key in _PAPER_SINGLE_HIT_STYLE_KEYS)
 
 
 def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
@@ -3799,8 +3862,23 @@ def _paper_ai_style_lint_failed(counts: dict[str, int]) -> bool:
     ) or sum(counts.values()) > 4
 
 
-def _paper_require_clean_final_style_lint(counts: dict[str, int]) -> None:
-    if _paper_ai_style_lint_failed(counts):
+def _paper_final_style_lint_failed(
+    all_lint: dict[str, int],
+    body_lint: dict[str, int] | None = None,
+) -> bool:
+    if body_lint is None:
+        return _paper_ai_style_lint_failed(all_lint)
+    return _paper_ai_style_lint_failed(body_lint) or any(
+        all_lint.get(key, 0) > 0
+        for key in ("作者式第一人称", "metadata_leakage")
+    )
+
+
+def _paper_require_clean_final_style_lint(
+    counts: dict[str, int],
+    body_counts: dict[str, int] | None = None,
+) -> None:
+    if _paper_final_style_lint_failed(counts, body_counts):
         raise RuntimeError("PAPER final style lint failed after local fallback")
 
 
@@ -5932,45 +6010,39 @@ def _generate_paper_article_markdown(
     markdown = _normalize_article_markdown(markdown, display_title)
     markdown = _paper_remove_inline_citation_markers(markdown)
     final_lint = _paper_ai_style_lint(markdown, include_abstract=True)
+    final_body_lint = _paper_ai_style_lint(markdown, include_abstract=False)
+    logger.info(
+        "PAPER final style lint all_nonzero=%s body_nonzero=%s",
+        {key: value for key, value in final_lint.items() if value},
+        {key: value for key, value in final_body_lint.items() if value},
+    )
     final_author_rewrite_rolled_back = False
-    if _paper_ai_style_lint_failed(final_lint):
-        logger.warning("PAPER final prose style lint remains; triggering local fallback rewrite")
+    if _paper_ai_style_lint_failed(final_body_lint):
+        logger.warning("PAPER final body style lint remains; triggering targeted repair")
         author_baseline_sections = copy.deepcopy(plan["sections"])
         author_baseline_markdown = markdown
         author_baseline_lint = dict(final_lint)
-        author_targets = _paper_style_issue_block_ids(plan["sections"])
-        targeted_output = safe_humanize(
-            client,
-            story_plan,
-            clean_evidence,
-            _paper_story_draft_blocks(plan["sections"]),
-            settings.model_name,
-            {"author_voice": final_lint},
-            block_specs=block_specs,
-            style_exemplar=style_exemplar,
-            target_block_ids=author_targets,
-        )
-        accepted, candidate_markdown = _paper_apply_story_candidate(
-            plan,
-            targeted_output,
-            evidence_map,
-            evidence_registry,
-            block_specs,
-            display_title,
-            abstract_lead,
-            valid_source_ids,
-            figure_evidence_bundles if figure_first else None,
-            markdown,
-            "author-voice",
-        )
-        if not accepted:
+        repair_lint = dict(final_body_lint)
+        repair_succeeded = False
+        for repair_index in range(2):
+            matches_by_block = _paper_style_lint_matches_by_block(plan["sections"])
+            author_targets = set(matches_by_block)
+            if not author_targets:
+                break
+            logger.info(
+                "PAPER style repair=%d target_blocks=%s current_hits=%s",
+                repair_index + 1,
+                sorted(author_targets),
+                {key: value for key, value in repair_lint.items() if value},
+            )
+            baseline_sections = copy.deepcopy(plan["sections"])
             targeted_output = safe_humanize(
                 client,
                 story_plan,
                 clean_evidence,
                 _paper_story_draft_blocks(plan["sections"]),
                 settings.model_name,
-                {"author_voice": final_lint, "deterministic_validation": "Preserve every hard anchor exactly."},
+                _paper_style_repair_feedback(repair_lint, matches_by_block),
                 block_specs=block_specs,
                 style_exemplar=style_exemplar,
                 target_block_ids=author_targets,
@@ -5986,9 +6058,12 @@ def _generate_paper_article_markdown(
                 valid_source_ids,
                 figure_evidence_bundles if figure_first else None,
                 markdown,
-                "author-voice retry",
+                f"author-voice repair-{repair_index + 1}",
             )
-        if accepted:
+            if not accepted:
+                plan["sections"] = baseline_sections
+                final_author_rewrite_rolled_back = True
+                continue
             candidate_markdown = _normalize_article_markdown(
                 _remove_unverified_paper_quotes(candidate_markdown, paper_text),
                 display_title,
@@ -5997,21 +6072,36 @@ def _generate_paper_article_markdown(
                 candidate_markdown,
                 include_abstract=True,
             )
-            if _paper_ai_style_lint_failed(candidate_lint):
+            candidate_body_lint = _paper_ai_style_lint(
+                candidate_markdown,
+                include_abstract=False,
+            )
+            if not _paper_style_lint_improved(repair_lint, candidate_body_lint):
                 logger.warning(
-                    "PAPER local fallback did not clear final style lint; rolling back"
+                    "PAPER style repair=%d rejected: candidate is not monotonic",
+                    repair_index + 1,
                 )
+                plan["sections"] = baseline_sections
+                final_author_rewrite_rolled_back = True
+                continue
+            markdown = candidate_markdown
+            final_lint = candidate_lint
+            final_body_lint = candidate_body_lint
+            repair_succeeded = True
+            if not _paper_ai_style_lint_failed(final_body_lint):
+                break
+            repair_lint = dict(final_body_lint)
+
+        if not repair_succeeded or _paper_ai_style_lint_failed(final_body_lint):
+            logger.warning("PAPER targeted style repair did not clear final body lint")
+            if not repair_succeeded:
                 plan["sections"] = author_baseline_sections
                 markdown = author_baseline_markdown
                 final_lint = author_baseline_lint
-                final_author_rewrite_rolled_back = True
-            else:
-                markdown = candidate_markdown
-                final_lint = candidate_lint
-        else:
             final_author_rewrite_rolled_back = True
     plan["final_style_lint"] = final_lint
-    _paper_require_clean_final_style_lint(final_lint)
+    plan["final_body_style_lint"] = final_body_lint
+    _paper_require_clean_final_style_lint(final_lint, final_body_lint)
     if not markdown:
         raise RuntimeError("PAPER staged pipeline returned empty article")
     plan["popular_science_audit"] = popular_science_audit

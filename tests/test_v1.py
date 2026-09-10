@@ -132,7 +132,12 @@ from writer.llm import (
     _paper_readability_audit,
     _paper_stop_slop_audit,
     _paper_stable_evidence_id,
+    _paper_final_style_lint_failed,
     _paper_style_exemplar,
+    _paper_style_lint_improved,
+    _paper_style_lint_matches,
+    _paper_style_lint_matches_by_block,
+    _paper_style_repair_feedback,
     _paper_title_style_lint,
     _paper_story_sections,
     _paper_story_writer,
@@ -4397,6 +4402,50 @@ class V1Tests(unittest.TestCase):
         }
         _validate_paper_evidence_plan(
             plan, "# 标题\n\n## 结果\n\n事实1、事实2和事实3。", {"source-1"}, evidence_registry=registry,
+        )
+
+    def test_paper_style_repair_rejects_new_lint_keys(self):
+        before = {"并非": 1, "而不是": 1}
+        after = {"并非": 0, "而不是": 0, "也就是说": 1}
+        self.assertFalse(_paper_style_lint_improved(before, after))
+
+    def test_paper_style_repair_accepts_strict_count_reduction(self):
+        before = {"结果表明": 2}
+        after = {"结果表明": 1}
+        self.assertTrue(_paper_style_lint_improved(before, after))
+
+    def test_paper_style_repair_accepts_clean_candidate(self):
+        before = {"并非": 1, "结果表明": 2}
+        after = {key: 0 for key in before}
+        self.assertTrue(_paper_style_lint_improved(before, after))
+
+    def test_paper_style_repair_localizes_only_hit_blocks_and_forbids_all_patterns(self):
+        sections = [{
+            "blocks": [
+                {"id": "b1", "text": "并非由单一因素造成。"},
+                {"id": "b2", "text": "结果仍然稳定。"},
+            ]
+        }]
+        matches = _paper_style_lint_matches_by_block(sections)
+        self.assertEqual(set(matches), {"b1"})
+        self.assertIn("并非", matches["b1"])
+        feedback = _paper_style_repair_feedback({"并非": 1}, matches)
+        self.assertEqual(feedback["matched_sentences"], matches)
+        for pattern in ("并非", "而不是", "也就是说", "研究发现", "roughly", "metadata_leakage"):
+            self.assertIn(pattern, feedback["forbidden_style_patterns"])
+
+    def test_paper_abstract_style_is_separate_from_body_and_safety_remains_hard(self):
+        self.assertFalse(
+            _paper_final_style_lint_failed(
+                {"结果表明": 1, "作者式第一人称": 0, "metadata_leakage": 0},
+                {"结果表明": 0, "作者式第一人称": 0, "metadata_leakage": 0},
+            )
+        )
+        self.assertTrue(
+            _paper_final_style_lint_failed(
+                {"作者式第一人称": 1, "metadata_leakage": 0},
+                {"作者式第一人称": 0, "metadata_leakage": 0},
+            )
         )
 
     def test_paper_final_style_lint_hard_fails_after_fallback_rollback(self):
