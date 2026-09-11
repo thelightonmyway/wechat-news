@@ -78,6 +78,7 @@ from publisher.wechat import (
     _paper_draft_title,
     _remove_paper_figure_attributions,
     _style_paper_figure_blocks,
+    _style_paper_visual_emphasis,
     _selected_cover_path,
     _style_paper_intro,
     format_markdown,
@@ -140,6 +141,8 @@ from writer.llm import (
     _paper_final_style_lint_failed,
     _paper_hard_style_lint_failed,
     _paper_style_exemplar,
+    _paper_style_document_excerpt,
+    _paper_validate_visual_selection,
     _paper_style_lint_improved,
     _paper_style_lint_matches,
     _paper_style_lint_matches_by_block,
@@ -3814,8 +3817,8 @@ class V1Tests(unittest.TestCase):
             (exemplar_dir / "STYLE_GUIDE.md").write_text(
                 "规则标记：只学习语言，不迁移事实。", encoding="utf-8"
             )
-            for index in range(1, 6):
-                (exemplar_dir / f"exemplar_{index:02d}.md").write_text(
+            for name, index in (("voice_a", 1), ("voice_b", 2), ("new_style", 3)):
+                (exemplar_dir / f"{name}.md").write_text(
                     f"# 范文{index}\n\n完整正文标记{index}。\n\n结尾标记{index}。",
                     encoding="utf-8",
                 )
@@ -3840,8 +3843,8 @@ class V1Tests(unittest.TestCase):
             with patch("writer.llm.PROJECT_ROOT", root):
                 package = _paper_style_exemplar()
         self.assertIn("规则标记", package)
-        for index in range(1, 6):
-            self.assertIn(f"范文文件：exemplar_{index:02d}.md", package)
+        for name, index in (("voice_a", 1), ("voice_b", 2), ("new_style", 3)):
+            self.assertIn(f"范文文件：{name}.md", package)
             self.assertIn(f"完整正文标记{index}", package)
         self.assertIn("范文文件：new_voice.md", package)
         self.assertIn("任意文件名也应自动进入语料库", package)
@@ -3859,11 +3862,8 @@ class V1Tests(unittest.TestCase):
             self.assertIn(text, package)
         self.assertIn("STYLE_GUIDE（辅助规则", package)
         self.assertIn("STYLE CORPUS（主要参考", package)
-        self.assertIn("写作观察：成果解读", package)
-        self.assertIn("写作观察：争议辨析", package)
-        self.assertIn("写作观察：短新闻", package)
-        self.assertIn("写作观察：材料综述", package)
-        self.assertIn("写作观察：解释型科普", package)
+        self.assertIn("写作与排版强调信号", package)
+        self.assertIn("当前存在的全部范文", package)
 
     def test_paper_style_exemplar_compresses_large_corpus_deterministically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3888,6 +3888,14 @@ class V1Tests(unittest.TestCase):
             self.assertIn(f"开头标记{index}", package)
             self.assertIn(f"结尾标记{index}", package)
         self.assertLessEqual(package.count("范文文件："), 6)
+
+    def test_paper_style_document_excerpt_keeps_visual_signal(self):
+        text = "# 标题\n\n开头段落。\n\n" + ("普通正文。" * 100) + "\n\n**关键句保留**。\n\n结尾段落。"
+        excerpt = _paper_style_document_excerpt(text, 240, "dynamic.md")
+        self.assertIn("标题", excerpt)
+        self.assertIn("开头", excerpt)
+        self.assertIn("结尾", excerpt)
+        self.assertTrue("**" in excerpt or "排版代表片段" not in excerpt)
 
     def test_paper_style_payload_is_the_same_corpus_for_each_beat(self):
         package = _paper_style_exemplar()
@@ -4175,7 +4183,7 @@ class V1Tests(unittest.TestCase):
             "section-1": [{"block_id": "section-1-block-1", "beat_id": "section-1", "evidence_ids": ("e1",), "anchors": ("80%",), "figure_ids": ("Fig. 1",)}],
             "section-2": [{"block_id": "section-2-block-1", "beat_id": "section-2", "evidence_ids": ("e2",), "anchors": (), "figure_ids": ()}],
         }
-        corpus = "范文文件：exemplar_01.md\\n完整范文全文"
+        corpus = "范文文件：dynamic_voice.md\\n完整范文全文"
         result = _paper_article_editor(
             client, plan, "# 标题\\n\\n摘要\\n\\n## 现象\\n\\n旧一。\\n\\n## 机制\\n\\n旧二。",
             "摘要", corpus, "test-model", specs,
@@ -4205,7 +4213,8 @@ class V1Tests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized_payload)
         self.assertEqual(payload["article_feedback"]["article_level"], "check cross-block repetition")
-        self.assertIn("五篇范文全文", PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertIn("writer/exemplars/中的全部范文全文", PAPER_ARTICLE_EDITOR_PROMPT)
+        self.assertIn("正文大约1000个中文字符", PAPER_ARTICLE_EDITOR_PROMPT)
         self.assertIn("Abstract已经采用的中文译名优先沿用", PAPER_ARTICLE_EDITOR_PROMPT)
         self.assertIn("后文只应补充recurrence", PAPER_ARTICLE_STYLE_REVIEWER_PROMPT)
 
@@ -4685,7 +4694,7 @@ class V1Tests(unittest.TestCase):
             }, ensure_ascii=False)))]
         )
         sections = [{"id": "s1", "title": "结果", "blocks": [{"id": "b1", "text": "第一段。"}, {"id": "b2", "text": "第二段。"}]}]
-        result = _paper_style_review(client, "完整五篇范文", sections, "## 结果\\n\\n第一段。\\n\\n第二段。", "test-model", article_level=True, feedback={"style_lint": {"roughly": 1}})
+        result = _paper_style_review(client, "完整动态范文语料", sections, "## 结果\\n\\n第一段。\\n\\n第二段。", "test-model", article_level=True, feedback={"style_lint": {"roughly": 1}})
         self.assertEqual(result["issues"][0]["block_ids"], ["b1", "b2"])
         payload = json.loads(client.chat.completions.create.call_args.kwargs["messages"][1]["content"])
         self.assertEqual(payload["article_feedback"]["style_lint"]["roughly"], 1)
@@ -5048,12 +5057,20 @@ class V1Tests(unittest.TestCase):
             lambda current, count: calls.append((current, count)) or (True, current),
         )
         self.assertEqual(result[2], 0)
+        self.assertFalse(result[3])
         self.assertEqual(calls, [])
 
-    def test_paper_overlong_body_compresses_once_and_revalidates_limit(self):
+    def test_paper_body_length_audit_uses_soft_target_and_safety_limit(self):
+        audit = _paper_body_length_audit("## 结果\n\n" + "正文" * 800)
+        self.assertEqual(audit["target"], 1000)
+        self.assertEqual(audit["compress_threshold"], 1400)
+        self.assertEqual(audit["safety_limit"], 1700)
+        self.assertTrue(audit["length_warning"])
+
+    def test_paper_overlong_body_compresses_once_and_allows_soft_warning(self):
         calls = []
-        original = "## 结果\n\n" + "正文" * 600
-        compressed = "## 结果\n\n" + "核心发现和必要机制。" * 80
+        original = "## 结果\n\n" + "正文" * 800
+        compressed = "## 结果\n\n" + "核心发现和必要机制。" * 100
         result = _paper_bounded_compression(
             original,
             _paper_body_char_count(original),
@@ -5061,12 +5078,13 @@ class V1Tests(unittest.TestCase):
         )
         self.assertEqual(calls, [_paper_body_char_count(original)])
         self.assertEqual(result[0], compressed)
-        self.assertLessEqual(result[1], 1000)
+        self.assertLessEqual(result[1], 1700)
         self.assertEqual(result[2], 1)
+        self.assertFalse(result[3])
 
-    def test_paper_overlong_body_fails_after_unsuccessful_compression(self):
-        original = "## 结果\n\n" + "正文" * 600
-        with self.assertRaisesRegex(RuntimeError, "PAPER body exceeds 1000-character limit"):
+    def test_paper_overlong_body_fails_after_safety_limit(self):
+        original = "## 结果\n\n" + "正文" * 800
+        with self.assertRaisesRegex(RuntimeError, "PAPER body exceeds 1700-character safety limit"):
             _paper_bounded_compression(
                 original,
                 _paper_body_char_count(original),
@@ -7507,6 +7525,63 @@ class V1Tests(unittest.TestCase):
         self.assertEqual(styled_with_body.count('data-role="paper-figure-caption"'), 1)
         self.assertIn("<p>普通正文。</p>", styled_with_body)
         self.assertEqual(_style_paper_figure_blocks(styled), styled)
+
+    def test_paper_visual_selection_accepts_body_and_drops_invalid_spans(self):
+        markdown = (
+            "![论文第一页](images/first.png)\n\n摘要不应强调。\n\n"
+            "## 结果\n\n核心结论是森林减少14%。这里还有一段较长的普通解释，用来保持视觉强调的比例限制不会误伤单个重点句。" + "普通背景信息继续说明研究范围和限制条件。" * 8 + "\n\n"
+            "![Fig. 2](images/figure.png)\n*Fig. 2 | 图注中的关键结论。*\n\n"
+            "## 文章信息\n\n来源链接。"
+        )
+        result = _paper_validate_visual_selection(
+            markdown,
+            {
+                "emphasis": [
+                    {"text": "核心结论是森林减少14%。", "role": "key_claim"},
+                    {"text": "图注中的关键结论。", "role": "key_number"},
+                    {"text": "不存在的句子。", "role": "key_claim"},
+                ],
+                "takeaway": [{"text": "摘要不应强调。"}],
+            },
+        )
+        self.assertEqual(result["counts"], {"key_claim": 1, "key_number": 0, "takeaway": 0, "total": 1})
+        self.assertEqual(result["emphasis"][0]["text"], "核心结论是森林减少14%。")
+        self.assertEqual(len(result["dropped"]), 3)
+
+    def test_paper_visual_selection_limits_overlap_and_text_ratio(self):
+        sentence = "这是一个非常长的关键结论。" * 4
+        markdown = "## 结果\n\n" + sentence + "\n"
+        result = _paper_validate_visual_selection(
+            markdown,
+            {
+                "emphasis": [
+                    {"text": sentence, "role": "key_claim"},
+                    {"text": "这是一个非常长的关键结论。", "role": "key_number"},
+                    {"text": "这是一个非常长的关键结论。", "role": "key_claim"},
+                ],
+                "takeaway": [],
+            },
+        )
+        self.assertEqual(result["counts"]["total"], 0)
+        self.assertTrue(result["dropped"])
+
+    def test_paper_visual_html_styles_roles_without_changing_normal_text(self):
+        html = '<section><p>普通文字。核心结论。</p><p>关键数字14%。</p><p>收束句。</p></section>'
+        metadata = {
+            "paper_visual_emphasis": {
+                "emphasis": [
+                    {"text": "核心结论。", "role": "key_claim"},
+                    {"text": "关键数字14%。", "role": "key_number"},
+                ],
+                "takeaway": [{"text": "收束句。"}],
+            }
+        }
+        styled = _style_paper_visual_emphasis(html, metadata)
+        self.assertIn('data-role="paper-key_claim"', styled)
+        self.assertIn('data-role="paper-key_number"', styled)
+        self.assertIn('data-role="paper-takeaway"', styled)
+        self.assertIn("普通文字。", styled)
+        self.assertEqual(_style_paper_visual_emphasis(styled, metadata), styled)
 
     def test_paper_final_html_styles_intro_and_hides_figure_source(self):
         html = (

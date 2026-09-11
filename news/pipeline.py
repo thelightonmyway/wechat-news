@@ -3907,6 +3907,11 @@ class NewsPipeline:
                     "body_image_captions": dossier.get("body_image_captions", []),
                     "paper_image_allocation": dossier.get("paper_image_allocation", {}),
                     "paper_evidence_plan": dossier.get("paper_evidence_plan", {}),
+                    "paper_visual_emphasis": (
+                        dossier.get("paper_evidence_plan", {}).get("paper_visual_emphasis", {})
+                        if isinstance(dossier.get("paper_evidence_plan"), dict)
+                        else {}
+                    ),
                     "redundant_images_removed": dossier.get("redundant_images_removed", 0),
                     "pdf_figure_fallback": dossier.get("pdf_figure_fallback", {}),
                     "pdf_figure_source": dossier.get("pdf_figure_source", {}),

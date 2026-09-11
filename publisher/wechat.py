@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -182,6 +183,124 @@ def _style_paper_figure_blocks(html: str) -> str:
     )
 
 
+def _style_paper_visual_emphasis(article_html: str, metadata: dict[str, Any]) -> str:
+    """Apply validated semantic emphasis without changing canonical article Markdown."""
+    visual = metadata.get("paper_visual_emphasis") or {}
+    if not isinstance(visual, dict):
+        return article_html
+    selections: list[tuple[str, str]] = []
+    for item in visual.get("emphasis") or []:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            role = str(item.get("role") or "").strip()
+            if text and role in {"key_claim", "key_number"}:
+                selections.append((text, role))
+    for item in visual.get("takeaway") or []:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            if text:
+                selections.append((text, "takeaway"))
+    if not selections:
+        return article_html
+
+    tokens = [match.group(0) for match in re.finditer(r"<[^>]+>|[^<]+", article_html, re.DOTALL)]
+    stack: list[tuple[str, str]] = []
+    paragraphs: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for index, token in enumerate(tokens):
+        if not token.startswith("<"):
+            if current is not None:
+                current["text_indices"].append(index)
+                if any(role.startswith("paper-") for _, role in stack):
+                    current.setdefault("visual_text_indices", set()).add(index)
+            continue
+        closing = re.match(r"</\s*([A-Za-z0-9:_-]+)", token)
+        opening = re.match(r"<\s*([A-Za-z0-9:_-]+)\b", token)
+        if closing:
+            if closing.group(1).lower() == "p" and current is not None:
+                current["end_index"] = index
+                current = None
+            for stack_index in range(len(stack) - 1, -1, -1):
+                if stack[stack_index][0] == closing.group(1).lower():
+                    del stack[stack_index:]
+                    break
+            continue
+        if not opening:
+            continue
+        tag = opening.group(1).lower()
+        if tag == "p":
+            current = {
+                "opening_index": index,
+                "text_indices": [],
+                "roles": list(stack),
+                "caption": bool(re.search(r'data-role=["\']paper-figure-caption', token, re.IGNORECASE)),
+            }
+            paragraphs.append(current)
+        if not token.rstrip().endswith("/>"):
+            role = re.search(r'data-role=["\']([^"\']+)', token, re.IGNORECASE)
+            stack.append((tag, role.group(1).lower() if role else ""))
+
+    def eligible(paragraph: dict[str, Any]) -> bool:
+        if paragraph.get("caption"):
+            return False
+        roles = {role for _, role in paragraph.get("roles") or []}
+        return not roles.intersection({"paper-intro", "img-wrapper"}) and not any(
+            role.startswith("paper-") for _, role in paragraph.get("roles") or []
+        )
+
+    replacements: dict[int, list[tuple[int, int, str]]] = {}
+    takeaway_openings: set[int] = set()
+    for text, role in selections:
+        literal = html.escape(text, quote=False)
+        matches: list[tuple[dict[str, Any], int, int, int]] = []
+        for paragraph in paragraphs:
+            if not eligible(paragraph):
+                continue
+            for token_index in paragraph.get("text_indices") or []:
+                if token_index in paragraph.get("visual_text_indices", set()):
+                    continue
+                token = tokens[token_index]
+                if token.count(literal) == 1:
+                    start = token.find(literal)
+                    matches.append((paragraph, token_index, start, start + len(literal)))
+        if len(matches) != 1:
+            continue
+        paragraph, token_index, start, end = matches[0]
+        if role == "takeaway":
+            takeaway_openings.add(int(paragraph["opening_index"]))
+            continue
+        color = "#1677FF" if role == "key_claim" else "#0B5FD7"
+        tag = f'<strong data-role="paper-{role}" style="font-weight:700;color:{color};">'
+        replacements.setdefault(token_index, []).append((start, end, f"{tag}{literal}</strong>"))
+
+    for token_index, ranges in replacements.items():
+        value = tokens[token_index]
+        for start, end, replacement in sorted(ranges, reverse=True):
+            value = value[:start] + replacement + value[end:]
+        tokens[token_index] = value
+    takeaway_style = (
+        "background:rgba(22,119,255,0.06);border-left:3px solid #1677FF;"
+        "padding:8px 12px;margin:12px 0 20px;text-indent:0;"
+    )
+    for index in takeaway_openings:
+        opening = tokens[index]
+        if "data-role=\"paper-takeaway\"" in opening:
+            continue
+        if re.search(r'\bstyle=["\']', opening, re.IGNORECASE):
+            opening = re.sub(
+                r'\bstyle=["\']([^"\']*)["\']',
+                lambda match: f'style="{match.group(1)};{takeaway_style}"',
+                opening,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        else:
+            opening = opening[:-1] + f' style="{takeaway_style}">'
+        opening = opening[:-1] + ' data-role="paper-takeaway">'
+        tokens[index] = opening
+    return "".join(tokens)
+
+
 def _remove_paper_figure_attributions(html: str) -> str:
     label = r"(?:图源|图片来源|Source)\s*[:：]"
     html = re.sub(
@@ -266,6 +385,7 @@ def format_markdown(
         )
         html = _style_paper_intro(html)
         html = _style_paper_figure_blocks(html)
+        html = _style_paper_visual_emphasis(html, metadata)
         html = _remove_paper_figure_attributions(html)
         article_html.write_text(html, encoding="utf-8")
     return {

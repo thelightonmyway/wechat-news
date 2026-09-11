@@ -1614,7 +1614,7 @@ def _paper_style_corpus_paths(exemplar_dir: Path) -> list[Path]:
 
 
 def _paper_style_document_excerpt(text: str, budget: int, title: str) -> str:
-    """Compress one document while retaining its title, opening, middle, and ending."""
+    """Compress one document while retaining prose and a representative visual signal."""
     text = text.strip()
     if len(text) <= budget:
         return text
@@ -1631,23 +1631,51 @@ def _paper_style_document_excerpt(text: str, budget: int, title: str) -> str:
     opening = prose[0] if prose else text
     middle = prose[len(prose) // 2] if prose else opening
     ending = prose[-1] if prose else opening
-    if len({opening, middle, ending}) == 1:
-        middle = ""
-    fixed = len(heading) + len("\n\n开头：\n\n正文代表段落：\n\n结尾：\n")
+    visual_signal = next(
+        (
+            paragraph
+            for paragraph in paragraphs
+            if paragraph != heading
+            and (
+                "**" in paragraph
+                or "__" in paragraph
+                or re.search(r"(?m)^\s*>|^\s*[-*+]\s+|<[^>]+(?:style|class)=", paragraph)
+            )
+        ),
+        "",
+    )
+    selected = [heading, opening, visual_signal, middle, ending]
+    unique: list[str] = []
+    for paragraph in selected:
+        if paragraph and paragraph not in unique:
+            unique.append(paragraph)
+    labels = ["标题", "开头", "排版代表片段", "正文代表段落", "结尾"]
+    fixed = len(heading) + sum(len(label) + 2 for label in labels)
     available = max(0, budget - fixed)
-    opening_budget = available * 3 // 8
-    middle_budget = available * 1 // 4
-    ending_budget = max(0, available - opening_budget - middle_budget)
-    return "\n\n".join(
-        part
-        for part in (
-            heading,
-            f"开头：\n{opening[:opening_budget]}" if opening_budget else "",
-            f"正文代表段落：\n{middle[:middle_budget]}" if middle and middle_budget else "",
-            f"结尾：\n{ending[:ending_budget]}" if ending_budget else "",
-        )
-        if part
-    )[:budget]
+    weights = [3, 2, 2, 3]
+    if visual_signal:
+        weights = [3, 2, 2, 2, 3]
+    else:
+        unique = [heading, opening, middle, ending]
+        labels = ["标题", "开头", "正文代表段落", "结尾"]
+        weights = [3, 2, 2, 3]
+    total_weight = sum(weights)
+    excerpts = []
+
+    def excerpt(paragraph: str, part_budget: int) -> str:
+        if len(paragraph) <= part_budget:
+            return paragraph
+        bold = re.search(r"(?:\*\*|__)(.+?)(?:\*\*|__)", paragraph, re.DOTALL)
+        if bold and len(bold.group(0)) <= part_budget:
+            start = max(0, bold.start() - max(0, (part_budget - len(bold.group(0))) // 2))
+            return paragraph[start : start + part_budget]
+        return paragraph[:part_budget]
+
+    for index, paragraph in enumerate(unique):
+        part_budget = available * weights[index] // total_weight
+        excerpt_text = excerpt(paragraph, part_budget) if part_budget else ""
+        excerpts.append(f"{labels[index]}：\n{excerpt_text}" if excerpt_text else "")
+    return "\n\n".join(excerpts)[:budget]
 
 
 def _paper_style_exemplar() -> str:
@@ -1679,27 +1707,157 @@ def _paper_style_exemplar() -> str:
         parts.append(
             "STYLE_GUIDE（辅助规则；范文原文是主要风格参考）\n" + guide
         )
-    corpus_lenses = {
-        "exemplar_01.md": "成果解读：观察背景—科学问题—核心发现—机制—意义。",
-        "exemplar_02.md": "争议辨析：先提出具体疑问，再逐层解释证据和统计含义。",
-        "exemplar_03.md": "短新闻：开头直接交代最值得知道的变化，信息推进紧凑。",
-        "exemplar_04.md": "材料综述：区分事实、引述和评价，让每段承担清楚的任务。",
-        "exemplar_05.md": "解释型科普：顺手解释概念，连接时间变化、影响和应对。",
-    }
-    corpus_with_lenses = []
-    for item in corpus:
-        name, _, text = item.partition("\n")
-        lens = corpus_lenses.get(name.removeprefix("范文文件："))
-        if lens:
-            item = f"{name}\n写作观察：{lens}\n{text}"
-        corpus_with_lenses.append(item)
-    corpus = corpus_with_lenses
     parts.append(
-        "STYLE CORPUS（主要参考：五篇范文共同提供组织方式和语言节奏；优先学习"
-        "开头、段落推进、方法压缩、数字密度、句式变化和收束方式；禁止复制其中的事实、数字、人物、地点和结论）\n"
+        "STYLE CORPUS（主要参考：writer/exemplars/当前存在的全部范文共同提供写作与排版强调信号；"
+        "优先学习开头、信息取舍、段落推进、方法压缩、数字密度、术语解释、收束方式，以及哪些句子值得稀疏突出。"
+        "范文只提供风格规律，禁止复制其中的事实、数字、人物、地点、结论或措辞）\n"
         + "\n\n---\n\n".join(corpus)
     )
     return "\n\n=== STYLE PACKAGE ===\n\n".join(parts)
+
+
+def _paper_visual_body_paragraphs(markdown: str) -> list[tuple[int, str]]:
+    """Return selectable body paragraphs, excluding Abstract, captions, and metadata."""
+    paragraphs: list[tuple[int, str]] = []
+    paragraph_index = 0
+    for _, body in _paper_body_sections(markdown):
+        for raw in re.split(r"\n\s*\n", body):
+            text = raw.strip()
+            if not text or text.startswith(("#", "!", "*Fig.", "*图", "---")):
+                continue
+            visible_lines = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith(("!", "*Fig.", "*图"))
+            ]
+            text = " ".join(visible_lines).strip()
+            if text:
+                paragraphs.append((paragraph_index, text))
+                paragraph_index += 1
+    return paragraphs
+
+
+_PAPER_VISUAL_ROLES = frozenset({"key_claim", "key_number", "takeaway"})
+
+
+def _paper_validate_visual_selection(
+    markdown: str,
+    response: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep only unique, body-local visual selections within deterministic limits."""
+    paragraphs = _paper_visual_body_paragraphs(markdown)
+    raw_emphasis = response.get("emphasis") if isinstance(response, dict) else []
+    raw_takeaway = response.get("takeaway") if isinstance(response, dict) else []
+    candidates: list[dict[str, Any]] = []
+    dropped: list[dict[str, str]] = []
+    if not isinstance(raw_emphasis, list):
+        raw_emphasis = []
+    if not isinstance(raw_takeaway, list):
+        raw_takeaway = []
+    for raw, role in [
+        *[(item, str(item.get("role") or "")) for item in raw_emphasis if isinstance(item, dict)],
+        *[(item, "takeaway") for item in raw_takeaway if isinstance(item, dict)],
+    ]:
+        text = str(raw.get("text") or "").strip()
+        if not text or role not in _PAPER_VISUAL_ROLES:
+            dropped.append({"text": text, "reason": "invalid role or empty text"})
+            continue
+        matches = [
+            (index, paragraph, paragraph.find(text))
+            for index, paragraph in paragraphs
+            if paragraph.count(text) == 1
+            and paragraph.find(text) >= 0
+        ]
+        if len(matches) != 1:
+            dropped.append({"text": text, "reason": "missing, ambiguous, or cross-paragraph text"})
+            continue
+        index, paragraph, start = matches[0]
+        candidates.append({
+            "text": text,
+            "role": role,
+            "paragraph_index": index,
+            "start": start,
+            "end": start + len(text),
+            "paragraph_length": len(paragraph),
+        })
+    unique: list[dict[str, Any]] = []
+    seen_text: set[str] = set()
+    for candidate in candidates:
+        if candidate["text"] in seen_text:
+            dropped.append({"text": candidate["text"], "reason": "duplicate text"})
+            continue
+        if any(
+            candidate["paragraph_index"] == previous["paragraph_index"]
+            and candidate["start"] < previous["end"]
+            and previous["start"] < candidate["end"]
+            for previous in unique
+        ):
+            dropped.append({"text": candidate["text"], "reason": "overlapping text"})
+            continue
+        seen_text.add(candidate["text"])
+        unique.append(candidate)
+    accepted: list[dict[str, Any]] = []
+    role_counts = {role: 0 for role in _PAPER_VISUAL_ROLES}
+    body_count = max(1, _paper_body_char_count(markdown))
+    for candidate in unique:
+        role = candidate["role"]
+        role_limit = {"key_claim": 2, "key_number": 2, "takeaway": 1}[role]
+        if role_counts[role] >= role_limit or len(accepted) >= 4:
+            dropped.append({"text": candidate["text"], "reason": "visual role limit"})
+            continue
+        candidate_size = _paper_chinese_char_count(candidate["text"]) or len(candidate["text"])
+        accepted_size = sum(
+            _paper_chinese_char_count(item["text"]) or len(item["text"])
+            for item in accepted
+        )
+        if (accepted_size + candidate_size) / body_count > 0.15:
+            dropped.append({"text": candidate["text"], "reason": "visual text exceeds 15 percent"})
+            continue
+        role_counts[role] += 1
+        accepted.append(candidate)
+    accepted.sort(key=lambda item: (item["paragraph_index"], item["start"]))
+    return {
+        "emphasis": [
+            {"text": item["text"], "role": item["role"]}
+            for item in accepted
+            if item["role"] != "takeaway"
+        ],
+        "takeaway": [
+            {"text": item["text"]}
+            for item in accepted
+            if item["role"] == "takeaway"
+        ],
+        "dropped": dropped,
+        "counts": {
+            "key_claim": sum(item["role"] == "key_claim" for item in accepted),
+            "key_number": sum(item["role"] == "key_number" for item in accepted),
+            "takeaway": sum(item["role"] == "takeaway" for item in accepted),
+            "total": len(accepted),
+        },
+    }
+
+
+def _paper_visual_editor(
+    client: OpenAI,
+    markdown: str,
+    style_exemplar: str,
+    model: str,
+) -> dict[str, Any]:
+    body_sections = [
+        {"title": title, "text": body}
+        for title, body in _paper_body_sections(markdown)
+    ]
+    response = _paper_completion_json(
+        client,
+        PAPER_VISUAL_EDITOR_PROMPT,
+        {
+            "body_sections": body_sections,
+            "style_exemplar": style_exemplar,
+            "_model": model,
+            "_temperature": 0.1,
+        },
+    )
+    return _paper_validate_visual_selection(markdown, response)
 
 
 def _paper_clean_story_text(text: str) -> str:
@@ -4077,8 +4235,9 @@ def _paper_chinese_char_count(text: str) -> int:
     return len(re.findall(r"[㐀-鿿]", str(text or "")))
 
 
-_PAPER_BODY_TARGET = 900
-_PAPER_BODY_LIMIT = 1000
+_PAPER_BODY_TARGET = 1000
+_PAPER_BODY_COMPRESS_THRESHOLD = 1400
+_PAPER_BODY_SAFETY_LIMIT = 1700
 
 
 def _paper_body_char_count(markdown: str) -> int:
@@ -4103,15 +4262,17 @@ def _paper_bounded_compression(
     markdown: str,
     body_char_count: int,
     compress_fn: Callable[[str, int], tuple[bool, str]],
-) -> tuple[str, int, int]:
-    """Run at most one validated compression pass for an overlong body."""
-    if body_char_count <= _PAPER_BODY_LIMIT:
-        return markdown, body_char_count, 0
+) -> tuple[str, int, int, bool]:
+    """Run one optional compression pass, retaining a separate safety ceiling."""
+    if body_char_count <= _PAPER_BODY_COMPRESS_THRESHOLD:
+        return markdown, body_char_count, 0, False
     accepted, candidate = compress_fn(markdown, body_char_count)
     candidate_count = _paper_body_char_count(candidate) if accepted else body_char_count
-    if not accepted or candidate_count > _PAPER_BODY_LIMIT:
-        raise RuntimeError("PAPER body exceeds 1000-character limit after bounded compression")
-    return candidate, candidate_count, 1
+    if not accepted or candidate_count > _PAPER_BODY_SAFETY_LIMIT:
+        raise RuntimeError(
+            "PAPER body exceeds 1700-character safety limit after bounded compression"
+        )
+    return candidate, candidate_count, 1, candidate_count > _PAPER_BODY_COMPRESS_THRESHOLD
 
 
 def _paper_body_length_audit(markdown: str) -> dict[str, Any]:
@@ -4129,8 +4290,9 @@ def _paper_body_length_audit(markdown: str) -> dict[str, Any]:
         "total_characters": sum(item["characters"] for item in section_records),
         "body_char_count": body_characters,
         "target": _PAPER_BODY_TARGET,
-        "limit": _PAPER_BODY_LIMIT,
-        "over_limit": body_characters > _PAPER_BODY_LIMIT,
+        "compress_threshold": _PAPER_BODY_COMPRESS_THRESHOLD,
+        "safety_limit": _PAPER_BODY_SAFETY_LIMIT,
+        "length_warning": body_characters > _PAPER_BODY_COMPRESS_THRESHOLD,
         "overlong_sections": [
             item["title"] for item in section_records if item["characters"] > 135
         ],
@@ -5060,6 +5222,18 @@ PAPER_NARRATOR_CONTRACT = (
     "英文原文引用和论文题目保持原样，不要改写其中的第一人称。"
 )
 
+PAPER_VISUAL_EDITOR_PROMPT = (
+    "你是最终PAPER Visual Editor，只负责从已经完成并通过科学验证的正文中选择少量视觉重点。"
+    "当前style_exemplar由writer/exemplars/中实际存在的全部范文组成，同时提供写作信号和排版/强调信号；"
+    "只学习哪些核心句、关键数字或独立takeaway值得稀疏突出，不复制范文事实、数字、人物、地点、结论或措辞。"
+    "你只能选择输入正文中原样存在的连续文本，不能改字、增删句子、改数字、改因果、改section、改Figure或创造新的科学内容。"
+    "只能返回key_claim、key_number、takeaway三种role；key_claim最多2个，key_number最多2个，takeaway最多1个，总数最多4个。"
+    "不要选择Abstract、Figure caption、文章信息、标题或跨自然段文本；简单文章可以返回空列表。"
+    "返回严格JSON且只能包含emphasis和takeaway："
+    '{"emphasis":[{"text":"正文中原样存在的连续文本","role":"key_claim"}],"takeaway":[{"text":"正文中原样存在的完整句子"}]}'
+)
+
+
 PAPER_STORY_PLANNER_PROMPT = (
     "你是Story Planner，先读懂房间，再为已经通过Figure-first科学验证的证据设计自然的公众号故事线。"
     "读者是对科学感兴趣但非本领域专家的普通读者；目的不是逐项汇报Results，而是像人在解释一个值得知道的科学发现。"
@@ -5069,7 +5243,7 @@ PAPER_STORY_PLANNER_PROMPT = (
     "selected_story_points只能从输入的point_id中选择；未选点及其证据可以完全不写，不要为了完整覆盖论文而扩展范围。通常只需1—2张直接支撑主线的关键Figure，最多3张；不要因为有可用Figure就全部纳入。故事形状由当前证据决定，不套固定的A→B→C公式；可以从现象、结果、机制或影响切入，结论和方法的先后以自然表达为准，方法只保留帮助理解结果的部分。"
     "Python已经根据科学验证结果建立不可变的证据承载骨架；story_beats只是把上述核心story points落到已有证据边界中的写作任务，不代表固定section数量、固定角色或固定段落数量。"
     "你只需返回selected_story_points和所选beat的title、reader_question、core_message、transition_to_next，不能返回任何evidence、source、Figure或provenance字段。故事顺序和证据归属由Python根据point_id保持。"
-    "每个beat的summary和required_facts仅用于理解对应科学主题；不要在输出中复述系统字段或任何内部标识。标题专业、直接、简洁即可，长度和小标题形状以五篇范文的自然变化为参考，不套固定字数或固定角色。避免明显标题党和幕后黑手式媒体措辞；不要为了规避某个普通连接词而牺牲自然中文，也不要把图、Figure、panel或source写成文章目录。"
+    "每个beat的summary和required_facts仅用于理解对应科学主题；不要在输出中复述系统字段或任何内部标识。标题专业、直接、简洁即可，长度和小标题形状以writer/exemplars/中的全部范文的自然变化为参考，不套固定字数或固定角色。避免明显标题党和幕后黑手式媒体措辞；不要为了规避某个普通连接词而牺牲自然中文，也不要把图、Figure、panel或source写成文章目录。"
     "只学习style_exemplar的中文节奏、句长、信息密度和推进方式，不复制其中的科学事实、数字、地点、机制或句子。"
     "返回严格JSON："
     '{"editorial_brief":{"audience":"...","purpose":"...","tone":"...","reader_should_leave_with":"...","story_question":"..."},'
@@ -5082,8 +5256,8 @@ PAPER_STORY_WRITER_PROMPT = (
     "绝不能提及或猜测图号、Figure、panel、source id，也不要按证据编号或资料顺序逐项汇报。"
     "每个beat只能使用其对应的clean evidence；在固定evidence/block边界内参考style corpus自然组织正文，不要为了结构完整硬加转折、总结句或解释句。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
-    "标题和正文以五篇范文原文的自然表达为主要参考，清楚、克制即可；不套固定小标题、固定段落长度或禁用词清单。"
-    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，优先回答读者问题，再把最重要的发现、必要机制和意义连起来，不为了结构完整硬加转折、总结句或解释句。正文主体目标为700—900个中文字符，硬上限1000；通常4—7个实质段落、1—3个小标题即可，但只是软参考。不要把数字压成清单或塞进一个超长段落，优先减少覆盖范围而不是牺牲解释质量。方法、变量清单和统计术语只保留确实有助于理解的部分。"
+    "标题和正文以writer/exemplars/中的全部范文原文的自然表达为主要参考，清楚、克制即可；不套固定小标题、固定段落长度或禁用词清单。"
+    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，优先回答读者问题，再把最重要的发现、必要机制和意义连起来，不为了结构完整硬加转折、总结句或解释句。正文大约1000个中文字符，通常700—1300个中文字符是自然范围；以完整、自然地讲清一条科学主线为优先，不要主动压缩到几百字，也不要为了达到某个精确字数机械删减或扩写。通常4—7个实质段落、1—3个小标题即可，但只是软参考。不要把数字压成清单或塞进一个超长段落。方法、变量清单和统计术语只保留确实有助于理解的部分。"
     "模仿范文中有变化的句长、段落推进、数字密度和收束方式；专业词在需要时顺手解释，避免连续堆缩写、模型名和参数，不把人工规则写成排比模板。"
     "每个beat必须按输入的固定blocks分别写作。Python已经决定每个block_id及其对应的科学证据边界；不得新增、删除、重排、合并或拆分block，不得分配或返回evidence_ids。"
     "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
@@ -5095,9 +5269,9 @@ PAPER_STORY_WRITER_PROMPT = (
 
 PAPER_ARTICLE_EDITOR_PROMPT = (
     "你是中文科学新闻的Article Editor。一次性阅读完整PAPER草稿、Abstract、全部sections和全部自然段，"
-    "并把五篇范文全文当作主要参考，学习整篇文章的组织、信息推进、段落节奏、句法和自然中文。"
+    "并把writer/exemplars/中的全部范文全文当作主要参考，学习整篇文章的组织、信息推进、段落节奏、句法和自然中文。"
     "根据当前论文自己的科学内容重新组织叙事：可以重排sections和自然段，也可以把多个相邻或相关block合并到同一个自然段，"
-    "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。当前正文主体目标为700—900个中文字符，硬上限1000；如果内容较简单可以更短，不要为了凑字扩写。不要把文章写成Figure目录，不要按图号顺序汇报，"
+    "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。正文大约1000个中文字符，通常700—1300个中文字符是自然范围；以完整、自然地讲清一条科学主线为优先，不要主动压缩到几百字，也不要为了达到某个精确字数机械删减或扩写。不要把文章写成Figure目录，不要按图号顺序汇报，"
     "不要复制范文事实、数字、人物、地点或结论；方法只保留帮助理解结论所需的部分。"
     "术语和地名必须全文一致：地名按语义判断，有标准且明确中文译名的地理名称正常翻译，例如East Antarctica译为东南极、"
     "West Antarctica译为西南极、Indian Ocean译为印度洋、Southern Ocean译为南大洋、North Atlantic译为北大西洋、"
@@ -5118,8 +5292,8 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
 
 
 PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
-    "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的五篇范文原文是主要参考。"
-    "把五篇范文当作整篇文章的主要参照，检查组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
+    "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的writer/exemplars/中的全部范文原文是主要参考。"
+    "把writer/exemplars/中的全部范文当作整篇文章的主要参照，检查组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
     "必须检查：是否围绕少数核心story points推进、跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
     "术语和地名是否一致：Abstract和正文首次采用的标准中文译名优先沿用；中文译名不确定的生僻命名型地理实体可保持准确英文，后文不得交替使用不同写法；"
     "普通科学概念如Rossby wave应统一译为‘罗斯贝波’，不得中英文或多个中文译名混用；"
@@ -5152,7 +5326,7 @@ PAPER_HUMANIZER_PROMPT = (
 
 PAPER_STYLE_REVIEWER_PROMPT = (
     "你是只读的中文科学写作Style Reviewer。完整style_exemplar是主要参考，STYLE_GUIDE和人工规则只作辅助校对。"
-    "把五篇范文作为主要写作参照，检查完整正文是否像自然的science news/explainer，而不是论文Results、摘要扩写或图注翻译。"
+    "把writer/exemplars/中的全部范文作为主要写作参照，检查完整正文是否像自然的science news/explainer，而不是论文Results、摘要扩写或图注翻译。"
     "只指出真正影响阅读的结果翻译腔、AI语气、机械对仗或转折、作者式第一人称、重复同构句式、方法/变量堆叠、生硬衔接，"
     "以及与范文语法、段落节奏、信息密度和叙事推进明显偏离的问题。不要评价或改动科学事实。"
     "不能移动证据、调整block或section、修改Figure和anchor、改变来源、重排章节或新增科学结论。"
@@ -5203,7 +5377,7 @@ PAPER_POPULAR_SCIENCE_EDITOR_PROMPT = (
     "科学结构、section顺序、Figure归属、证据范围、数字、anchor、趋势方向、因果强度和限定条件已经锁定，绝不能新增、删除、合并或移动科学结论。"
     "围绕当前section的科学内容回答读者问题：优先说最重要的发现，再在需要时解释为什么重要或可能如何发生；不要把Figure caption逐句翻译成结果清单。"
     "优先使用普通中文：第一次出现的缩写和专业词尽量用极短中文解释，能不用缩写就不用；不要堆叠方法名、统计量或模型术语。保留SSP3-7.0这类已验证anchor时，必须写成‘SSP3-7.0这一未来排放情景’或在紧邻括号中解释，不能只留下裸缩写。"
-    "段落长短、句长和标点以五篇范文的自然节奏为准，让每段推进一个主要意思，但不强制短段落、单一句式或统一长度；采用直接的科学陈述，避免模板化连接和媒体式修辞。"
+    "段落长短、句长和标点以writer/exemplars/中的全部范文的自然节奏为准，让每段推进一个主要意思，但不强制短段落、单一句式或统一长度；采用直接的科学陈述，避免模板化连接和媒体式修辞。"
     "不要写成论文摘要或Results中文翻译，也不要为了学术感保留不必要的术语密度。XGBoost、SHAP、CCA等方法只有在解释证据为何可信时才保留。"
     "Abstract只用于核对主线和限定条件，不能把当前Figure bundle未支持的次要结果重新塞回正文。"
     "返回严格JSON sections数组，保持每个section的id和顺序；若小标题仍含英文或难懂术语，可以只改title但不得改变其Figure范围和科学含义。正文总量以350到500个中文字符为参考，不要求每节等长，也不得机械截断句子。"
@@ -5286,7 +5460,10 @@ def _write_article_files(
                     {
                         "paper_body_char_count": paper_evidence_plan.get("paper_body_char_count"),
                         "paper_body_target": paper_evidence_plan.get("paper_body_target"),
-                        "paper_body_limit": paper_evidence_plan.get("paper_body_limit"),
+                        "paper_body_compress_threshold": paper_evidence_plan.get("paper_body_compress_threshold"),
+                        "paper_body_safety_limit": paper_evidence_plan.get("paper_body_safety_limit"),
+                        "paper_body_length_warning": paper_evidence_plan.get("paper_body_length_warning", False),
+                        "paper_visual_emphasis": paper_evidence_plan.get("paper_visual_emphasis", {}),
                     }
                     if paper_evidence_plan and "paper_body_char_count" in paper_evidence_plan
                     else {}
@@ -5782,11 +5959,13 @@ def _generate_paper_article_markdown(
             "compression": {
                 "current_body_char_count": current_count,
                 "target_body_char_count": _PAPER_BODY_TARGET,
-                "hard_limit": _PAPER_BODY_LIMIT,
+                "compression_threshold": _PAPER_BODY_COMPRESS_THRESHOLD,
+                "safety_limit": _PAPER_BODY_SAFETY_LIMIT,
                 "instruction": (
-                    "压缩正文而不是截断正文。只保留当前focused story的中心问题、2到3个关键发现、"
-                    "必要机制和自然落点；优先删除重复事实、方法过程、次要结果、Figure caption复述和同义解释。"
-                    "不要修改Abstract，不新增evidence或Figure，不改变block_ids、anchor、source、Figure归属或科学强度。"
+                    "压缩正文而不是截断正文。以约1000至1200个中文字符为目标，优先删除重复事实、方法过程、"
+                    "次要结果、Figure caption复述和同义解释；保留当前focused story的中心问题、2到3个关键发现、"
+                    "必要机制和自然落点。不要修改Abstract，不新增evidence或Figure，不改变block_ids、anchor、"
+                    "source、Figure归属或科学强度；即使压缩后仍超过1400，只要不超过1700也保留并记录长度警告。"
                 ),
             }
         }
@@ -5815,19 +5994,26 @@ def _generate_paper_article_markdown(
         )
 
     try:
-        markdown, body_char_count, compression_retry_count = _paper_bounded_compression(
+        (
+            markdown,
+            body_char_count,
+            compression_retry_count,
+            length_warning,
+        ) = _paper_bounded_compression(
             markdown,
             body_char_count,
             compress_article,
         )
     except Exception as exc:
-        if str(exc) == "PAPER body exceeds 1000-character limit after bounded compression":
+        if str(exc) == "PAPER body exceeds 1700-character safety limit after bounded compression":
             raise
         raise RuntimeError(
-            "PAPER body exceeds 1000-character limit after bounded compression"
+            "PAPER body exceeds 1700-character safety limit after bounded compression"
         ) from exc
     if compression_retry_count:
         article_editor_succeeded = True
+    else:
+        length_warning = body_char_count > _PAPER_BODY_COMPRESS_THRESHOLD
 
     lint = _paper_ai_style_lint(markdown, include_abstract=True)
     popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
@@ -6491,12 +6677,30 @@ def _generate_paper_article_markdown(
             exc,
         )
     logger.info("PAPER deterministic evidence validation passed")
+    try:
+        visual_emphasis = _paper_visual_editor(
+            client,
+            markdown,
+            style_exemplar,
+            settings.model_name,
+        )
+    except Exception as exc:
+        logger.warning("PAPER visual emphasis selection unavailable; retaining plain body: %s", exc)
+        visual_emphasis = {
+            "emphasis": [],
+            "takeaway": [],
+            "dropped": [{"text": "", "reason": "visual editor unavailable"}],
+            "counts": {"key_claim": 0, "key_number": 0, "takeaway": 0, "total": 0},
+        }
+    plan["paper_visual_emphasis"] = visual_emphasis
     body_char_count = _paper_body_char_count(markdown)
-    if body_char_count > _PAPER_BODY_LIMIT:
-        raise RuntimeError("PAPER body exceeds 1000-character limit after bounded compression")
+    if body_char_count > _PAPER_BODY_SAFETY_LIMIT:
+        raise RuntimeError("PAPER body exceeds 1700-character safety limit")
     plan["paper_body_char_count"] = body_char_count
     plan["paper_body_target"] = _PAPER_BODY_TARGET
-    plan["paper_body_limit"] = _PAPER_BODY_LIMIT
+    plan["paper_body_compress_threshold"] = _PAPER_BODY_COMPRESS_THRESHOLD
+    plan["paper_body_safety_limit"] = _PAPER_BODY_SAFETY_LIMIT
+    plan["paper_body_length_warning"] = bool(length_warning or body_char_count > _PAPER_BODY_COMPRESS_THRESHOLD)
     plan["compression_retry_count"] = compression_retry_count
     if _paper_ai_style_lint_failed(final_body_lint):
         logger.warning(
