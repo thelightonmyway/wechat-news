@@ -2237,10 +2237,17 @@ def _insert_paper_figures(
                 }
             )
         local_name = Path(str(image["local_path"])).name
-        block = [
-            f"![Fig. {figure_number}](images/{local_name})",
-            f"*Fig. {figure_number} | {caption}*",
-        ]
+        if numbered:
+            block = [
+                f"![Fig. {figure_number}](images/{local_name})",
+                f"*Fig. {figure_number} | {caption}*",
+            ]
+        else:
+            # A hero, cover, or graphical abstract is not a numbered Figure.
+            block = [
+                f"![论文配图](images/{local_name})",
+                f"*{caption}*",
+            ]
         insertions.setdefault(insertion_index, []).append("\n".join(block))
 
     if dossier.get("content_type") == PAPER_CONTENT:

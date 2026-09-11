@@ -77,6 +77,7 @@ from publisher.wechat import (
     DEFAULT_COVER,
     _paper_draft_title,
     _remove_paper_figure_attributions,
+    _style_paper_figure_blocks,
     _selected_cover_path,
     _style_paper_intro,
     format_markdown,
@@ -2636,6 +2637,14 @@ class V1Tests(unittest.TestCase):
         self.assertIn("R = 0.84", by_id["Fig. 2"]["quantitative_anchors"])
         self.assertEqual(by_id["Fig. 3"]["supported_figures_by_anchor"]["approximately 74%"], ["Fig. 3"])
 
+    def test_paper_figure_bundle_does_not_infer_fig1_from_hero_position(self):
+        images = [
+            {"image_role": "hero", "url": "https://example.test/hero.png"},
+            {"figure_number": 2, "caption": "Figure 2. Reconstruction R = 0.71."},
+        ]
+        bundles = _paper_figure_evidence_bundles(images, [])
+        self.assertEqual([bundle["figure_id"] for bundle in bundles], ["Fig. 2"])
+
     def test_paper_figure_bundle_contains_caption_and_source_links(self):
         images = [{"figure_number": 2, "caption": "Figure 2. XGBoost reconstruction R = 0.71."}]
         source_paragraphs = [{"id": "source-0", "text": "Results refer to Figure 2 and report R = 0.71."}]
@@ -3810,6 +3819,11 @@ class V1Tests(unittest.TestCase):
             self.assertIn(text, package)
         self.assertIn("STYLE_GUIDE（辅助规则", package)
         self.assertIn("STYLE CORPUS（主要参考", package)
+        self.assertIn("写作观察：成果解读", package)
+        self.assertIn("写作观察：争议辨析", package)
+        self.assertIn("写作观察：短新闻", package)
+        self.assertIn("写作观察：材料综述", package)
+        self.assertIn("写作观察：解释型科普", package)
 
     def test_paper_style_exemplar_compresses_large_corpus_deterministically(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6218,6 +6232,26 @@ class V1Tests(unittest.TestCase):
             self.assertEqual(text.count("![Fig. 1]"), 1)
             self.assertEqual(text.count("![Fig. 2]"), 1)
 
+    def test_paper_hero_image_is_not_labeled_fig1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images_dir = root / "images"
+            images_dir.mkdir()
+            hero = images_dir / "hero.png"
+            hero.write_bytes(b"png")
+            markdown = root / "article.md"
+            markdown.write_text("## 结果\n\n正文。\n", encoding="utf-8")
+            dossier = {"content_type": PAPER_CONTENT}
+            _insert_paper_figures(
+                markdown,
+                [{"local_path": str(hero), "image_role": "hero", "caption": "论文配图"}],
+                ["论文配图"],
+                dossier,
+            )
+            text = markdown.read_text(encoding="utf-8")
+            self.assertIn("![论文配图]", text)
+            self.assertNotIn("Fig. 1", text)
+
     def test_body_image_captions_are_independent_and_batched(self):
         settings = replace(
             load_settings(),
@@ -7357,6 +7391,19 @@ class V1Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_selected_cover_path(markdown), DEFAULT_COVER)
+
+    def test_paper_figure_caption_style_is_paper_only_and_idempotent(self):
+        html = (
+            '<section data-role="img-wrapper"><img src="figure.png" alt="figure">'
+            '<p>图1. 环流和降水变化。</p></section>'
+        )
+        styled = _style_paper_figure_blocks(html)
+        self.assertIn('data-role="paper-figure-caption"', styled)
+        self.assertIn("font-size:12px", styled)
+        styled_with_body = _style_paper_figure_blocks(html + "<p>普通正文。</p>")
+        self.assertEqual(styled_with_body.count('data-role="paper-figure-caption"'), 1)
+        self.assertIn("<p>普通正文。</p>", styled_with_body)
+        self.assertEqual(_style_paper_figure_blocks(styled), styled)
 
     def test_paper_final_html_styles_intro_and_hides_figure_source(self):
         html = (

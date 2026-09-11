@@ -196,15 +196,20 @@ def _paper_figure_evidence_bundles(
     source_paragraphs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     figure_info: list[tuple[str, int, str]] = []
-    for index, image in enumerate(selected_images, start=1):
-        figure_id = _paper_figure_id(
-            image.get("figure_number") or image.get("metadata_title") or index
-        )
-        number_match = re.search(r"(\d+)", figure_id)
+    for image in selected_images:
+        raw_figure = image.get("figure_number")
+        if raw_figure in (None, ""):
+            raw_figure = image.get("metadata_title") or image.get("alt") or ""
+        figure_id = _paper_figure_id(raw_figure)
+        number_match = re.fullmatch(r"Fig\.\s*(\d+)", figure_id, flags=re.IGNORECASE)
+        if number_match is None:
+            # Hero, cover, avatar, and graphical-abstract images are not body
+            # Figures. Never infer ``Fig. 1`` from their list position.
+            continue
         figure_info.append(
             (
                 figure_id,
-                int(number_match.group(1)) if number_match else index,
+                int(number_match.group(1)),
                 str(image.get("caption") or image.get("original_caption") or image.get("alt") or "").strip(),
             )
         )
@@ -1674,9 +1679,24 @@ def _paper_style_exemplar() -> str:
         parts.append(
             "STYLE_GUIDE（辅助规则；范文原文是主要风格参考）\n" + guide
         )
+    corpus_lenses = {
+        "exemplar_01.md": "成果解读：观察背景—科学问题—核心发现—机制—意义。",
+        "exemplar_02.md": "争议辨析：先提出具体疑问，再逐层解释证据和统计含义。",
+        "exemplar_03.md": "短新闻：开头直接交代最值得知道的变化，信息推进紧凑。",
+        "exemplar_04.md": "材料综述：区分事实、引述和评价，让每段承担清楚的任务。",
+        "exemplar_05.md": "解释型科普：顺手解释概念，连接时间变化、影响和应对。",
+    }
+    corpus_with_lenses = []
+    for item in corpus:
+        name, _, text = item.partition("\n")
+        lens = corpus_lenses.get(name.removeprefix("范文文件："))
+        if lens:
+            item = f"{name}\n写作观察：{lens}\n{text}"
+        corpus_with_lenses.append(item)
+    corpus = corpus_with_lenses
     parts.append(
-        "STYLE CORPUS（主要参考：学习句法、段落长度、信息密度、叙事推进、"
-        "术语解释和自然中文；禁止复制其中的事实、数字、人物、地点和结论）\n"
+        "STYLE CORPUS（主要参考：五篇范文共同提供组织方式和语言节奏；优先学习"
+        "开头、段落推进、方法压缩、数字密度、句式变化和收束方式；禁止复制其中的事实、数字、人物、地点和结论）\n"
         + "\n\n---\n\n".join(corpus)
     )
     return "\n\n=== STYLE PACKAGE ===\n\n".join(parts)
@@ -3120,9 +3140,7 @@ def _paper_style_issue_block_ids(sections: list[dict[str, Any]]) -> set[str]:
                 target_ids.add(block_id)
                 continue
             if (
-                "；" in text
-                or ";" in text
-                or re.search(r"(?:第一|第二|第三|第四|首先|其次|再次|最后|图\s*\d+|Fig\.?\s*\d+)", text)
+                re.search(r"(?:第一|第二|第三|第四|首先|其次|再次|最后|图\s*\d+|Fig\.?\s*\d+)", text)
                 or _paper_readability_audit(f"## section\n\n{text}")["issue_count"]
             ):
                 target_ids.add(block_id)
@@ -4903,10 +4921,11 @@ PAPER_STORY_PLANNER_PROMPT = (
     "读者是对科学感兴趣但非本领域专家的普通读者；目的不是逐项汇报Results，而是像人在解释一个值得知道的科学发现。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
     "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
+    "先从整篇论文中筛选2到4个真正值得读者记住的story points，优先考虑问题、现象、反常或矛盾、核心发现及其意义；可参考‘问题—发现—为什么—意义/未来’的推进，但不是固定模板；不要把论文目录、Figure顺序或方法清单当成故事线。"
     "故事形状由当前证据决定，不套固定的A→B→C公式；可以从现象、结果、机制或影响切入，结论和方法的先后以自然表达为准，方法只保留帮助理解结果的部分。"
-    "Python已经根据科学验证结果建立固定story skeleton，每个scientific section对应一个固定beat；不要重排、合并、拆分或重新分配beat。"
+    "Python已经根据科学验证结果建立不可变的证据承载骨架；story_beats只是把上述核心story points落到已有证据边界中的写作任务，不代表固定section数量、固定角色或固定段落数量。"
     "你只需为每个固定beat填写title、reader_question、core_message和transition_to_next，不能返回任何evidence、source、Figure或provenance字段。故事顺序和证据归属由Python保持。"
-    "每个beat的summary和required_facts仅用于理解该固定section的科学主题；不要在输出中复述系统字段或任何内部标识。标题必须专业、直接、简洁，优先10到22个中文字，直接陈述科学结果。避免为何、线索、改写、同一片中国、谁在主导、真正的答案、背后的秘密等媒体化措辞。不能使用第一、第二、第三、第四、首先、其次、最后，也不能提及任何图、Figure、panel或source。"
+    "每个beat的summary和required_facts仅用于理解对应科学主题；不要在输出中复述系统字段或任何内部标识。标题专业、直接、简洁即可，长度和小标题形状以五篇范文的自然变化为参考，不套固定字数或固定角色。避免明显标题党和幕后黑手式媒体措辞；不要为了规避某个普通连接词而牺牲自然中文，也不要把图、Figure、panel或source写成文章目录。"
     "只学习style_exemplar的中文节奏、句长、信息密度和推进方式，不复制其中的科学事实、数字、地点、机制或句子。"
     "返回严格JSON："
     '{"editorial_brief":{"audience":"...","purpose":"...","tone":"...","reader_should_leave_with":"...","story_question":"..."},'
@@ -4918,9 +4937,9 @@ PAPER_STORY_WRITER_PROMPT = (
     "绝不能提及或猜测图号、Figure、panel、source id，也不要按证据编号或资料顺序逐项汇报。"
     "每个beat只能使用其对应的clean evidence；在固定evidence/block边界内参考style corpus自然组织正文，不要为了结构完整硬加转折、总结句或解释句。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
-    "标题和正文以style corpus的自然表达为主要参考，清楚、克制即可，不把10到22字、固定小标题或禁用词清单当成硬模板。"
-    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，不为了结构完整硬加转折、总结句或解释句。方法、变量清单和统计术语只保留确实有助于理解的部分。"
-    "句式、句长和段落节奏参考style corpus自然变化；专业词在需要时顺手解释，避免连续堆缩写、模型名和参数，不把人工规则写成排比模板。"
+    "标题和正文以五篇范文原文的自然表达为主要参考，清楚、克制即可；不套固定小标题、固定段落长度或禁用词清单。"
+    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，优先回答读者问题，再把最重要的发现、必要机制和意义连起来，不为了结构完整硬加转折、总结句或解释句。方法、变量清单和统计术语只保留确实有助于理解的部分。"
+    "模仿范文中有变化的句长、段落推进、数字密度和收束方式；专业词在需要时顺手解释，避免连续堆缩写、模型名和参数，不把人工规则写成排比模板。"
     "每个beat必须按输入的固定blocks分别写作。Python已经决定每个block_id及其对应的科学证据边界；不得新增、删除、重排、合并或拆分block，不得分配或返回evidence_ids。"
     "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
     "本次只写当前story beat，按证据需要保持紧凑；全篇长度由Python汇总审计，不要把每个beat或block机械写成等长。"
@@ -4939,24 +4958,24 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
     "West Antarctica译为西南极、Indian Ocean译为印度洋、Southern Ocean译为南大洋、North Atlantic译为北大西洋、"
     "Arctic译为北极；生僻、具体、命名型地理实体如果中文译名不确定，保留准确的原始英文，例如Queen Mary Land、Wilkes Land。"
     "普通科学表达必须翻译，例如Antarctic moistening、Antarctic precipitation、Antarctic warming和Rossby wave分别使用自然中文，"
-    "不得因为包含Antarctic或Antarctica就保留整段英文。Abstract和正文首次明确采用的写法优先沿用，后文不得交替使用英文名或不同中文译名。"
+    "不得因为包含Antarctic或Antarctica就保留整段英文。Abstract和正文首次明确采用的写法优先沿用，Abstract已经采用的中文译名优先沿用，后文不得交替使用英文名或不同中文译名。"
     "writing_facts中的required_facts只是必须保留的论文事实，has_figure只是附近需要承载图的提示；"
     "不要在正文提到required fact、evidence、证据、锚点、约束、block、metadata、provenance或任何系统概念。"
     "不得发明事实、因果、意义、数字或来源。每个原有block_id必须在全文一个且仅一个paragraph的block_ids中出现，"
     "不得新增、删除或重复block_id；block_ids只用于Python恢复事实归属，不要把它们写进正文。"
     "返回严格JSON且只能包含sections。每个section使用section_id、title和paragraphs；每个paragraph只能使用block_ids和text。"
-    "所有原有section_id和block_id必须各出现恰好一次，允许sections、paragraphs和block_ids任意重排。"
+    "所有原有section_id和block_id必须各出现恰好一次，允许sections、paragraphs和block_ids任意重排；section数量、段落数量、每段承载的block数量和标题长度都由科学内容与范文自然节奏决定，不套人工模板。"
     + PAPER_FIDELITY_CONTRACT
     + PAPER_NARRATOR_CONTRACT
-    + "禁止明显AI或论文翻译腔，包括我们、咱们、并非、并不是、而不是、不是……而是、值得注意的是、这意味着、综上所述等。"
+    + "避免明显AI或论文翻译腔和机械对仗；普通连接词单次自然出现不需要强行替换，只有造成重复、空泛或读者负担时才改写。作者式第一人称和内部元数据仍绝对禁止。"
     + "输出格式：{\"sections\":[{\"section_id\":\"...\",\"title\":\"...\",\"paragraphs\":[{\"block_ids\":[\"...\"],\"text\":\"...\"}]}]}"
 )
 
 
 PAPER_ARTICLE_STYLE_REVIEWER_PROMPT = (
     "你是只读的整篇中文科学新闻Style Reviewer。完整style_exemplar中的五篇范文原文是主要参考。"
-    "检查整篇文章的组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
-    "必须检查：跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
+    "把五篇范文当作整篇文章的主要参照，检查组织、信息推进、段落节奏、自然中文和科学新闻感，而不是逐block挑句子。"
+    "必须检查：是否围绕少数核心story points推进、跨section机制是否重复完整解释、后文是否只是换词复述、是否隐含按Figure顺序、开头和结尾是否重复、"
     "术语和地名是否一致：Abstract和正文首次采用的标准中文译名优先沿用；中文译名不确定的生僻命名型地理实体可保持准确英文，后文不得交替使用不同写法；"
     "普通科学概念如Rossby wave应统一译为‘罗斯贝波’，不得中英文或多个中文译名混用；"
     "还要检查中英文是否异常混杂、roughly或300百帕等不自然表达、以及Results翻译腔和AI对立句。"
@@ -4988,8 +5007,8 @@ PAPER_HUMANIZER_PROMPT = (
 
 PAPER_STYLE_REVIEWER_PROMPT = (
     "你是只读的中文科学写作Style Reviewer。完整style_exemplar是主要参考，STYLE_GUIDE和人工规则只作辅助校对。"
-    "检查完整正文是否像自然的science news/explainer，而不是论文Results、摘要扩写或图注翻译。"
-    "只指出结果翻译腔、AI语气、机械对仗或转折、作者式第一人称、重复同构句式、方法/变量堆叠、生硬衔接，"
+    "把五篇范文作为主要写作参照，检查完整正文是否像自然的science news/explainer，而不是论文Results、摘要扩写或图注翻译。"
+    "只指出真正影响阅读的结果翻译腔、AI语气、机械对仗或转折、作者式第一人称、重复同构句式、方法/变量堆叠、生硬衔接，"
     "以及与范文语法、段落节奏、信息密度和叙事推进明显偏离的问题。不要评价或改动科学事实。"
     "不能移动证据、调整block或section、修改Figure和anchor、改变来源、重排章节或新增科学结论。"
     "每个问题只指定一个已有block；没有明确问题就返回空issues。每个block最多一个问题。"
@@ -5004,7 +5023,7 @@ PAPER_PLANNER_PROMPT = (
     "每个section包含id、title、role和findings；source provenance与真实Figure mapping均由Python根据evidence_ids和canonical evidence registry推导，禁止返回source_paragraph_ids、source_sentence或其他source字段。title必须是适合中文成稿的简洁中文小标题；每个finding包含id和evidence_ids。"
     "不要返回或依赖figure_ids、selected_body_figures等Figure ownership字段；即使兼容旧JSON格式返回这些字段，Python也会忽略它们。evidence_ids必须来自输入registry，Figure mapping将由Python根据canonical supported_figures自动恢复。"
     "输入中的figure_backed_evidence_ids按selected Figure列出合法的Figure-backed evidence_id；有selected Figure时，每个section至少选择一条对应列表中的evidence_id，可搭配global_context或section_context，但不要由模型重新推断Figure归属。若selected_body_figures或figure_evidence_bundles为空，仍必须根据paper_text和source_paragraphs规划至少一个有证据支持的section。"
-    "每个evidence_id只能归属于一个primary section；不要把同一个evidence_id重复分配给多个section。每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
+    "每个evidence_id只能归属于一个primary section；不要把同一个evidence_id重复分配给多个section。提交前逐项检查所有evidence_ids的全局集合，任何ID只能出现一次，即使两个finding共享同一个数字或source段落也必须选择各自唯一的registry记录。每个核心finding只能有一个primary section。若historical/model spread、mechanism、attribution、projection或implication"
     "是不同科学问题且各有独立Figure bundle证据，按真实Figure证据拆分；不要为凑section数量而合并不相关Figure，也不要固定section数量。"
     "只有Abstract或Results明确支持时才拆分multiple modes/regimes，不得创造first/second mode。"
     "每个Figure bundle的核心finding只能进入包含该Figure的section；Figure 只可通过bundle中的caption、明确引用段落和直接关联Results段落支持正文。不要把Fig.2的R=0.71写入只包含Fig.3的section。"
@@ -5037,9 +5056,9 @@ PAPER_REVISION_PROMPT = (
 PAPER_POPULAR_SCIENCE_EDITOR_PROMPT = (
     "你是Popular Science Editor，负责把已经通过Scientific Reviewer的论文正文改写成面向跨专业普通读者的高质量science news/explainer。"
     "科学结构、section顺序、Figure归属、证据范围、数字、anchor、趋势方向、因果强度和限定条件已经锁定，绝不能新增、删除、合并或移动科学结论。"
-    "每个section围绕当前Figure回答一个读者问题：先说这张图最重要的发现，再用一两句解释为什么重要或可能如何发生；不要把Figure caption逐句翻译成结果清单。"
-    "优先使用普通中文：第一次出现的缩写和专业词必须用极短中文解释，能不用缩写就不用；不要堆叠方法名、统计量或模型术语。保留SSP3-7.0这类已验证anchor时，必须写成‘SSP3-7.0这一未来排放情景’或在紧邻括号中解释，不能只留下裸缩写。"
-    "使用短段落和短句，一句话只表达一个主要意思；采用直接的科学陈述，让读者第一遍就能理解。默认使用逗号和句号，避免分号、模板化连接和媒体式修辞。"
+    "围绕当前section的科学内容回答读者问题：优先说最重要的发现，再在需要时解释为什么重要或可能如何发生；不要把Figure caption逐句翻译成结果清单。"
+    "优先使用普通中文：第一次出现的缩写和专业词尽量用极短中文解释，能不用缩写就不用；不要堆叠方法名、统计量或模型术语。保留SSP3-7.0这类已验证anchor时，必须写成‘SSP3-7.0这一未来排放情景’或在紧邻括号中解释，不能只留下裸缩写。"
+    "段落长短、句长和标点以五篇范文的自然节奏为准，让每段推进一个主要意思，但不强制短段落、单一句式或统一长度；采用直接的科学陈述，避免模板化连接和媒体式修辞。"
     "不要写成论文摘要或Results中文翻译，也不要为了学术感保留不必要的术语密度。XGBoost、SHAP、CCA等方法只有在解释证据为何可信时才保留。"
     "Abstract只用于核对主线和限定条件，不能把当前Figure bundle未支持的次要结果重新塞回正文。"
     "返回严格JSON sections数组，保持每个section的id和顺序；若小标题仍含英文或难懂术语，可以只改title但不得改变其Figure范围和科学含义。正文总量以350到500个中文字符为参考，不要求每节等长，也不得机械截断句子。"
@@ -5160,6 +5179,8 @@ def _generate_paper_article_markdown(
         selected_images,
         source_paragraphs,
     )
+    # An unnumbered hero or cover is not a Figure-first evidence source.
+    figure_first = figure_first and bool(figure_evidence_bundles)
     evidence_registry = _paper_canonical_evidence_registry(
         source_paragraphs,
         figure_evidence_bundles,

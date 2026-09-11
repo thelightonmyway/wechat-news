@@ -145,6 +145,43 @@ def _style_paper_intro(html: str) -> str:
     return html[: first_page.end()] + tail[: candidate.start()] + styled + tail[candidate.end() :]
 
 
+def _style_paper_figure_blocks(html: str) -> str:
+    """Give PAPER figure captions a quiet, mobile-friendly rhythm."""
+    caption_style = (
+        "font-size:12px;color:#888;line-height:1.6;text-align:center;"
+        "margin:8px 0 20px;"
+    )
+
+    def replace_figure(match: re.Match[str]) -> str:
+        caption = match.group("caption")
+        if re.search(
+            r"\bdata-role=[\"']paper-figure-caption[\"']",
+            caption,
+            flags=re.IGNORECASE,
+        ):
+            return match.group(0)
+        opening = re.match(r"<p\b[^>]*>", caption, flags=re.IGNORECASE)
+        if opening is None:
+            return match.group(0)
+        styled_opening = (
+            f'<p data-role="paper-figure-caption" style="{caption_style}">'
+        )
+        return (
+            f"{match.group('prefix')}"
+            f"{styled_opening}{caption[opening.end():]}"
+            f"{match.group('suffix')}"
+        )
+
+    return re.sub(
+        r"(?P<prefix><section\b[^>]*data-role=[\"']img-wrapper[\"'][^>]*>.*?)"
+        r"(?P<caption><p\b[^>]*>.*?</p>)"
+        r"(?P<suffix>.*?</section>)",
+        replace_figure,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 def _remove_paper_figure_attributions(html: str) -> str:
     label = r"(?:图源|图片来源|Source)\s*[:：]"
     html = re.sub(
@@ -228,6 +265,7 @@ def format_markdown(
             flags=re.IGNORECASE | re.DOTALL,
         )
         html = _style_paper_intro(html)
+        html = _style_paper_figure_blocks(html)
         html = _remove_paper_figure_attributions(html)
         article_html.write_text(html, encoding="utf-8")
     return {
