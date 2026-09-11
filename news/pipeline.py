@@ -1468,7 +1468,7 @@ def _paper_candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int,
 def _paper_allocate_images(
     images: list[dict[str, Any]],
     context: str,
-    limit: int = 4,
+    limit: int = 3,
     source_context: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Map every usable PAPER image before applying the global image limit."""
@@ -1494,7 +1494,7 @@ def _paper_allocate_images(
             "discarded_figures": [
                 {
                     "figure": _paper_image_label(image),
-                    "reason": "超过全局最多4张图片限制",
+                    "reason": f"超过全局最多{limit}张图片限制",
                     "candidate_sections": [],
                 }
                 for image in images[limit:]
@@ -1783,7 +1783,7 @@ def _paper_allocate_images(
             {
                 "figure": _paper_image_label(image),
                 "reason": (
-                    "全局最多4张，已优先覆盖主要 section"
+                    f"全局最多{limit}张，已优先覆盖主要 section"
                     if related_sections
                     else "没有足够的正文对应关系"
                 ),
@@ -1874,7 +1874,7 @@ def _select_article_images(
             else:
                 cover = pdf_figures[0]
 
-    limit = 4 if content_type == PAPER_CONTENT else 2
+    limit = 3 if content_type == PAPER_CONTENT else 2
     body: list[dict[str, Any]] = []
     redundant_count = 0
     for image in ranked:

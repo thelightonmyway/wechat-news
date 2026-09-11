@@ -109,6 +109,8 @@ from writer.llm import (
     _paper_apply_story_candidate,
     _paper_assemble_markdown,
     _paper_body_length_audit,
+    _paper_body_char_count,
+    _paper_bounded_compression,
     _paper_chinese_char_count,
     _paper_canonical_evidence_registry,
     _paper_canonical_anchor_owners,
@@ -2988,7 +2990,7 @@ class V1Tests(unittest.TestCase):
         ]
         sections = _paper_story_sections(validated, evidence_map, registry, {"source-1", "source-2", "source-3"})
         self.assertEqual(sections[0]["source_paragraph_ids"], ["source-1", "source-2"])
-        self.assertEqual(sections[0]["figure_ids"], ["Fig. 1"])
+        self.assertEqual(sections[0]["figure_ids"], [])
         self.assertEqual(sections[0]["findings"][0]["evidence_ids"], ["e1", "e2"])
 
     def test_paper_story_planner_rejects_unknown_duplicate_and_missing_beats(self):
@@ -3006,6 +3008,44 @@ class V1Tests(unittest.TestCase):
             with self.subTest(beats=beats):
                 with self.assertRaises(RuntimeError):
                     _paper_validate_story_plan({"editorial_brief": brief, "story_beats": beats}, skeleton)
+
+    def test_paper_story_planner_scope_keeps_only_selected_points(self):
+        skeleton = [
+            {
+                "beat_id": "beat-1",
+                "evidence_ids": ["e1", "e2"],
+                "summary": "一",
+                "required_facts": [],
+                "story_points": [
+                    {"point_id": "point-1", "summary": "核心结果", "required_facts": ["68%"], "figure_count": 1},
+                    {"point_id": "point-2", "summary": "次要结果", "required_facts": [], "figure_count": 1},
+                ],
+            },
+            {
+                "beat_id": "beat-2",
+                "evidence_ids": ["e3"],
+                "summary": "二",
+                "required_facts": [],
+                "story_points": [
+                    {"point_id": "point-3", "summary": "机制", "required_facts": [], "figure_count": 1},
+                ],
+            },
+        ]
+        brief = {
+            "audience": "读者", "purpose": "解释", "tone": "清楚",
+            "reader_should_leave_with": "主线", "story_question": "为什么？",
+        }
+        response = {
+            "editorial_brief": brief,
+            "selected_story_points": ["point-1", "point-3"],
+            "story_beats": [
+                {"id": "beat-1", "title": "结果", "reader_question": "发生了什么？", "core_message": "核心结果。", "transition_to_next": "再看机制。"},
+                {"id": "beat-2", "title": "机制", "reader_question": "为什么？", "core_message": "机制解释。", "transition_to_next": "文章收束。"},
+            ],
+        }
+        validated = _paper_validate_story_plan(response, skeleton)
+        self.assertEqual([beat["evidence_ids"] for beat in validated], [["e1"], ["e3"]])
+        self.assertEqual(response["selected_story_points"], ["point-1", "point-3"])
 
     def test_paper_canonical_section_sources_derive_from_evidence_ids(self):
         registry = [{
@@ -4981,6 +5021,70 @@ class V1Tests(unittest.TestCase):
         self.assertGreater(audit["issue_count"], 0)
         self.assertTrue(any(issue["type"] == "unexplained_acronym" for issue in audit["issues"]))
 
+    def test_paper_body_char_count_excludes_abstract_and_headings(self):
+        markdown = "# 标题标题\n\n完整摘要摘要。\n\n## 核心发现\n\n正文只算这里。"
+        self.assertEqual(_paper_body_char_count(markdown), _paper_chinese_char_count("正文只算这里。"))
+
+    def test_paper_body_char_count_excludes_figure_captions(self):
+        markdown = (
+            "## 核心发现\n\n正文内容。\n\n"
+            "![Fig. 2](images/figure-02.png)\n*Fig. 2 | 图注不应计入。*"
+        )
+        self.assertEqual(_paper_body_char_count(markdown), _paper_chinese_char_count("正文内容。"))
+
+    def test_paper_body_char_count_excludes_article_information_and_doi(self):
+        markdown = (
+            "## 核心发现\n\n正文内容。\n\n## 文章信息\n\n"
+            "DOI：10.5194/example\n原文链接：https://example.test/paper\n"
+        )
+        self.assertEqual(_paper_body_char_count(markdown), _paper_chinese_char_count("正文内容。"))
+
+    def test_paper_body_under_limit_skips_compression(self):
+        calls = []
+        markdown = "## 结果\n\n" + "正文" * 100
+        result = _paper_bounded_compression(
+            markdown,
+            _paper_body_char_count(markdown),
+            lambda current, count: calls.append((current, count)) or (True, current),
+        )
+        self.assertEqual(result[2], 0)
+        self.assertEqual(calls, [])
+
+    def test_paper_overlong_body_compresses_once_and_revalidates_limit(self):
+        calls = []
+        original = "## 结果\n\n" + "正文" * 600
+        compressed = "## 结果\n\n" + "核心发现和必要机制。" * 80
+        result = _paper_bounded_compression(
+            original,
+            _paper_body_char_count(original),
+            lambda current, count: calls.append(count) or (True, compressed),
+        )
+        self.assertEqual(calls, [_paper_body_char_count(original)])
+        self.assertEqual(result[0], compressed)
+        self.assertLessEqual(result[1], 1000)
+        self.assertEqual(result[2], 1)
+
+    def test_paper_overlong_body_fails_after_unsuccessful_compression(self):
+        original = "## 结果\n\n" + "正文" * 600
+        with self.assertRaisesRegex(RuntimeError, "PAPER body exceeds 1000-character limit"):
+            _paper_bounded_compression(
+                original,
+                _paper_body_char_count(original),
+                lambda current, count: (False, current),
+            )
+
+    def test_paper_compression_callback_keeps_immutable_bindings(self):
+        bindings = {"block_ids": ["b1"], "evidence_ids": ["e1"], "figure_ids": ["Fig. 2"]}
+        before = copy.deepcopy(bindings)
+        original = "## 结果\n\n" + "正文" * 600
+        compressed = "## 结果\n\n核心发现。" * 100
+        _paper_bounded_compression(
+            original,
+            _paper_body_char_count(original),
+            lambda current, count: (True, compressed),
+        )
+        self.assertEqual(bindings, before)
+
     def test_paper_clean_story_evidence_hides_backend_figure_labels(self):
         plan = {
             "sections": [
@@ -6884,7 +6988,7 @@ class V1Tests(unittest.TestCase):
                     text.index(heading),
                 )
 
-    def test_paper_image_allocation_covers_later_sections_before_four_image_cap(self):
+    def test_paper_image_allocation_covers_later_sections_before_three_image_cap(self):
         context = (
             "## Ensemble spread\n\n"
             "The ensemble spread quantifies forecast errors across the experiments.\n\n"
@@ -6919,18 +7023,18 @@ class V1Tests(unittest.TestCase):
             allocation,
         )
         selected_numbers = [image["figure_number"] for image in selected]
-        self.assertEqual(len(selected), 4)
-        self.assertEqual(selected_numbers, [1, 3, 4, 5])
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected_numbers, [1, 3, 4])
         self.assertNotEqual(selected_numbers, [1, 2, 3, 6])
         self.assertEqual(allocation["input_image_count"], 6)
-        self.assertEqual(allocation["max_images"], 4)
+        self.assertEqual(allocation["max_images"], 3)
         self.assertEqual(
             [section["section"] for section in allocation["sections"]],
             ["Ensemble spread", "Circulation and precipitation", "Projection and attribution"],
         )
         self.assertEqual(
             [section["selected_figures"] for section in allocation["sections"]],
-            [["Fig. 1"], ["Fig. 3"], ["Fig. 4", "Fig. 5"]],
+            [["Fig. 1"], ["Fig. 3"], ["Fig. 4"]],
         )
         self.assertEqual(
             [candidate["figure"] for candidate in allocation["sections"][0]["candidates"]],
@@ -6939,7 +7043,7 @@ class V1Tests(unittest.TestCase):
         discarded = {item["figure"]: item["reason"] for item in allocation["discarded_figures"]}
         self.assertIn("Fig. 2", discarded)
         self.assertIn("Fig. 6", discarded)
-        self.assertIn("全局最多4张", discarded["Fig. 2"])
+        self.assertIn("全局最多3张", discarded["Fig. 2"])
         self.assertIn("没有足够的正文对应关系", discarded["Fig. 6"])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -6962,12 +7066,11 @@ class V1Tests(unittest.TestCase):
                     for line in rendered.splitlines()
                     if line.startswith("![Fig. ")
                 ],
-                [1, 3, 4, 5],
+                [1, 3, 4],
             )
             self.assertGreater(rendered.index("![Fig. 1]"), rendered.index("ensemble spread"))
             self.assertGreater(rendered.index("![Fig. 3]"), rendered.index("regional precipitation"))
             self.assertGreater(rendered.index("![Fig. 4]"), rendered.index("future projection"))
-            self.assertGreater(rendered.index("![Fig. 5]"), rendered.index("![Fig. 4]"))
 
     def test_paper_scoring_prefers_scientific_and_source_evidence_over_structure(self):
         context = (

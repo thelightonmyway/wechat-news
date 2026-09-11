@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 
@@ -1997,13 +1997,14 @@ def _paper_story_skeleton(
     clean_evidence: list[dict[str, Any]],
     evidence_map: dict[str, tuple[dict[str, Any], dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build fixed beat ownership from the validated scientific plan."""
+    """Build an immutable candidate skeleton for focused story selection."""
     clean_by_id = {
         str(record.get("evidence_id") or ""): record
         for record in clean_evidence
         if str(record.get("evidence_id") or "")
     }
     skeleton: list[dict[str, Any]] = []
+    point_counter = 0
     for index, section in enumerate(plan.get("sections") or [], start=1):
         section_id = str(section.get("id") or "")
         evidence_ids: list[str] = []
@@ -2036,28 +2037,111 @@ def _paper_story_skeleton(
             )
         facts: list[str] = []
         summaries = [str(section.get("title") or "").strip()]
+        story_points: list[dict[str, Any]] = []
         for evidence_id in evidence_ids:
+            point_counter += 1
             record = clean_by_id[evidence_id]
-            summaries.append(str(record.get("core_finding") or "").strip())
+            core_finding = str(record.get("core_finding") or "").strip()
+            summaries.append(core_finding)
+            point_facts: list[str] = []
             for anchor in record.get("anchors") or []:
                 fact = _paper_plain_language_cleanup(str(anchor)).strip()
                 if fact and fact not in facts:
                     facts.append(fact)
+                if fact and fact not in point_facts:
+                    point_facts.append(fact)
+            story_points.append({
+                "point_id": f"point-{point_counter}",
+                "summary": core_finding[:600],
+                "required_facts": point_facts,
+                "figure_count": len(record.get("supported_figures") or []),
+            })
         skeleton.append({
             "beat_id": f"beat-{index}",
             "evidence_ids": evidence_ids,
             "summary": "；".join(part for part in summaries if part)[:1200],
             "required_facts": facts,
+            "story_points": story_points,
         })
     if not skeleton:
         raise RuntimeError("PAPER story skeleton has no evidence beats")
     return skeleton
 
 
+def _paper_story_scope_skeleton(
+    story_plan: dict[str, Any],
+    story_skeleton: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply the Planner's focused point selection without changing bindings."""
+    selected = story_plan.get("selected_story_points")
+    if selected is None:
+        return story_skeleton
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or len(selected) < 2
+        or len(selected) > 3
+        or any(not isinstance(point_id, str) or not point_id.strip() for point_id in selected)
+        or len(set(selected)) != len(selected)
+    ):
+        raise RuntimeError("PAPER story planner returned an invalid focused scope")
+    points = {
+        str(point.get("point_id") or ""): (skeleton, point)
+        for skeleton in story_skeleton
+        for point in skeleton.get("story_points") or []
+        if isinstance(point, dict) and str(point.get("point_id") or "")
+    }
+    if any(point_id not in points for point_id in selected):
+        raise RuntimeError("PAPER story planner selected an unknown story point")
+    if sum(int(points[point_id][1].get("figure_count") or 0) for point_id in selected) > 3:
+        raise RuntimeError("PAPER focused story planner selected more than three Figures")
+    selected_by_beat: dict[str, list[str]] = {}
+    for point_id in selected:
+        skeleton, _ = points[point_id]
+        selected_by_beat.setdefault(str(skeleton.get("beat_id") or ""), []).append(point_id)
+    scoped: list[dict[str, Any]] = []
+    for skeleton in story_skeleton:
+        beat_id = str(skeleton.get("beat_id") or "")
+        point_ids = selected_by_beat.get(beat_id)
+        if not point_ids:
+            continue
+        point_evidence = {
+            str(point.get("point_id") or ""): evidence_id
+            for evidence_id, point in zip(
+                skeleton.get("evidence_ids") or [],
+                skeleton.get("story_points") or [],
+            )
+            if isinstance(point, dict)
+        }
+        evidence_ids = [point_evidence[point_id] for point_id in point_ids if point_id in point_evidence]
+        if not evidence_ids:
+            raise RuntimeError("PAPER story planner selected a story point without evidence")
+        scoped.append({
+            **skeleton,
+            "evidence_ids": evidence_ids,
+            "required_facts": list(dict.fromkeys(
+                fact
+                for point_id in point_ids
+                for point in [points[point_id][1]]
+                for fact in point.get("required_facts") or []
+            )),
+            "summary": "；".join(
+                str(points[point_id][1].get("summary") or "").strip()
+                for point_id in point_ids
+                if str(points[point_id][1].get("summary") or "").strip()
+            )[:1200],
+        })
+    if not scoped:
+        raise RuntimeError("PAPER story planner selected no usable story points")
+    story_plan["selected_story_points"] = list(selected)
+    return scoped
+
+
 def _paper_validate_story_plan(
     story_plan: dict[str, Any],
     story_skeleton: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    story_skeleton = _paper_story_scope_skeleton(story_plan, story_skeleton)
     brief = story_plan.get("editorial_brief")
     if not isinstance(brief, dict) or not all(
         isinstance(brief.get(field), str) and brief[field].strip()
@@ -2066,7 +2150,16 @@ def _paper_validate_story_plan(
         raise RuntimeError("PAPER story planner returned an invalid editorial brief")
     beats = story_plan.get("story_beats")
     expected_ids = [str(item.get("beat_id") or "") for item in story_skeleton]
-    if not isinstance(beats, list) or len(beats) != len(expected_ids):
+    if not isinstance(beats, list):
+        raise RuntimeError("PAPER story planner returned an invalid beat count")
+    if story_plan.get("selected_story_points") is not None:
+        beats_by_id = {
+            str(beat.get("id") or "").strip(): beat
+            for beat in beats
+            if isinstance(beat, dict)
+        }
+        beats = [beats_by_id[beat_id] for beat_id in expected_ids if beat_id in beats_by_id]
+    if len(beats) != len(expected_ids):
         raise RuntimeError("PAPER story planner returned an invalid beat count")
     returned_ids = [str(beat.get("id") or "").strip() if isinstance(beat, dict) else "" for beat in beats]
     if returned_ids != expected_ids:
@@ -2129,7 +2222,12 @@ def _paper_story_sections(
                 for source_id in original_section.get("source_paragraph_ids") or []:
                     if source_id not in source_ids:
                         source_ids.append(source_id)
-            for figure_id in original_section.get("figure_ids") or original_section.get("selected_body_figures") or []:
+            figure_values = (
+                evidence_by_id.get(evidence_id, {}).get("supported_figures") or []
+                if canonical_mode
+                else original_section.get("figure_ids") or original_section.get("selected_body_figures") or []
+            )
+            for figure_id in figure_values:
                 normalized = _paper_figure_id(figure_id)
                 if normalized not in figure_ids:
                     figure_ids.append(normalized)
@@ -2211,15 +2309,9 @@ def _paper_story_block_specs(
                     evidence_map[evidence_id] if evidence_map is not None else ({}, {})
                 )
                 if evidence_registry:
+                    # Contextual evidence remains unfigured. Only canonical
+                    # Figure-specific support can create a Figure binding.
                     figure_values = evidence_by_id.get(evidence_id, {}).get("supported_figures") or []
-                    # Contextual evidence is placed in the section's prose for
-                    # rendering, but its canonical support remains unfigured.
-                    if not figure_values:
-                        figure_values = (
-                            original_section.get("figure_ids")
-                            or original_section.get("selected_body_figures")
-                            or []
-                        )
                 else:
                     figure_values = (
                         finding.get("figure_ids")
@@ -2482,6 +2574,16 @@ def _paper_story_planner(
             "beat_id": skeleton["beat_id"],
             "summary": skeleton["summary"],
             "required_facts": list(skeleton.get("required_facts") or []),
+            "story_points": [
+                {
+                    "point_id": str(point.get("point_id") or ""),
+                    "summary": str(point.get("summary") or ""),
+                    "required_facts": list(point.get("required_facts") or []),
+                    "figure_count": int(point.get("figure_count") or 0),
+                }
+                for point in skeleton.get("story_points") or []
+                if isinstance(point, dict)
+            ],
         }
         for skeleton in story_skeleton
     ]
@@ -3975,6 +4077,43 @@ def _paper_chinese_char_count(text: str) -> int:
     return len(re.findall(r"[㐀-鿿]", str(text or "")))
 
 
+_PAPER_BODY_TARGET = 900
+_PAPER_BODY_LIMIT = 1000
+
+
+def _paper_body_char_count(markdown: str) -> int:
+    """Count visible Chinese characters in the PAPER body, excluding scaffolding."""
+    visible_parts: list[str] = []
+    for _, body in _paper_body_sections(markdown):
+        lines = []
+        for line in str(body or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("!"):
+                continue
+            if re.fullmatch(r"\*\s*(?:Fig(?:ure)?\.?\s*\d+|图\s*\d+|article hero).*?\*", stripped, re.IGNORECASE):
+                continue
+            lines.append(line)
+        visible = "\n".join(lines)
+        visible = re.sub(r"https?://\S+|10\.\d{4,9}/\S+", "", visible)
+        visible_parts.append(visible)
+    return _paper_chinese_char_count("\n".join(visible_parts))
+
+
+def _paper_bounded_compression(
+    markdown: str,
+    body_char_count: int,
+    compress_fn: Callable[[str, int], tuple[bool, str]],
+) -> tuple[str, int, int]:
+    """Run at most one validated compression pass for an overlong body."""
+    if body_char_count <= _PAPER_BODY_LIMIT:
+        return markdown, body_char_count, 0
+    accepted, candidate = compress_fn(markdown, body_char_count)
+    candidate_count = _paper_body_char_count(candidate) if accepted else body_char_count
+    if not accepted or candidate_count > _PAPER_BODY_LIMIT:
+        raise RuntimeError("PAPER body exceeds 1000-character limit after bounded compression")
+    return candidate, candidate_count, 1
+
+
 def _paper_body_length_audit(markdown: str) -> dict[str, Any]:
     sections = _paper_body_sections(markdown)
     section_records = [
@@ -3984,9 +4123,14 @@ def _paper_body_length_audit(markdown: str) -> dict[str, Any]:
         }
         for title, body in sections
     ]
+    body_characters = _paper_body_char_count(markdown)
     return {
         "sections": section_records,
         "total_characters": sum(item["characters"] for item in section_records),
+        "body_char_count": body_characters,
+        "target": _PAPER_BODY_TARGET,
+        "limit": _PAPER_BODY_LIMIT,
+        "over_limit": body_characters > _PAPER_BODY_LIMIT,
         "overlong_sections": [
             item["title"] for item in section_records if item["characters"] > 135
         ],
@@ -4921,14 +5065,15 @@ PAPER_STORY_PLANNER_PROMPT = (
     "读者是对科学感兴趣但非本领域专家的普通读者；目的不是逐项汇报Results，而是像人在解释一个值得知道的科学发现。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
     "先确定editorial_brief：audience、purpose、tone、reader_should_leave_with（读者记住的2到3个观点）和story_question。"
-    "先从整篇论文中筛选2到4个真正值得读者记住的story points，优先考虑问题、现象、反常或矛盾、核心发现及其意义；可参考‘问题—发现—为什么—意义/未来’的推进，但不是固定模板；不要把论文目录、Figure顺序或方法清单当成故事线。"
-    "故事形状由当前证据决定，不套固定的A→B→C公式；可以从现象、结果、机制或影响切入，结论和方法的先后以自然表达为准，方法只保留帮助理解结果的部分。"
+    "先从完整论文的story_points中筛选2到3个真正值得读者记住的点，组成一个focused story：1个中心科学问题、2到3个关键发现或证据、必要时1个机制解释和1个自然落点。selected_story_points必须恰好使用2到3个不同point_id；优先选择合计Figure数量不超过3、通常不超过2的点，绝不能选择会让合计Figure数量超过3的组合。优先考虑问题、现象、反常或矛盾、核心发现及其意义；可参考‘问题—发现—为什么—意义/未来’的推进，但不是固定模板；不要把论文目录、Figure顺序或方法清单当成故事线。"
+    "selected_story_points只能从输入的point_id中选择；未选点及其证据可以完全不写，不要为了完整覆盖论文而扩展范围。通常只需1—2张直接支撑主线的关键Figure，最多3张；不要因为有可用Figure就全部纳入。故事形状由当前证据决定，不套固定的A→B→C公式；可以从现象、结果、机制或影响切入，结论和方法的先后以自然表达为准，方法只保留帮助理解结果的部分。"
     "Python已经根据科学验证结果建立不可变的证据承载骨架；story_beats只是把上述核心story points落到已有证据边界中的写作任务，不代表固定section数量、固定角色或固定段落数量。"
-    "你只需为每个固定beat填写title、reader_question、core_message和transition_to_next，不能返回任何evidence、source、Figure或provenance字段。故事顺序和证据归属由Python保持。"
+    "你只需返回selected_story_points和所选beat的title、reader_question、core_message、transition_to_next，不能返回任何evidence、source、Figure或provenance字段。故事顺序和证据归属由Python根据point_id保持。"
     "每个beat的summary和required_facts仅用于理解对应科学主题；不要在输出中复述系统字段或任何内部标识。标题专业、直接、简洁即可，长度和小标题形状以五篇范文的自然变化为参考，不套固定字数或固定角色。避免明显标题党和幕后黑手式媒体措辞；不要为了规避某个普通连接词而牺牲自然中文，也不要把图、Figure、panel或source写成文章目录。"
     "只学习style_exemplar的中文节奏、句长、信息密度和推进方式，不复制其中的科学事实、数字、地点、机制或句子。"
     "返回严格JSON："
     '{"editorial_brief":{"audience":"...","purpose":"...","tone":"...","reader_should_leave_with":"...","story_question":"..."},'
+    '"selected_story_points":["point-1","point-2"],'
     '"story_beats":[{"id":"beat-1","title":"...","reader_question":"...","core_message":"...","transition_to_next":"..."}]}'
 )
 
@@ -4938,7 +5083,7 @@ PAPER_STORY_WRITER_PROMPT = (
     "每个beat只能使用其对应的clean evidence；在固定evidence/block边界内参考style corpus自然组织正文，不要为了结构完整硬加转折、总结句或解释句。"
     "style_exemplar中的范文原文是主要写作参考，STYLE_GUIDE只是辅助规则；学习句法、段落长度、信息密度、叙事推进、术语解释和自然中文，禁止复制范文事实、数字、人物、地点和结论。"
     "标题和正文以五篇范文原文的自然表达为主要参考，清楚、克制即可；不套固定小标题、固定段落长度或禁用词清单。"
-    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，优先回答读者问题，再把最重要的发现、必要机制和意义连起来，不为了结构完整硬加转折、总结句或解释句。方法、变量清单和统计术语只保留确实有助于理解的部分。"
+    "正文不要写成论文Results、摘要扩写、图注翻译或营销型自媒体；在当前evidence/block边界内自然组织，优先回答读者问题，再把最重要的发现、必要机制和意义连起来，不为了结构完整硬加转折、总结句或解释句。正文主体目标为700—900个中文字符，硬上限1000；通常4—7个实质段落、1—3个小标题即可，但只是软参考。不要把数字压成清单或塞进一个超长段落，优先减少覆盖范围而不是牺牲解释质量。方法、变量清单和统计术语只保留确实有助于理解的部分。"
     "模仿范文中有变化的句长、段落推进、数字密度和收束方式；专业词在需要时顺手解释，避免连续堆缩写、模型名和参数，不把人工规则写成排比模板。"
     "每个beat必须按输入的固定blocks分别写作。Python已经决定每个block_id及其对应的科学证据边界；不得新增、删除、重排、合并或拆分block，不得分配或返回evidence_ids。"
     "每个block只能使用输入中该block的clean_evidence；不能把不同Figure group的证据混入，也不能把anchor移动到另一个block。clean_evidence中的每个anchor必须在对应block正文中原样保留。"
@@ -4952,7 +5097,7 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
     "你是中文科学新闻的Article Editor。一次性阅读完整PAPER草稿、Abstract、全部sections和全部自然段，"
     "并把五篇范文全文当作主要参考，学习整篇文章的组织、信息推进、段落节奏、句法和自然中文。"
     "根据当前论文自己的科学内容重新组织叙事：可以重排sections和自然段，也可以把多个相邻或相关block合并到同一个自然段，"
-    "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。不要把文章写成Figure目录，不要按图号顺序汇报，"
+    "让已解释的机制只完整出现一次，后文用简短承接推进新证据或意义。当前正文主体目标为700—900个中文字符，硬上限1000；如果内容较简单可以更短，不要为了凑字扩写。不要把文章写成Figure目录，不要按图号顺序汇报，"
     "不要复制范文事实、数字、人物、地点或结论；方法只保留帮助理解结论所需的部分。"
     "术语和地名必须全文一致：地名按语义判断，有标准且明确中文译名的地理名称正常翻译，例如East Antarctica译为东南极、"
     "West Antarctica译为西南极、Indian Ocean译为印度洋、Southern Ocean译为南大洋、North Atlantic译为北大西洋、"
@@ -4962,7 +5107,7 @@ PAPER_ARTICLE_EDITOR_PROMPT = (
     "writing_facts中的required_facts只是必须保留的论文事实，has_figure只是附近需要承载图的提示；"
     "不要在正文提到required fact、evidence、证据、锚点、约束、block、metadata、provenance或任何系统概念。"
     "不得发明事实、因果、意义、数字或来源。每个原有block_id必须在全文一个且仅一个paragraph的block_ids中出现，"
-    "不得新增、删除或重复block_id；block_ids只用于Python恢复事实归属，不要把它们写进正文。"
+    "不得新增、删除或重复block_id；block_ids只用于Python恢复事实归属，不要把它们写进正文。优先删除重复事实、方法过程、caption的正文复述、次要结果和同义解释，但必须保留主线问题、核心定量结果、因果强度、限定词、必要机制和选定evidence所需信息。"
     "返回严格JSON且只能包含sections。每个section使用section_id、title和paragraphs；每个paragraph只能使用block_ids和text。"
     "所有原有section_id和block_id必须各出现恰好一次，允许sections、paragraphs和block_ids任意重排；section数量、段落数量、每段承载的block数量和标题长度都由科学内容与范文自然节奏决定，不套人工模板。"
     + PAPER_FIDELITY_CONTRACT
@@ -5137,6 +5282,15 @@ def _write_article_files(
                 "doi": dossier.get("doi", ""),
                 "images": dossier.get("images", []),
                 "paper_evidence_plan": paper_evidence_plan or {},
+                **(
+                    {
+                        "paper_body_char_count": paper_evidence_plan.get("paper_body_char_count"),
+                        "paper_body_target": paper_evidence_plan.get("paper_body_target"),
+                        "paper_body_limit": paper_evidence_plan.get("paper_body_limit"),
+                    }
+                    if paper_evidence_plan and "paper_body_char_count" in paper_evidence_plan
+                    else {}
+                ),
             },
             ensure_ascii=False,
             indent=2,
@@ -5475,7 +5629,7 @@ def _generate_paper_article_markdown(
             story_skeleton,
             style_exemplar,
             settings.model_name,
-            {"validation": "Return exactly one beat for each fixed beat_id in the supplied skeleton, in the same order. Do not return evidence, source, Figure, or provenance fields."},
+            {"validation": "Return exactly one beat for each fixed beat_id in the supplied skeleton, in the same order. Select exactly 2 or 3 point_id values, and choose only a combination whose summed figure_count is at most 3 (prefer at most 2). Do not return evidence, source, Figure, or provenance fields."},
         )
         story_beats = _paper_validate_story_plan(story_plan, story_skeleton)
     story_sections = _paper_story_sections(
@@ -5620,6 +5774,61 @@ def _generate_paper_article_markdown(
             logger.info("PAPER article-level editor validation passed")
     except Exception as exc:
         logger.warning("PAPER article-level editor unavailable; retaining Story Writer draft: %s", exc)
+
+    body_char_count = _paper_body_char_count(markdown)
+
+    def compress_article(current_markdown: str, current_count: int) -> tuple[bool, str]:
+        compression_feedback = {
+            "compression": {
+                "current_body_char_count": current_count,
+                "target_body_char_count": _PAPER_BODY_TARGET,
+                "hard_limit": _PAPER_BODY_LIMIT,
+                "instruction": (
+                    "压缩正文而不是截断正文。只保留当前focused story的中心问题、2到3个关键发现、"
+                    "必要机制和自然落点；优先删除重复事实、方法过程、次要结果、Figure caption复述和同义解释。"
+                    "不要修改Abstract，不新增evidence或Figure，不改变block_ids、anchor、source、Figure归属或科学强度。"
+                ),
+            }
+        }
+        compressed_output = _paper_article_editor(
+            client,
+            plan,
+            current_markdown,
+            abstract_lead,
+            style_exemplar,
+            settings.model_name,
+            block_specs,
+            compression_feedback,
+        )
+        return _paper_apply_article_editor_candidate(
+            plan,
+            compressed_output,
+            evidence_map,
+            evidence_registry,
+            block_specs,
+            display_title,
+            abstract_lead,
+            valid_source_ids,
+            figure_evidence_bundles if figure_first else None,
+            current_markdown,
+            "bounded compression",
+        )
+
+    try:
+        markdown, body_char_count, compression_retry_count = _paper_bounded_compression(
+            markdown,
+            body_char_count,
+            compress_article,
+        )
+    except Exception as exc:
+        if str(exc) == "PAPER body exceeds 1000-character limit after bounded compression":
+            raise
+        raise RuntimeError(
+            "PAPER body exceeds 1000-character limit after bounded compression"
+        ) from exc
+    if compression_retry_count:
+        article_editor_succeeded = True
+
     lint = _paper_ai_style_lint(markdown, include_abstract=True)
     popular_feedback = _paper_editor_feedback(abstract_lead, markdown)
     popular_feedback["anchor_preservation"] = _paper_editor_anchor_audit(
@@ -6282,6 +6491,13 @@ def _generate_paper_article_markdown(
             exc,
         )
     logger.info("PAPER deterministic evidence validation passed")
+    body_char_count = _paper_body_char_count(markdown)
+    if body_char_count > _PAPER_BODY_LIMIT:
+        raise RuntimeError("PAPER body exceeds 1000-character limit after bounded compression")
+    plan["paper_body_char_count"] = body_char_count
+    plan["paper_body_target"] = _PAPER_BODY_TARGET
+    plan["paper_body_limit"] = _PAPER_BODY_LIMIT
+    plan["compression_retry_count"] = compression_retry_count
     if _paper_ai_style_lint_failed(final_body_lint):
         logger.warning(
             "PAPER final editorial style lint remains after bounded repair: %s",
